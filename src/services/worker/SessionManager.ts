@@ -488,6 +488,10 @@ export class SessionManager {
       agentId: data.agentId,
       agentType: data.agentType,
       toolUseId: data.toolUseId,
+      // Bounded side references only; tool_input/tool_response stay text and
+      // the durable identity lives in media_events, never this RAM buffer ID.
+      ...(data.mediaRefs ? { mediaRefs: data.mediaRefs, mediaEventKey: data.mediaEventKey } : {}),
+      ...(data.mediaFailures ? { mediaFailures: data.mediaFailures } : {}),
     };
 
     const messageId = this.buffer.enqueue(sessionDbId, message, enqueuedAtEpochMs);
@@ -812,6 +816,16 @@ export class SessionManager {
 
   getTotalQueueDepth(): number {
     return this.buffer.getTotalDepth();
+  }
+
+  /** See SessionMessageBuffer.getLastAssignedId. */
+  getLastBufferedMessageId(): number {
+    return this.buffer.getLastAssignedId();
+  }
+
+  /** See SessionMessageBuffer.getOldestPendingId. */
+  getOldestPendingMessageId(sessionDbId: number): number | null {
+    return this.buffer.getOldestPendingId(sessionDbId);
   }
 
   async getTotalActiveWork(): Promise<number> {

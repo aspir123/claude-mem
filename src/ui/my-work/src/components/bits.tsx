@@ -1,5 +1,6 @@
-import { createContext, useContext, useState, type ReactNode } from 'react'
-import { BotIcon, CornerLeftUpIcon, RefreshCwIcon, UserIcon } from 'lucide-react'
+import { useEffect, useState, type ReactNode } from 'react'
+import { motion } from 'motion/react'
+import { BotIcon, CornerLeftUpIcon, MessageSquareIcon, RefreshCwIcon, StarIcon, UserIcon } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
@@ -8,13 +9,21 @@ import { Spinner } from '@/components/ui/spinner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { Req } from '@/spec/req'
-import { agentById, applyPendingWorkModel, deviceById, isSampleHref, measuredEstimate, SAMPLE_DEVICES, useHasPendingWorkModel, useWorkModel, type Device, type LiveState, type Request, type Run, type SkillRun } from '@/data'
+import { isSampleHref, measuredEstimate, SAMPLE_DEVICES, type Device, type LiveState, type Request, type Run, type SkillRun } from '@/data'
+import { agentById, deviceById, useConnection, useWorkModel, useWorkspace } from '@/store'
 import type { AutoRefresh } from '@/live/work-data-source'
+import { focusAreaLabel, resolveFocusAreaId } from '@/live/to-focus-model'
 import { AgentMark } from './brand'
 
-export interface Workspace { mode: 'home' | 'web'; team: boolean; connected: boolean }
-export const WorkspaceContext = createContext<Workspace>({ mode: 'home', team: false, connected: false })
-export const useWorkspace = () => useContext(WorkspaceContext)
+/**
+ * The sliding highlight behind the active choice in a nav or toggle group (the `layoutId` pattern from aceternity/tabs).
+ * Render it inside the active item only; the item needs `relative` and its content `relative` to sit above it.
+ * Each group passes its own `layoutId` so pills never jump between groups.
+ */
+export function ActivePill({ layoutId, className }: { layoutId: string; className?: string }) {
+  return <motion.span layoutId={layoutId} transition={{ type: 'spring', bounce: 0.3, duration: 0.6 }} className={cn('absolute inset-0 rounded-[inherit] bg-accent', className)} />
+}
+
 
 /** Agent mark, plus the machine it ran on (§13: remote agents are already synced, say where the work happened). */
 export function AgentIcon({ agentId, withDevice = false }: { agentId: string; withDevice?: boolean }) {
@@ -44,17 +53,20 @@ export const STATE_LABEL: Record<LiveState, string> = {
 /** Attention first: what waits on you, then what to check, then what is moving, then the rest. */
 export const ATTENTION_ORDER: LiveState[] = ['your-move', 'needs-check', 'working', 'idle', 'shipped']
 
+/** Each state's colors, shared by the badge and the List view's flipboard so both read as the same state. */
+export const STATE_SURFACE: Record<LiveState, string> = {
+  working: 'border-working-border bg-working text-working-foreground',
+  'needs-check': 'border-review-border bg-review text-review-foreground',
+  'your-move': 'border-attention-border bg-attention font-medium text-attention-foreground',
+  idle: 'border-idle-border bg-idle text-idle-foreground',
+  shipped: 'border-shipped-border bg-shipped text-shipped-foreground',
+}
+
 /** One glance tells working, done-but-unchecked, waiting on you and shipped apart (§6). State is the only thing colored. */
 export function StateBadge({ state }: { state: LiveState }) {
   return (
     <Req ids={['R6.2']}>
-      <Badge variant="outline" className={cn('shrink-0 gap-1.5 font-normal', {
-        'border-working-border bg-working text-working-foreground': state === 'working',
-        'border-review-border bg-review text-review-foreground': state === 'needs-check',
-        'border-attention-border bg-attention font-medium text-attention-foreground': state === 'your-move',
-        'border-idle-border bg-idle text-idle-foreground': state === 'idle',
-        'border-shipped-border bg-shipped text-shipped-foreground': state === 'shipped',
-      })}>
+      <Badge variant="outline" className={cn('shrink-0 gap-1.5 font-normal', STATE_SURFACE[state])}>
         <span className={cn('size-1.5 rounded-full', {
           'bg-working-foreground motion-safe:animate-pulse': state === 'working',
           'bg-review-foreground': state === 'needs-check',
@@ -69,23 +81,23 @@ export function StateBadge({ state }: { state: LiveState }) {
 }
 
 /**
- * Links a request to the goal it serves, or says it serves none (decision 1).
- * A quiet link, not a colored pill: color is reserved for state. Opens My Goals on that goal.
+ * The focus area a request sits in: the area's name, "Other", or "Sorting…" before the next refresh places it.
+ * A quiet link, not a colored pill: color is reserved for state. Opens My Work on that area.
  */
-export function GoalChip({ goalId, onOpen }: { goalId?: string | null; onOpen?: (goalId: string) => void }) {
-  const { priorities, openAsks } = useWorkModel()
-  // Resolved through the loaded goals only: a goal id the model doesn't have reads "Goal not linked yet".
-  const goal = goalId ? [...priorities, ...openAsks].find((entry) => entry.id === goalId) ?? null : null
+export function FocusAreaChip({ focusAreaId, onOpen }: { focusAreaId?: string; onOpen?: (focusAreaId: string) => void }) {
+  const { focusAreas } = useWorkModel()
+  const placed = resolveFocusAreaId(focusAreaId, focusAreas)
+  const label = focusAreaLabel(focusAreaId, focusAreas)
   return (
-    <Req ids={['D1']}>
-      {goal ? (
-        <button type="button" onClick={(event) => { event.stopPropagation(); onOpen?.(goal.id) }} className="inline-flex min-h-11 max-w-full items-center gap-1.5 self-start text-left text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline md:min-h-6">
+    <Req ids={['R16.5']}>
+      {placed ? (
+        <button type="button" onClick={(event) => { event.stopPropagation(); onOpen?.(placed) }} className="inline-flex min-h-11 max-w-full items-center gap-1.5 self-start text-left text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline md:min-h-6">
           <CornerLeftUpIcon className="size-3.5 shrink-0" />
-          <span className="truncate">{goal.title}</span>
+          <span className="truncate">{label}</span>
         </button>
       ) : (
-        // Not linked yet is not the same claim as "serves no goal".
-        <span className="inline-flex min-h-6 items-center gap-1.5 self-start text-xs text-muted-foreground/80 italic">{goalId === null ? 'No goal' : 'Goal not linked yet'}</span>
+        // Not placed yet is not the same claim as Other: the next refresh places it.
+        <span className="inline-flex min-h-6 items-center gap-1.5 self-start text-xs text-muted-foreground/80 italic">{label}</span>
       )}
     </Req>
   )
@@ -162,7 +174,8 @@ export function ProductLink({ href, children, className }: { href?: string; chil
  */
 export function LiveIndicator() {
   const { mode } = useWorkspace()
-  const { sourceKind, connection } = useWorkModel()
+  const { sourceKind } = useWorkModel()
+  const connection = useConnection()
   const demonstration = sourceKind === 'sample'
   const live = demonstration || connection.isLive
   return (
@@ -174,7 +187,8 @@ export function LiveIndicator() {
               {live && <span className="absolute inline-flex size-full rounded-full bg-shipped-foreground/40 motion-safe:animate-ping" />}
               <span className={cn('relative inline-flex size-2 rounded-full', live ? 'bg-shipped-foreground' : connection.tone === 'warning' ? 'bg-attention-foreground' : 'bg-idle-foreground')} />
             </span>
-            {demonstration ? 'Live' : connection.label}
+            {/* Phone: the dot alone (its colour carries the state, the tooltip the words) so the page title keeps whole words. */}
+            <span className="sr-only sm:not-sr-only">{demonstration ? 'Live' : connection.label}</span>
           </span>
         </TooltipTrigger>
         <TooltipContent className="max-w-72">
@@ -189,7 +203,8 @@ export function LiveIndicator() {
 
 /** Which machines are reporting and how fresh each one is (§13.6). This computer's freshness is the live feed's. */
 export function DeviceFreshness() {
-  const { sourceKind, devices, connection } = useWorkModel()
+  const { sourceKind, devices } = useWorkModel()
+  const connection = useConnection()
   const reportingNow = (device: Device) => sourceKind === 'sample' || device.syncedMinutesAgo !== 0 ? device.online : connection.isLive
   return (
     <Req ids={['R13.8', 'R13.2']}>
@@ -215,11 +230,55 @@ export function DeviceFreshness() {
   )
 }
 
-/** Newer work is held while you read; this applies it when you choose to (app.js "Show updates" banner). */
-export function ShowUpdatesButton({ className }: { className?: string }) {
-  const hasPendingWorkModel = useHasPendingWorkModel()
-  if (!hasPendingWorkModel) return null
-  return <Button size="sm" className={cn('text-xs', className)} onClick={applyPendingWorkModel}>Show updates</Button>
+const CLAUDE_MEM_REPO_URL = 'https://github.com/thedotmack/claude-mem'
+const CLAUDE_MEM_REPO_API_URL = 'https://api.github.com/repos/thedotmack/claude-mem'
+
+/** The repo's GitHub star count, read once from the public API. Shows no number until a real one arrives. */
+export function GitHubStars() {
+  const [stargazerCount, setStargazerCount] = useState<number | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    fetch(CLAUDE_MEM_REPO_API_URL)
+      .then((response) => {
+        if (!response.ok) throw new Error(`GitHub repo read failed: HTTP ${response.status}`)
+        return response.json() as Promise<{ stargazers_count: number }>
+      })
+      .then((repo) => { if (!cancelled) setStargazerCount(repo.stargazers_count) })
+      .catch((error: unknown) => console.warn('[my-work] GitHub star count unavailable:', error))
+    return () => { cancelled = true }
+  }, [])
+  return (
+    <Button asChild variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-xs">
+      <a href={CLAUDE_MEM_REPO_URL} target="_blank" rel="noreferrer" aria-label="Star claude-mem on GitHub">
+        <StarIcon className="size-3.5" />
+        <span className="hidden sm:inline">Star</span>
+        {stargazerCount !== null && <span className="tabular-nums">{new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(stargazerCount)}</span>}
+      </a>
+    </Button>
+  )
+}
+
+/** Opens the My Work feedback form on GitHub (.github/ISSUE_TEMPLATE/my-work-feedback.yml). */
+const MY_WORK_FEEDBACK_URL = `${CLAUDE_MEM_REPO_URL}/issues/new?template=my-work-feedback.yml`
+
+export function FeedbackLink() {
+  return (
+    <Button asChild variant="outline" size="sm" className="h-7 gap-1.5 px-2 text-xs">
+      <a href={MY_WORK_FEEDBACK_URL} target="_blank" rel="noreferrer" aria-label="Send feedback about My Work on GitHub">
+        <MessageSquareIcon className="size-3.5" />
+        <span className="hidden sm:inline">Feedback</span>
+      </a>
+    </Button>
+  )
+}
+
+/** The previous memory viewer, still served by the worker at /viewer. */
+export function ClassicViewerLink() {
+  return (
+    <a href="/viewer" className="hidden text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline md:inline" title="Open the previous memory viewer">
+      Classic viewer
+    </a>
+  )
 }
 
 /** Sample runs only (their machines are fixtures). Runs a skill from the GUI (§14): last run time, machine and progress (cost display dropped by the owner, Oct 20, 2026). On the web it queues for an online machine. */
