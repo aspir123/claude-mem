@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import express from 'express';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Server } from 'node:http';
@@ -26,7 +26,7 @@ function append(fields: Record<string, unknown>) {
 }
 
 async function start(humanCopy: HumanCopyWorker | null = null) {
-  routes = new WorkViewRoutes({ databasePath, reviewPath, pollIntervalMs: 20, humanCopy, ledgerDir: null });
+  routes = new WorkViewRoutes({ databasePath, reviewPath, pollIntervalMs: 20, humanCopy, ledgerDir: null, setupStatePath: join(directory, 'setup-state.json') });
   const app = express();
   app.use(express.json());
   routes.setupRoutes(app);
@@ -383,6 +383,23 @@ describe('local work view', () => {
     // afterEach may safely close an already closed handle.
   });
 
+  it('coalesces background activity without accepting stale evidence reviews', async () => {
+    seedLinkedEvidence();
+    const request = (await snapshot()).humanRequests[0];
+    const controller = new AbortController(); controllers.push(controller);
+    const response = await fetch(`${origin}/api/work-view/events`, { signal: controller.signal });
+    await response.body!.getReader().read();
+    const liveSource = (routes as any).source;
+    const initialRevision = liveSource.agentRevision;
+    source.prepare('UPDATE observations SET narrative=? WHERE id=1').run('Corrected full evidence.');
+    // Several real 20 ms polls must not rebuild for this activity-only commit.
+    await new Promise(resolve => setTimeout(resolve, 100));
+    expect(liveSource.agentRevision).toBe(initialRevision);
+    expect((await review(request)).status).toBe(409);
+    expect(liveSource.agentRevision).toBeGreaterThan(initialRevision);
+    controller.abort();
+  });
+
   it('streams genuine external source changes and releases disconnected clients', async () => {
     const controller = new AbortController(); controllers.push(controller);
     const response = await fetch(`${origin}/api/work-view/events`, { signal: controller.signal });
@@ -449,5 +466,43 @@ describe('review content versions', () => {
     expect(request.humanCopy.state).toBe('current');
     expect(request.humanCopy.summary).toBe('The viewer is ready to use.');
     expect(request.contentFingerprint).toBe(before.contentFingerprint);
+  });
+
+  it('does not spend user tokens on display copy during hosted setup, then resumes after completion', async () => {
+    await stop();
+    let calls = 0;
+    const humanCopy = new HumanCopyWorker({ cachePath: null, quietMs: 0, minIntervalMs: 0, provider: async (input: any) => {
+      calls++;
+      return { output: { title: 'Build a local work viewer', summary: 'The viewer is ready.', next: '',
+        workstreams: input.workstreams.map((stream: { id: string }) => ({ id: stream.id, title: 'Viewer', summary: 'Ready.' })) } };
+    } });
+    const setupPath = join(directory, 'setup-state.json');
+    writeFileSync(setupPath, JSON.stringify({ status: 'pending' }));
+    writeFileSync(join(directory, 'setup-session.json'), JSON.stringify({ pid: process.pid }));
+    await start(humanCopy);
+    await snapshot();
+    expect(calls).toBe(0);
+    expect(humanCopy.status().queued).toBe(0);
+    writeFileSync(setupPath, JSON.stringify({ status: 'complete' }));
+    await snapshot();
+    expect(calls).toBe(1);
+  });
+
+  it('resumes display copy with saved pending setup when the installer has exited', async () => {
+    await stop();
+    let calls = 0;
+    const humanCopy = new HumanCopyWorker({ cachePath: null, quietMs: 0, minIntervalMs: 0, provider: async (input: any) => {
+      calls++;
+      return { output: { title: 'Build a local work viewer', summary: 'The viewer is ready.', next: '',
+        workstreams: input.workstreams.map((stream: { id: string }) => ({ id: stream.id, title: 'Viewer', summary: 'Ready.' })) } };
+    } });
+    const setupPath = join(directory, 'setup-state.json');
+    const saved = { status: 'pending', choice: { branch: 'home', memoryBilling: 'existing', chosenAt: 'earlier' } };
+    writeFileSync(setupPath, JSON.stringify(saved));
+    writeFileSync(join(directory, 'setup-session.json'), JSON.stringify({ pid: 2 ** 22 + 12345 }));
+    await start(humanCopy);
+    await snapshot();
+    expect(calls).toBe(1);
+    expect(JSON.parse(readFileSync(setupPath, 'utf8'))).toEqual(saved);
   });
 });

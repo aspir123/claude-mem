@@ -180,9 +180,10 @@ export function shellTemplateManifest(buildShellCommand, buildCodexWindowsComman
     // the installer-prepared copies (#4763).
     requireDependencies: true,
   });
-  const codexHookPair = (tail) => ({
+  const codexHookPair = (tail, entryOptions = {}) => ({
     command: codexHook(tail),
     commandWindows: buildCodexWindowsCommand(tail, { requireDependencies: true }),
+    ...entryOptions,
   });
 
   return {
@@ -231,9 +232,21 @@ export function shellTemplateManifest(buildShellCommand, buildCodexWindowsComman
         'SessionStart.0.0': codexHookPair(['hook', 'codex', 'context']),
         'UserPromptSubmit.0.0': codexHookPair(['hook', 'codex', 'session-init']),
         'PreToolUse.0.0': codexHookPair(['hook', 'codex', 'file-context']),
-        'PostToolUse.0.0': codexHookPair(['hook', 'codex', 'observation']),
+        // Observation capture stays synchronous so a delayed event cannot cross
+        // turn boundaries. Why 5 s: the hook must fit wrapper startup, bundle
+        // load, the 2 s server attempt (SERVER_OBSERVATION_TIMEOUT_MS in
+        // src/cli/handlers/observation.ts) and the local spool write. Measured
+        // on an Apple Silicon Mac (2026-10-25, worker runtime, spool path):
+        // ~0.25-0.29 s warm, ~0.46 s on the first run. So 5 s leaves ~2.5 s of
+        // headroom after the server attempt. Windows (commandWindows) cold
+        // start was not measured. Change both values together.
+        'PostToolUse.0.0': codexHookPair(
+          ['hook', 'codex', 'observation'],
+          { timeout: 5 },
+        ),
         'Stop.0.0': codexHookPair(['hook', 'codex', 'summarize']),
         'PostCompact.0.0': codexHookPair(['hook', 'codex', 'post-compact']),
+        'SubagentStart.0.0': codexHookPair(['hook', 'codex', 'subagent-context']),
       },
     },
     'plugin/.mcp.json': {
@@ -470,6 +483,9 @@ async function buildHooks() {
       description: 'Runtime dependencies for claude-mem bundled hooks',
       type: 'module',
       dependencies: {
+        // Native decoder must remain external and be installed for each host.
+        // https://sharp.pixelplumbing.com/install/#bundlers
+        'sharp': packageJson.dependencies.sharp,
         'zod': '^4.4.3',
         // Exact, not a range: the worker only installs a tree-sitter executable
         // whose SHA-256 is pinned for this version
@@ -511,12 +527,12 @@ async function buildHooks() {
       // from the bundles below — so a server needs them in the plugin's own
       // runtime closure or the lazy path dies with "Cannot find module
       // 'onnxruntime-node'".
-      // sharp is deliberately NOT declared here: it is a hard dependency of
-      // @huggingface/transformers, so it installs and hoists into
-      // plugin/node_modules with it — and declaring it directly would trip
-      // scripts/check-postinstall-allowlist.js (sharp carries an `install`
-      // script), which prepublishOnly enforces. It is still marked external in
-      // the bundles below so the trio resolves at runtime, never at build time.
+      // sharp is declared above as a direct dependency (the media decoder);
+      // @huggingface/transformers depends on it too and shares the hoisted copy
+      // in plugin/node_modules when their ranges overlap. sharp 0.35
+      // ships no install/preinstall/postinstall script, so it passes
+      // scripts/check-postinstall-allowlist.js. It is still marked external in
+      // the bundles below so it resolves at runtime, never at build time.
       optionalDependencies: {
         '@huggingface/transformers': '^4.2.0',
       },
@@ -591,6 +607,7 @@ async function buildHooks() {
       ...SOURCEMAP_OPTS,
       logLevel: 'error', // Suppress warnings (import.meta warning is benign)
       external: [
+        'sharp',
         'bun:sqlite',
         // bun:ffi backs Windows listen-socket HANDLE_FLAG_INHERIT clearing (#3300).
         'bun:ffi',
@@ -916,7 +933,9 @@ async function buildHooks() {
       // plugin/node_modules instead of being inlined (keeps the bundle slim). The
       // worker and MCP server inline zod because a Codex or Claude Desktop copy of
       // the plugin may have no node_modules.
-      external: ['bun:sqlite', 'zod', ...POSTHOG_OPTIONAL_IMPORTS],
+      // processor.ts reaches ingestObservation's lazy media converter; keep
+      // the native decoder external exactly as the worker bundle does.
+      external: ['sharp', 'bun:sqlite', 'zod', ...POSTHOG_OPTIONAL_IMPORTS],
       define: {
         '__DEFAULT_PACKAGE_VERSION__': `"${version}"`,
         ...DIRNAME_DEFINE
@@ -1113,6 +1132,7 @@ async function buildHooks() {
       'PostToolUse',
       'Stop',
       'PostCompact',
+      'SubagentStart',
     ]);
     const requiredDistributionFiles = [
       'plugin/skills/mem-search/SKILL.md',

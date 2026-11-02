@@ -362,6 +362,38 @@ const runPowerShellHidden: PowerShellRunner = (script, extraEnvironment) => {
   };
 };
 
+// The bun path goes in by env var, never interpolated; only the ASCII 8.3 form comes out.
+const WINDOWS_SHORT_PATH_SCRIPT = '(New-Object -ComObject Scripting.FileSystemObject).GetFile($env:CLAUDE_MEM_BUN_PATH).ShortPath';
+
+function isAsciiPath(filePath: string): boolean {
+  return /^[\x20-\x7e]+$/.test(filePath);
+}
+
+/**
+ * The bun executable to compile with. On Windows `bun build --compile` copies
+ * the running bun.exe into the output, and Bun cannot open its own executable
+ * when that path has non-ASCII characters, e.g. under a Cyrillic user profile:
+ * "failed to copy bun executable into temporary file: ENOENT" (#5038). The 8.3
+ * short form of the same path is ASCII, so the compile runs bun through it.
+ * Throws when Windows has no short name for it (8.3 names disabled).
+ */
+export function resolveCompileBunPath(
+  bunPath: string,
+  platform: NodeJS.Platform,
+  runPowerShell: PowerShellRunner,
+): string {
+  if (platform !== 'win32' || isAsciiPath(bunPath)) return bunPath;
+  const shortPathResult = runPowerShell(WINDOWS_SHORT_PATH_SCRIPT, { CLAUDE_MEM_BUN_PATH: bunPath });
+  if (shortPathResult.spawnErrorMessage !== null || shortPathResult.status !== 0) {
+    const lookupFailureDetail = shortPathResult.spawnErrorMessage
+      ?? (shortPathResult.stderr.trim() || `exit ${shortPathResult.status}`);
+    throw new Error(`Could not look up the 8.3 short path for Bun at ${bunPath} (needed because bun build --compile cannot read a non-ASCII path on Windows, #5038): ${lookupFailureDetail}`);
+  }
+  const shortPath = shortPathResult.stdout.trim();
+  if (isAsciiPath(shortPath)) return shortPath;
+  throw new Error(`Bun at ${bunPath} is on a path with non-ASCII characters, which bun build --compile cannot read on Windows, and Windows has no 8.3 short name for it; install Bun in a folder whose path is ASCII only (for example C:\\bun), then run \`npx claude-mem install\``);
+}
+
 /**
  * Read-check-append-write of the USER Path in one PowerShell process; the Path
  * value never round-trips through Node. Only the directory goes in (by env
@@ -374,6 +406,19 @@ const runPowerShellHidden: PowerShellRunner = (script, extraEnvironment) => {
  * - Raw registry writes do not notify Explorer; setting and clearing a dummy
  *   variable through `SetEnvironmentVariable(..., 'User')` broadcasts
  *   WM_SETTINGCHANGE so new terminals pick up the change.
+ * - Guards (#5044): the script refuses to write `Path` when the launcher
+ *   directory env var is missing or empty, or when the new value would be
+ *   shorter than the existing one (an append can only grow the value), and it
+ *   backs the old value up to `%LOCALAPPDATA%\claude-mem\user-path.bak` first
+ *   — one bad run must never be able to blank the user Path. The backup is
+ *   written only when the existing value is non-empty, so a run after a
+ *   blanking never overwrites the last good copy; a failed backup is reported
+ *   on stderr (not `Write-Error`, which `Stop` would make terminating) and the
+ *   append continues.
+ * - The broadcast variable is removed with `DeleteValue`, not
+ *   `SetEnvironmentVariable(..., $null)`: PowerShell 5.1 passes `$null` to
+ *   .NET string parameters as `""`, which leaves the value behind as an empty
+ *   REG_SZ instead of deleting it.
  * - `setx` is never used: it truncates at 1024 characters.
  */
 export const WINDOWS_USER_PATH_APPEND_SCRIPT = [
@@ -382,12 +427,19 @@ export const WINDOWS_USER_PATH_APPEND_SCRIPT = [
   "$existingUserPath = [string]$environmentKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')",
   "$pathValueKind = if ($environmentKey.GetValueNames() -contains 'Path') { $environmentKey.GetValueKind('Path') } else { 'ExpandString' }",
   `$launcherDirectory = $env:${LAUNCHER_DIRECTORY_ENVIRONMENT_VARIABLE}`,
+  "if (-not $launcherDirectory) { 'missing-launcher-directory'; exit 1 }",
   "$normalizePathEntry = { param($pathEntry) [Environment]::ExpandEnvironmentVariables($pathEntry).Trim().Trim('\"').TrimEnd('\\') }",
   "if ($existingUserPath -split ';' | Where-Object { $_ -and ((& $normalizePathEntry $_) -ieq (& $normalizePathEntry $launcherDirectory)) }) { 'present'; exit 0 }",
   "$updatedUserPath = if ($existingUserPath -eq '') { $launcherDirectory } elseif ($existingUserPath.EndsWith(';')) { $existingUserPath + $launcherDirectory } else { \"$existingUserPath;$launcherDirectory\" }",
+  "if ($updatedUserPath.Length -lt $existingUserPath.Length) { 'shortened-user-path'; exit 1 }",
+  "$backupFile = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'claude-mem\\user-path.bak'",
+  "if ($existingUserPath) {",
+  "  try { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupFile) | Out-Null; [System.IO.File]::WriteAllText($backupFile, $existingUserPath) }",
+  "  catch { [Console]::Error.WriteLine(\"user-path-backup-failed: $($_.Exception.Message)\") }",
+  "}",
   "$environmentKey.SetValue('Path', $updatedUserPath, $pathValueKind)",
   "[Environment]::SetEnvironmentVariable('CLAUDE_MEM_PATH_BROADCAST', '1', 'User')",
-  "[Environment]::SetEnvironmentVariable('CLAUDE_MEM_PATH_BROADCAST', $null, 'User')",
+  "$environmentKey.DeleteValue('CLAUDE_MEM_PATH_BROADCAST', $false)",
   "'added'",
 ].join('\n');
 
@@ -652,8 +704,8 @@ function moveCompiledLauncherIntoPlace(
  * LauncherEnsureInvocationContext) nothing is compiled, but the cheap PATH
  * step still runs. `resolveBunPath` runs only when a compile is needed.
  * A foreign `claude-mem` at the launcher path is never replaced.
- * Throws on a missing bundle, a Bun older than 1.2.16 (#4933), a failed
- * compile or an unusable result.
+ * Throws on a missing bundle, a Bun older than 1.2.16 (#4933), a Windows Bun
+ * path with no ASCII form (#5038), a failed compile or an unusable result.
  */
 export function ensureLauncherOnPath(options: {
   pluginRoot: string;
@@ -710,6 +762,8 @@ export function ensureLauncherOnPath(options: {
     throw new Error(`Bun ${bunVersion} at ${bunPath} is older than ${MINIMUM_BUN_VERSION_FOR_BUN_BE_BUN}, which the claude-mem launcher needs; run \`bun upgrade\` (or update Bun with your version manager), then \`npx claude-mem install\``);
   }
 
+  const compileBunPath = resolveCompileBunPath(bunPath, host.platform, options.runPowerShell ?? runPowerShellHidden);
+
   mkdirSync(binDirectory, { recursive: true });
   removeStalePlacementLeftovers(binDirectory, platformPath);
   // Compile beside the target, then rename over it, so two concurrent
@@ -720,7 +774,7 @@ export function ensureLauncherOnPath(options: {
   const runCodesign = options.runCodesign ?? runAdhocCodesign;
   try {
     const compileResult = runCompile(
-      bunPath,
+      compileBunPath,
       buildLauncherCompileArguments(launcherBundlePath, temporaryOutfilePath),
       binDirectory,
     );

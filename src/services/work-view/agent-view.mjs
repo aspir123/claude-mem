@@ -1,14 +1,15 @@
 // A read-only projection of recorded work and observation activity. A captured
 // tool call establishes its author, never the assignee or live presence.
 import { buildHumanRequests } from './request-projection.mjs';
-import { OWNER_GOALS_LIST, isOwnerGoalsList } from './owner-goals.mjs';
+import { goalKindOf, OWNER_GOALS_LIST, isOwnerGoalsList } from './owner-goals.mjs';
 import { buildRules, isMyRulesList } from './my-rules.mjs';
+import { buildFocusAreas, isMyFocusList, placeRequests } from './my-focus.mjs';
 import { isWorkProductField, productsFromFields, readProductRecords } from './work-product.mjs';
 import { agentStopFor, isAgentLifecycleList, readAgentStops } from './agent-lifecycle.mjs';
 import { withDerivedProjects } from './session-project.mjs';
 const PROJECT_KEY = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => c.toLowerCase());
 const CLOSED = new Set(['done', 'dropped', 'completed', 'failed']);
-const PLATFORMS = { codex: 'Codex', claude: 'Claude Code', 'gemini-cli': 'Gemini CLI', kimi: 'Kimi', 'hermes-cli': 'Hermes', 'pi-agent': 'Pi' };
+const PLATFORMS = { codex: 'Codex', claude: 'Claude Code', 'gemini-cli': 'Gemini CLI', 'antigravity-cli': 'Antigravity CLI', kimi: 'Kimi', 'hermes-cli': 'Hermes', 'pi-agent': 'Pi' };
 const stamp = (value) => Number.isFinite(Number(value)) && Number(value) > 0 ? new Date(Number(value)).toISOString() : null;
 const fingerprint = (value) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
 const callKey = (project, list, fields) => JSON.stringify([PROJECT_KEY(project), list, fingerprint(fields)]);
@@ -85,7 +86,7 @@ export function readAgentRecords(database, { observationLimit = 300, summaryLimi
     FROM observations ORDER BY created_at_epoch DESC, id DESC LIMIT ?`, [observationLimit]);
   const summaries = safeRead(database, `SELECT id, project, memory_session_id, prompt_number, request, completed, next_steps, created_at_epoch
     FROM session_summaries ORDER BY created_at_epoch DESC, id DESC LIMIT ?`, [summaryLimit]);
-  const { productCalls, productObservations } = readProductRecords((sql, params) => safeRead(database, sql, params), workSinceEpoch);
+  const { productCalls, productObservations, productDeliverables } = readProductRecords((sql, params) => safeRead(database, sql, params), workSinceEpoch);
   const ids = [...new Set([...calls, ...productCalls].map((call) => call.session_db_id).filter((id) => id != null))];
   const memoryIds = [...new Set([...observations, ...summaries, ...productObservations].map((row) => row.memory_session_id).filter(Boolean))];
   const predicates = [], args = [];
@@ -126,7 +127,7 @@ export function readAgentRecords(database, { observationLimit = 300, summaryLimi
     AND content_session_id IN (${contentArgs}) ORDER BY id DESC LIMIT 2000`, contentIds) : [];
   const agentToolActivity = contentIds.length ? safeRead(database, `SELECT content_session_id, agent_id, MAX(created_at_epoch) AS last_epoch
     FROM tool_uses WHERE agent_id IS NOT NULL AND content_session_id IN (${contentArgs}) GROUP BY content_session_id, agent_id`, contentIds) : [];
-  return { calls, observations, summaries, sessions, prompts, productCalls, productObservations, agentLaunches, agentToolActivity };
+  return { calls, observations, summaries, sessions, prompts, productCalls, productObservations, productDeliverables, agentLaunches, agentToolActivity };
 }
 
 // The parent's Agent (formerly Task) calls, by [content session, agent id].
@@ -282,7 +283,7 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     activity.push({ ...entry, agentGroupId: group.id });
   }
 
-  const candidates = state.lists.filter((list) => !isOwnerGoalsList(list.name) && !isMyRulesList(list.name) && !isAgentLifecycleList(list.name)).flatMap((list) => [
+  const candidates = state.lists.filter((list) => !isOwnerGoalsList(list.name) && !isMyRulesList(list.name) && !isMyFocusList(list.name) && !isAgentLifecycleList(list.name)).flatMap((list) => [
     ...list.tasks.map((task) => ({ ...task, list, recordKind: 'task' })),
     ...(Object.keys(list.fields).some((key) => key !== 'task') ? [{ id: list.id, name: list.name, fields: list.fields, status: list.status, isOpen: !CLOSED.has(list.status), updatedAtEpoch: list.stateUpdatedAtEpoch, latestEntryId: state.events.find((event) => event.listId === list.id && event.task === null)?.id ?? 0, list, recordKind: 'list' }] : []),
   ]).sort((a, b) => b.updatedAtEpoch - a.updatedAtEpoch).slice(0, workLimit);
@@ -424,17 +425,27 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
   }).sort((a, b) => String(b.presence.lastActivityAt ?? '').localeCompare(String(a.presence.lastActivityAt ?? '')));
   const recentActivity = activity.sort((a, b) => b.atEpoch - a.atEpoch).slice(0, activityLimit);
   const requestProjection = buildHumanRequests({ agents, recentActivity }, records, { titleCache, ledger });
+  const { focusAreas, focusAreaIdByAnchor } = buildFocusAreas(state);
   return {
     version: 1, generatedAt: stamp(now), currentProject: state.currentProject, currentProjectScope: state.currentProjectScope,
     agents, recentActivity, goals: buildOwnerGoals(state), goalHistory: buildOwnerGoalHistory(state),
     ...buildRules(state, ledger),
     ...requestProjection,
+    focusAreas, humanRequests: placeRequests(requestProjection.humanRequests, focusAreaIdByAnchor, ledger),
     coverage: { workRows: candidates.length, workLimit, linkedWork, ownerWork, unattributedWork, observations: observations.length, observationLimit: 300, summaries: summaries.length, livePresenceAvailable: false, summaryMethod: 'bounded-recorded-text', fullHistoryUrl: '/viewer' },
   };
 }
 
-// Evidence is saved as one string field, a line per quote: "YYYY-MM-DD HH:MM | quote".
-function goalEvidence(value) {
+// Hosted quotes retain their structure: a quote may contain newlines, so the legacy line format cannot represent it losslessly.
+function goalEvidence(value, structuredValue = null) {
+  if (structuredValue !== null) {
+    const evidence = JSON.parse(structuredValue);
+    if (!Array.isArray(evidence) || !evidence.every(item => item && typeof item.at === 'string' && typeof item.quote === 'string')) {
+      throw new TypeError('Hosted goal evidence must contain dated quote objects.');
+    }
+    return evidence;
+  }
+  // Legacy evidence is a line per quote: "YYYY-MM-DD HH:MM | quote".
   if (typeof value !== 'string') return [];
   return value.split('\n').flatMap((line) => {
     const match = /^(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})?)\s*\|\s*(.+)$/.exec(line.trim());
@@ -447,21 +458,36 @@ function goalEvidence(value) {
 // a past month (saved closed, as history) shows everything but dropped items.
 function goalsFromList(list, history) {
   const count = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
-  const items = list.tasks.filter((task) => history ? task.status !== 'dropped' : task.isOpen).map((task) => ({
-    id: task.id, task: task.name, kind: task.fields.goal_kind === 'open-ask' ? 'open-ask' : 'priority',
-    rank: count(task.fields.rank), title: compactText(task.fields.title ?? task.name, 240),
-    product: compactText(task.fields.product, 60), latestAt: compactText(task.fields.latest_at, 20),
-    timesAsked: count(task.fields.times_asked), status: task.status, evidence: goalEvidence(task.fields.evidence),
-  })).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity) || a.title.localeCompare(b.title));
+  // A later local refresh changes generated_at/snapshot; its older hosted fields must not override the new result.
+  const hosted = list.fields.source === 'hosted-intent' && list.fields.hosted_generated_at === list.fields.generated_at;
+  const originalText = value => typeof value === 'string' ? value : null;
+  const listText = (value, max) => hosted ? originalText(value) : compactText(value, max);
+  const items = list.tasks.filter((task) => history ? task.status !== 'dropped' : task.isOpen).map((task) => {
+    const hostedTask = task.fields.source === 'hosted-intent' && task.fields.hosted_snapshot === task.fields.snapshot;
+    const taskText = (value, max) => hostedTask ? originalText(value) : compactText(value, max);
+    return {
+      id: task.id, task: task.name, kind: goalKindOf(task.fields).kind,
+      rank: count(task.fields.rank), title: taskText(task.fields.title ?? task.name, 240),
+      // A focus area's one-sentence goal; an ask's focus area (the name it was mined with) and that area's id.
+      // 300 and 80 are the bounds they are written with: an area's goal and name (MAX_AREA_GOAL_CHARS and
+      // MAX_AREA_NAME_CHARS in save_goals.py, the same as focusBody / ownerGoalsFocusBody in WorkViewRoutes.ts).
+      goal: taskText(task.fields.goal, 300), focusArea: taskText(task.fields.focus_area, 80),
+      focusAreaId: typeof task.fields.focus_area_id === 'string' ? task.fields.focus_area_id : null,
+      // Rows saved before the three tests (2026-10-27) name a product instead of a focus area.
+      product: taskText(task.fields.product, 60), latestAt: taskText(task.fields.latest_at, 20),
+      timesAsked: count(task.fields.times_asked), status: task.status,
+      evidence: goalEvidence(task.fields.evidence, hostedTask ? task.fields.evidence_json ?? null : null),
+    };
+  }).sort((a, b) => (a.rank ?? Infinity) - (b.rank ?? Infinity) || a.title.localeCompare(b.title));
   const day = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? '')) ? String(value) : null;
   return {
     listId: list.id, listName: list.name, history, project: list.project, updatedAt: list.updatedAt,
     periodStart: day(list.fields.period_start) ?? (history ? day(list.name.slice(OWNER_GOALS_LIST.length + 1)) : null),
     periodEnd: day(list.fields.period_end),
-    summary: compactText(list.fields.human_summary, 1600), generatedAt: compactText(list.fields.generated_at, 40),
+    summary: listText(list.fields.human_summary, 1600), generatedAt: listText(list.fields.generated_at, 40),
     windowDays: count(list.fields.window_days), sourcePromptCount: count(list.fields.source_prompt_count),
-    mapPath: compactText(list.fields.map_path, 400),
-    priorities: items.filter((item) => item.kind === 'priority'), openAsks: items.filter((item) => item.kind === 'open-ask'),
+    mapPath: listText(list.fields.map_path, 400),
+    areas: items.filter((item) => item.kind === 'focus-area'), asks: items.filter((item) => item.kind === 'ask'),
   };
 }
 
@@ -475,7 +501,7 @@ export function buildOwnerGoals(state) {
 export function buildOwnerGoalHistory(state) {
   return state.lists.filter((list) => list.name !== OWNER_GOALS_LIST && isOwnerGoalsList(list.name) && list.status !== 'dropped')
     .map((list) => goalsFromList(list, true))
-    .filter((goals) => goals.priorities.length || goals.openAsks.length)
+    .filter((goals) => goals.areas.length || goals.asks.length)
     .sort((a, b) => String(b.periodStart ?? b.listName).localeCompare(String(a.periodStart ?? a.listName)));
 }
 
