@@ -5,12 +5,13 @@
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
 import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
-import { parseJsonArray, formatTime, formatDate, formatHeaderDateTime } from '../../shared/timeline-formatting.js';
+import { parseJsonArray, formatTime, formatDate, formatHeaderDateTime, compactTime } from '../../shared/timeline-formatting.js';
 import { closeSync, openSync, readSync, statSync } from 'fs';
 import { homedir } from 'os';
 import path from 'path';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { loadFromFileOnce } from '../../shared/hook-settings.js';
+import { projectsQueryValues } from '../../shared/project-list.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { detectLanguage } from '../../services/smart-file-read/language-map.js';
 import { checkTreeSitterCliLoadable } from '../../services/smart-file-read/tree-sitter-bin-path.js';
@@ -19,6 +20,7 @@ import { claimFileContextInjection } from './file-context-dedupe.js';
 import { memorySearchHandler } from './memory-search.js';
 import { isQwenCodeHookEvent } from './session-init.js';
 import { resolveRuntimeContext } from '../../services/hooks/runtime-selector.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
 
 /** Below this a file gets neither the timeline nor a deny: reading it costs about what the timeline would. */
 const FILE_CONTEXT_MIN_BYTES = 1_500;
@@ -56,9 +58,6 @@ const TYPE_ICONS: Record<string, string> = {
   change: '\u2705',
 };
 
-function compactTime(timeStr: string): string {
-  return timeStr.toLowerCase().replace(' am', 'a').replace(' pm', 'p');
-}
 
 interface ObservationRow {
   id: number;
@@ -501,9 +500,16 @@ async function lookupFileObservationHistory(
     queryParams.append('path', candidate);
   }
   if (context.allProjects.length > 0) {
-    queryParams.set('projects', context.allProjects.join(','));
+    for (const value of projectsQueryValues(context.allProjects)) {
+      queryParams.append('projects', value);
+    }
   }
   queryParams.set('limit', String(FETCH_LOOKAHEAD_LIMIT));
+  // Keep the lookup on the calling harness's rows; the opt-out is the same
+  // cross-harness hand-off switch the other context paths honour.
+  if (input.platform && loadFromFileOnce().CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES !== 'true') {
+    queryParams.set('platformSource', normalizePlatformSource(input.platform));
+  }
 
   const result = await executeWithWorkerFallback<{ observations: ObservationRow[]; count: number }>(
     `/api/observations/by-file?${queryParams.toString()}`,

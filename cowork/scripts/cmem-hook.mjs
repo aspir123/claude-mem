@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 /**
- * claude-mem-cowork — thin HTTP hook shim for Cowork (Claude app cloud sessions).
+ * cmem-pro (CMEM Pro for the Claude app) — thin HTTP hook shim for Claude app
+ * cloud sessions.
  *
- * Local claude-mem runs a worker service on the user's machine. Cowork containers
- * are ephemeral, so this shim replaces the worker with HTTPS calls to cmem.ai:
+ * Local claude-mem runs a worker service on the user's machine. Claude app cloud
+ * containers are ephemeral, so this shim replaces the worker with HTTPS calls to cmem.ai:
  *
  *   capture  →  POST {base}/api/hooks/ingest      (raw hook payloads; Pro worker/observer runs server-side)
  *   inject   →  GET  {base}/api/hooks/context     (compiled context block)
@@ -28,7 +29,7 @@ import { spawnSync } from 'node:child_process';
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // Keep in step with cowork/.claude-plugin/plugin.json "version"; every request sends it.
-const PLUGIN_HEADER = 'claude-mem-cowork/0.1.5';
+const PLUGIN_HEADER = 'cmem-pro/0.2.0';
 // per-user, 0600 — never a shared world-readable temp dir (payloads may hold tool output)
 const SPOOL_DIR = join(homedir(), '.claude-mem');
 const SPOOL = join(SPOOL_DIR, 'cowork-spool.jsonl');
@@ -255,19 +256,33 @@ function truncate(v, cap) {
 // POST nor the retry spool ever holds raw credentials. All patterns are
 // single-pass linear regexes over capped input (FIELD_CAP/PROMPT_CAP).
 const REDACTED = '[cmem-redacted]';
+// Prefix shapes start with (?<=\\[nrt]|\b), the worker's perplexity_key start
+// (src/utils/redaction.ts): clean() redacts JSON.stringify()'d values, where a
+// newline right before a key arrives as `\n`. The `n` is a word character, so
+// a bare `\b` could not match there and the key went out verbatim.
 const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, // PEM key blocks
   /\b(?:Bearer|Basic|Token)[ \t]+[A-Za-z0-9._~+/=-]{16,512}\b/gi,                // auth scheme credentials
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,            // JWTs
-  /\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b/g,                                         // OpenAI/Anthropic-style keys
-  /\b[sprk]k_(?:live|test)_[A-Za-z0-9]{10,}\b/g,                                 // Stripe-style keys
-  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,                                             // GitHub tokens
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,                                           // GitHub fine-grained PATs
-  /\bglpat-[A-Za-z0-9_-]{20,}\b/g,                                               // GitLab PATs
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,                                           // Slack tokens
-  /\b(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}\b/g,               // AWS access key ids
-  /\bAIza[0-9A-Za-z_-]{35}\b/g,                                                  // Google API keys
-  /\bnpm_[A-Za-z0-9]{36}\b/g                                                     // npm tokens
+  /(?<=\\[nrt]|\b)eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, // JWTs
+  /(?<=\\[nrt]|\b)sk-(?:ant-)?[A-Za-z0-9_-]{16,}\b/g,                           // OpenAI/Anthropic-style keys
+  /(?<=\\[nrt]|\b)[sprk]k_(?:live|test)_[A-Za-z0-9]{10,}\b/g,                   // Stripe-style keys
+  /(?<=\\[nrt]|\b)gh[pousr]_[A-Za-z0-9]{20,}\b/g,                               // GitHub tokens
+  /(?<=\\[nrt]|\b)github_pat_[A-Za-z0-9_]{20,}\b/g,                             // GitHub fine-grained PATs
+  /(?<=\\[nrt]|\b)glpat-[A-Za-z0-9_-]{20,}\b/g,                                 // GitLab PATs
+  /(?<=\\[nrt]|\b)xox[baprs]-[A-Za-z0-9-]{10,}\b/g,                             // Slack tokens
+  /(?<=\\[nrt]|\b)(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA)[0-9A-Z]{16}\b/g, // AWS access key ids
+  /(?<=\\[nrt]|\b)AIza[0-9A-Za-z_-]{35}\b/g,                                    // Google API keys
+  /(?<=\\[nrt]|\b)npm_[A-Za-z0-9]{36}\b/g,                                      // npm tokens
+  // Vendor provider keys, matching the worker's redaction set
+  // (src/utils/redaction.ts): NVIDIA NIM, Runcrate, Groq, xAI and Perplexity
+  // all issue prefixed keys that no pattern above claims, so a key pasted as
+  // bare prose reached the ingest verbatim. The (?!\w) tail is the same
+  // "the token ends here" check the worker uses (\b cannot follow a `-`).
+  /(?<=\\[nrt]|\b)nvapi-[A-Za-z0-9_-]{32,}(?!\w)/g,                             // NVIDIA NIM keys
+  /(?<=\\[nrt]|\b)rc_live_[A-Za-z0-9_-]{24,}(?!\w)/g,                           // Runcrate keys
+  /(?<=\\[nrt]|\b)gsk_[A-Za-z0-9]{52}(?!\w)/g,                                  // Groq keys
+  /(?<=\\[nrt]|\b)xai-[A-Za-z0-9_]{80}(?!\w)/g,                                 // xAI keys
+  /(?<=\\[nrt]|\b)pplx-[A-Za-z0-9]{48}(?!\w)/g                                  // Perplexity keys
 ];
 // `password: …` / `api_key=…` style assignments — keep the key, redact the
 // ENTIRE value through the line or record delimiter (quote, backtick, comma,
@@ -572,7 +587,7 @@ async function mcpSearch(query, limit, project) {
     const init = await mcpRpc('initialize', {
       protocolVersion: '2025-03-26',
       capabilities: {},
-      clientInfo: { name: 'claude-mem-cowork', version: '0.1.0' }
+      clientInfo: { name: 'cmem-pro', version: '0.2.0' }
     }, 1);
     if (!init.ok) return null;
     await mcpRpc('notifications/initialized', {}, undefined).catch?.(() => {});
@@ -624,12 +639,26 @@ function contextBlock(text, cwd) {
 
 // ---------- event handlers ----------
 
+// When the hooks can't reach cmem.ai, a connected memory connector usually
+// still can (it goes through the host's own connector path, not this
+// container's network). Point the session at it so recall keeps working, and
+// so durable notes land there when the connector offers a save tool.
+function connectorFallback(project) {
+  return [
+    '',
+    'Recall still works through the cmem.ai memory connector if it is connected here: the "cmem" connector on the CMEM Pro plugin\'s Connectors tab, or the Claude-Mem connector (its memory_search, timeline and get_observations tools).',
+    `Before relying on earlier context, search there: try project ${project} first, then without a project filter.`,
+    'If that connector offers save_memory, save durable decisions and handoffs there (project: ' + project + '), since this session\'s hooks cannot.'
+  ];
+}
+
 function emptyNotice(project) {
   if (CLOUD_REACHED === false) {
     return [
       `Claude-Mem is installed here but can't reach cmem.ai from this session, so notes from this session are not being saved yet (project: ${project}).`,
       'Notes wait in a local queue and are lost if this container is recycled.',
-      'If the user asks about memory, tell them exactly this: do not say notes are being saved.'
+      'If the user asks about memory, tell them exactly this: do not say notes are being saved.',
+      ...connectorFallback(project)
     ].join('\n');
   }
   return [
@@ -731,7 +760,11 @@ async function onSessionInit(input) {
   });
 }
 
-const ALWAYS_SKIP = /^(mcp__memory__|mcp__cmem)/;
+// Memory reads are never captured (feedback-loop guard): the Claude memory tool,
+// a connector named cmem*, the Claude-Mem connector — mcp__Claude-Mem__* in the
+// Claude app, mcp__claude_ai_Claude-Mem__* when Claude Code loads it — and this
+// plugin's own cmem.ai connector (.mcp.json), mcp__plugin_cmem-pro_cmem__*.
+const ALWAYS_SKIP = /^(mcp__memory__|mcp__cmem|mcp__(claude_ai_)?claude-mem__|mcp__plugin_cmem-pro_)/i;
 
 // ---------- image capture (media contract v1; gated by CFG.capture.media) ----------
 // Recognized native image blocks are pulled out of the RAW tool response before
@@ -954,7 +987,7 @@ function mediaUploadForm(image, toolUseId) {
 
 // One bounded code per failure; never ids, labels, paths or bytes.
 function logMediaFailure(code) {
-  try { process.stderr.write(`claude-mem-cowork: media upload failed (${code})\n`); } catch { /* never break the hook */ }
+  try { process.stderr.write(`cmem-pro: media upload failed (${code})\n`); } catch { /* never break the hook */ }
 }
 
 async function uploadImage(image, toolUseId, deadline) {

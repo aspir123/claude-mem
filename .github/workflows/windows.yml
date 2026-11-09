@@ -14,6 +14,14 @@ on:
   push:
     branches: [main]
 
+
+# A newer push to the same branch or PR cancels the older run: its result is
+# already out of date. 174 of 224 CI push runs on main (Nov 1-7) were superseded
+# yet ran to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     # Pinned to windows-2022 (VS2022 / v17). The windows-latest image moved to
@@ -73,10 +81,19 @@ jobs:
       # scripts that replaced rsync and tail: mirror pattern matching, --delete
       # protection and -a metadata reconciliation against real NTFS paths, and
       # the bounded log tail under a constrained heap.
-      - shell: pwsh
+      - name: Windows bun resolver and rsync-replacement scripts
+        shell: pwsh
         run: |
           $bun = Join-Path $env:USERPROFILE '.bun\\bin\\bun.exe'
-          & $bun test tests/bun-runner.test.ts tests/scripts/mirror-dir.test.ts tests/scripts/worker-logs.test.ts
+          & $bun test tests/bun-runner.test.ts tests/scripts/mirror-dir.test.ts tests/scripts/worker-logs.test.ts --timeout 120000
+
+      # Bun's Glob returns backslash paths on Windows. The lane split must still
+      # send tests/integration and smart-file-read files to the integration lane.
+      - name: Test-lane split on Windows paths
+        shell: pwsh
+        run: |
+          $bun = Join-Path $env:USERPROFILE '.bun\\bin\\bun.exe'
+          & $bun test tests/scripts/test-lanes.test.ts
 
       # The installer's refusal boundaries: non-TTY and TTY cases that require
       # exit 1, require --runtime worker, untouched settings (mode included) and

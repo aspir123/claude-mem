@@ -4,6 +4,7 @@ import { relativeTimePlaceholder } from '../../../shared/context-cache.js';
 import { isOwnerGoalsList } from '../../work-view/owner-goals.mjs';
 import { isMyRulesList } from '../../work-view/my-rules.mjs';
 import { isMyFocusList } from '../../work-view/my-focus.mjs';
+import { isSharedWorkList } from '../../work-view/shared-records.mjs';
 
 /**
  * When "updated N ago" is measured from: an epoch, or 'placeholders' to leave
@@ -104,6 +105,7 @@ export function renderWorkStateList(
 
 /** Lines for every list in `entries`, the most recently written list first. */
 export function renderWorkStateLines(entries: WorkStateEntry[], nowEpoch: WorkStateClock, includeClosed: boolean = false): string[] {
+  entries = entries.filter(entry => !isSharedWorkList(entry.list_name));
   const entriesByList = new Map<string, WorkStateEntry[]>();
   const listProjectCounts = new Map<string, number>();
   /** Position of each list's latest entry in `entries`, which arrive in write order. */
@@ -137,15 +139,23 @@ export function renderWorkStateLines(entries: WorkStateEntry[], nowEpoch: WorkSt
     });
 }
 
+/**
+ * Whether the SessionStart section shows this list. Goals lists (owner-goals
+ * and its past months), My Rules and My Focus show in My Work; their quotes
+ * would fill this section. Approved rules reach agents through
+ * ~/.claude-mem/MY-RULES.md instead. Shared My Work records never show.
+ */
+export function isSessionStartWorkStateList(listName: string): boolean {
+  return !isOwnerGoalsList(listName) && !isMyRulesList(listName) && !isMyFocusList(listName) && !isSharedWorkList(listName);
+}
+
 /** The SessionStart section: the rule, then what is still open, cut to `characterLimit`. */
 export function buildWorkStateContextSection(
   entries: WorkStateEntry[],
   nowEpoch: WorkStateClock,
   characterLimit: number = WORK_STATE_SECTION_CHARACTER_LIMIT,
 ): string {
-  // Goals lists (owner-goals and its past months), My Rules and My Focus show in My Work; their quotes would fill this section.
-  // Approved rules reach agents through ~/.claude-mem/MY-RULES.md instead.
-  const openLines = renderWorkStateLines(entries.filter(entry => !isOwnerGoalsList(entry.list_name) && !isMyRulesList(entry.list_name) && !isMyFocusList(entry.list_name)), nowEpoch);
+  const openLines = renderWorkStateLines(entries.filter(entry => isSessionStartWorkStateList(entry.list_name)), nowEpoch);
   if (openLines.length === 0) {
     return `${WORK_STATE_RULE}\n\nNothing open yet.`;
   }

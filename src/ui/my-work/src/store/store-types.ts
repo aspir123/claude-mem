@@ -5,8 +5,9 @@ import type { OwnerRule, RuleChange } from '../data-rules.ts'
 import type { ConnectionStatus } from '../live/connection-status.ts'
 import type { ReviewResult } from '../live/review-response.ts'
 import type { RuleDecision, SavedRuleDecision } from '../live/rule-actions.ts'
+import type { RequestChange } from '../live/update-queue.ts'
 import type { UsageReport } from '../live/usage.ts'
-import type { RuleSaveResult, WorkDataSource, WorkModel } from '../live/work-data-source.ts'
+import type { RuleSaveResult, SuggestionSaveResult, WorkDataSource, WorkModel } from '../live/work-data-source.ts'
 
 // ---------- Work: the active source's model ----------
 
@@ -21,6 +22,8 @@ export interface WorkState {
   connection: ConnectionStatus | null
   /** Requests whose recorded content changed in the last applied model; their cards show the "Just updated" dot. */
   freshlyUpdatedIds: Set<string>
+  /** What changed in the models this screen showed, newest first, one entry per request (update-queue.ts). */
+  recentChanges: RequestChange[]
   sourceKind: WorkDataSource['sourceKind'] | null
   /** A save went through but reading the model after it failed. The save stands; this says why the screen may lag. */
   refreshError: string | null
@@ -32,15 +35,19 @@ export interface WorkSlice {
   startWorkSource: (source: WorkDataSource) => () => void
   /** Reads the active source again: the Retry after a failed first read. */
   retryWorkRead: () => Promise<void>
+  /** Loads one compact request's complete detail; old/full sources return the supplied request. */
+  loadRequestDetail: (request: Request, options?: { signal?: AbortSignal }) => Promise<Request>
   receiveWorkModel: (model: WorkModel) => void
   receiveConnection: (connection: ConnectionStatus) => void
   /** Checks (or undoes the check of) the version of a request that was on screen. */
-  setRequestChecked: (requestId: string, checked: boolean, expectedFingerprint: string | undefined) => Promise<ReviewResult>
+  setRequestChecked: (requestId: string, checked: boolean, expectedFingerprint: string | undefined, expectedReviewHash?: string | null) => Promise<ReviewResult>
+  answerRequestSuggestion: (suggestion: NonNullable<Request['suggestion']>, action: 'join' | 'not-this') => Promise<SuggestionSaveResult>
   /** Saves one rule change. Answers with the model the save returned, which is the receipt even if the screen has moved on. */
   saveRuleChange: (change: RuleChange) => Promise<RuleSaveResult>
   saveFocusChange: (change: FocusChange) => Promise<WorkModel>
   markAgentFinished: (agentId: string) => Promise<void>
   loadRulesInClaudeCode: () => Promise<void>
+  refreshWork: () => Promise<{ state: string }>
   /** Sample mode only: replace one fixture request everywhere. */
   updateSampleRequest: (id: string, change: (request: Request) => Request) => void
   /** Sample mode only: the wireframe agent finishes while you watch. Returns the stop. */
@@ -55,7 +62,7 @@ export type NavPage = 'work' | 'rules'
 /** What the main column shows: a page, or one of the focus views the rail opens. */
 export type Section = NavPage | 'suggested' | 'past-focus'
 export type WorkListView = 'cards' | 'list' | 'agents' | 'team'
-export type WorkFilter = 'all' | 'needs-you' | 'shipped' | 'closed'
+export type WorkFilter = 'all' | 'needs-you' | 'working' | 'shipped' | 'closed'
 export type WorkSort = 'attention' | 'started' | 'progress'
 export interface Workspace { mode: 'home' | 'web'; team: boolean; connected: boolean }
 export type FocusSelection = { kind: 'area'; focusAreaId: string } | { kind: 'suggested' } | { kind: 'past-focus' } | null

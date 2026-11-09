@@ -149,6 +149,14 @@ describe('installer OAuth start failure classification', () => {
     expect(lastOAuthStartFailure()).toBe('http_error');
   });
 
+  it('falls back to the HTTP status when a non-2xx body carries no message (#5493)', async () => {
+    expect(await withFetch(async () => new Response('Too Many Requests', { status: 429 }))).toBeNull();
+    expect(lastOAuthStartFailure()).toBe('http_error');
+    // #5493 — a refusal used to surface as "run again when cmem.ai is
+    // reachable", sending the user hunting for a network problem.
+    expect(lastOAuthStartErrorMessage()).toBe('cmem.ai answered HTTP 429');
+  });
+
   it('retains the server error message for the caller to show', async () => {
     expect(await withFetch(async () => Response.json({
       error: 'intent_credentials_invalid', message: 'This installation credential was not accepted.',
@@ -250,6 +258,61 @@ describe('installer OAuth start failure classification', () => {
   });
 });
 
+describe('installer OAuth start with a setup episode (#5493)', () => {
+  const flow = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  // The exact shape cmem.ai's buildInstallerOAuthUrls returns when the start
+  // request carried setup_flow_id: the episode is copied into both claim URLs.
+  function echoedStartBody(echoedFlow: string, extra: Record<string, string> = {}) {
+    const login = `/api/pro/trial/claim?${new URLSearchParams({ pairing: pairingId, setup_flow_id: echoedFlow, login_only: '1', ...extra })}`;
+    const checkout = `https://cmem.ai/api/pro/trial/claim?${new URLSearchParams({ pairing: pairingId, setup_flow_id: echoedFlow, trial: '30', ...extra })}`;
+    return { ...validStartBody, authorization_url: `https://cmem.ai/login?next=${encodeURIComponent(login)}`, checkout_url: checkout };
+  }
+
+  it('accepts the episode it sent echoed in both claim URLs and keeps it in the links', () => {
+    const body = echoedStartBody(flow);
+    const parsed = parseInstallerOAuthStartBody(body, flow);
+    expect(parsed).not.toBeNull();
+    expect(parsed?.authorizationUrl).toBe(body.authorization_url);
+    expect(parsed?.checkoutUrl).toBe(body.checkout_url);
+  });
+
+  it('rejects an episode it did not send, a different episode, or any other extra parameter', () => {
+    expect(parseInstallerOAuthStartBody(echoedStartBody(flow))).toBeNull();
+    expect(parseInstallerOAuthStartBody(echoedStartBody(flow), 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')).toBeNull();
+    expect(parseInstallerOAuthStartBody(echoedStartBody(flow, { redirect: 'https://evil.example' }), flow)).toBeNull();
+  });
+
+  it('still accepts a server that leaves the episode out', () => {
+    expect(parseInstallerOAuthStartBody(validStartBody, flow)).not.toBeNull();
+  });
+
+  it('completes a start that sent an episode instead of failing bad_body', async () => {
+    const previousFetch = globalThis.fetch;
+    const previousDnt = process.env.DO_NOT_TRACK;
+    const previousTelemetry = process.env.CLAUDE_MEM_TELEMETRY;
+    let sent: Record<string, unknown> = {};
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      sent = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify(echoedStartBody(String(sent.setup_flow_id))), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    try {
+      delete process.env.DO_NOT_TRACK;
+      process.env.CLAUDE_MEM_TELEMETRY = 'on';
+      const pairing = await startInstallerOAuthPairing({ setupFlowId: flow });
+      expect(sent.setup_flow_id).toBe(flow);
+      expect(lastOAuthStartFailure()).toBeNull();
+      expect(pairing?.pairingId).toBe(pairingId);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousDnt === undefined) delete process.env.DO_NOT_TRACK; else process.env.DO_NOT_TRACK = previousDnt;
+      if (previousTelemetry === undefined) delete process.env.CLAUDE_MEM_TELEMETRY; else process.env.CLAUDE_MEM_TELEMETRY = previousTelemetry;
+    }
+  });
+});
+
 describe('installer trial-ready contract', () => {
   it('parses an OAuth-only pairing without accepting an email or identity', () => {
     expect(parseInstallerOAuthStartBody({
@@ -301,7 +364,9 @@ describe('installer trial-ready contract', () => {
     expect(output).toContain('__FETCH_CALLED__');
     expect(output).not.toContain('Sign-in link:');
     expect(output).not.toContain('AGENT:');
-    expect(output).toContain('Could not start the optional claude-mem sign-in.');
+    // #5493 — the reason is appended after the prefix, so a refusal no longer
+    // reads as a network problem.
+    expect(output).toContain('Could not start the optional claude-mem sign-in: cmem.ai answered HTTP 503');
     expect(output).toContain('__DEFERRED_DONE__');
   });
 
@@ -404,21 +469,69 @@ describe('installer trial-ready contract', () => {
     expect(source).not.toContain('CMEM_TRIAL_ACKNOWLEDGEMENT');
   });
 
-  it('requires OAuth before provider selection and contains no retired email path', () => {
+  it('signs in before provider selection only for a named account-backed provider', () => {
     const source = readFileSync(join(repoRoot, 'src/npx-cli/commands/install.ts'), 'utf-8');
     const oauthIndex = source.indexOf('await requireInstallerOAuthLogin(version)');
-    const providerIndex = source.indexOf('await promptProvider(options, oauthPairing, version)');
+    const providerIndex = source.indexOf('await promptProvider(options, oauthPairing, version, signInForCmem)');
     expect(oauthIndex).toBeGreaterThan(-1);
     expect(providerIndex).toBeGreaterThan(oauthIndex);
+    // An interactive run with no provider named defers sign-in to the CMEM Pro pick.
+    const deferIndex = source.indexOf('} else if (isInteractive && !options.provider) {');
+    const accountGateIndex = source.indexOf('} else if (providerNeedsAccount(options.provider)) {');
+    expect(deferIndex).toBeGreaterThan(-1);
+    expect(deferIndex).toBeLessThan(accountGateIndex);
+    expect(source).toContain('if (!pairing && signIn) {');
     expect(source).not.toContain('promptBrowserLogin');
     expect(source).not.toContain('CMEM_PRO_TRIAL_START_URL');
-    expect(source).not.toContain('CLAUDE_MEM_ONLINE_OPTIN');
-    expect(source).not.toContain('Your email:');
+  });
+
+  it('asks for an optional email and note once, early, and only in an interactive terminal', () => {
+    const source = readFileSync(join(repoRoot, 'src/npx-cli/commands/install.ts'), 'utf-8');
+    const fnStart = source.indexOf('async function promptEmailOptIn(version: string)');
+    const fnEnd = source.indexOf('\n}\n', fnStart);
+    expect(fnStart).toBeGreaterThan(-1);
+    const fn = source.slice(fnStart, fnEnd);
+    expect(fn).toContain('if (!isInteractive) return;');
+    expect(fn).toContain('if (process.env.CI) return;');
+    expect(fn).toContain('CLAUDE_MEM_ONLINE_OPTIN');
+    expect(fn).toContain('Your work email (press Enter to skip):');
+    expect(fn).toContain('what are you working on, or how can we help you and your team?');
+    expect(source).toContain("source: 'npx-installer',");
+    expect(source).toContain("const DEFAULT_SIGNUP_ENDPOINT = 'https://cmem.ai/api/waitlist';");
+    // Asked near the start: before the overwrite question and before any sign-in.
+    const callIndex = source.indexOf('await promptEmailOptIn(version);');
+    expect(callIndex).toBeGreaterThan(-1);
+    expect(callIndex).toBeLessThan(source.indexOf("message: 'Overwrite existing installation?'"));
+    expect(callIndex).toBeLessThan(source.indexOf('oauthPairing = await requireInstallerOAuthLogin(version);'));
+  });
+
+  it('keeps every privacy statement true now that setup can ask for an email', () => {
+    // The opt-in sends an email to cmem.ai, so no copy may still say the CLI
+    // contacts cmem.ai only for the sign-in link or never asks for an email.
+    const installer = readFileSync(join(repoRoot, 'src/npx-cli/commands/install.ts'), 'utf-8');
+    const privacyLine = installer.split('\n').find(line => line.includes('on this machine. cmem.ai'));
+    expect(privacyLine).toBeDefined();
+    expect(privacyLine).toContain('your email and optional note');
+    expect(privacyLine).toContain('numbers-only usage summary');
+    const copies = [
+      'src/npx-cli/commands/install.ts',
+      'docs/public/installation.mdx',
+      'docs/public/cmem-pro-headless.mdx',
+      'docs/public/cursor/index.mdx',
+      'docs/public/hooks-architecture.mdx',
+      'src/services/worker/onboarding-explainer.md',
+      'plugin/skills/how-it-works/SKILL.md',
+    ];
+    for (const path of copies) {
+      const text = readFileSync(join(repoRoot, path), 'utf-8');
+      expect({ path, stale: /contacted? cmem\.ai once|cmem\.ai is contacted once|does \*\*not\*\* ask for an email|no email in the CLI|No email address or identity is accepted/.test(text) })
+        .toEqual({ path, stale: false });
+    }
   });
 
   it('stops any respawned worker after provider settings are persisted', () => {
     const source = readFileSync(join(repoRoot, 'src/npx-cli/commands/install.ts'), 'utf-8');
-    const providerIndex = source.indexOf('await promptProvider(options, oauthPairing, version)');
+    const providerIndex = source.indexOf('await promptProvider(options, oauthPairing, version, signInForCmem)');
     const cutoverIndex = source.indexOf("'provider-cutover'", providerIndex);
     const workerStartIndex = source.indexOf('workerStartResult = await ensureWorkerStarted', cutoverIndex);
     expect(providerIndex).toBeGreaterThan(-1);

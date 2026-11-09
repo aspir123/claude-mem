@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Test harness for claude-mem-cowork hooks. Mock cmem.ai server + assertions.
+// Test harness for the cmem-pro (CMEM Pro) hooks. Mock cmem.ai server + assertions.
 import http from 'node:http';
 import { execFile } from 'node:child_process';
 import { existsSync, rmSync, readFileSync, writeFileSync, statSync, mkdirSync, appendFileSync, mkdtempSync, cpSync } from 'node:fs';
@@ -79,6 +79,17 @@ const PORT = await new Promise(r => server.listen(0, '127.0.0.1', () => r(server
 rmSync(TESTHOME, { recursive: true, force: true });
 
 // ---- 1. observation capture ----
+console.log('\n[0] plugin identity');
+{
+  const plugin = JSON.parse(readFileSync(PLUGIN_DIR + '/.claude-plugin/plugin.json', 'utf8'));
+  const marketplace = JSON.parse(readFileSync(PLUGIN_DIR + '/../.claude-plugin/marketplace.json', 'utf8'));
+  const entry = marketplace.plugins.find(p => p.source === './cowork');
+  const header = (readFileSync(HOOK, 'utf8').match(/const PLUGIN_HEADER = '([^']+)'/) || [])[1];
+  check('plugin is named cmem-pro in plugin.json and the marketplace', plugin.name === 'cmem-pro' && entry?.name === 'cmem-pro', `${plugin.name} ${entry?.name}`);
+  check('old installs are renamed to cmem-pro', marketplace.renames?.['claude-mem-cowork'] === 'cmem-pro', JSON.stringify(marketplace.renames));
+  check('plugin.json, marketplace and X-CMEM-Plugin header carry one version', entry?.version === plugin.version && header === `cmem-pro/${plugin.version}`, `${plugin.version} ${entry?.version} ${header}`);
+}
+
 console.log('\n[1] PostToolUse observation');
 received = [];
 await run('observation', { session_id: 's1', cwd: '/home/claude', tool_name: 'Write', tool_use_id: 'tu_1', tool_input: { file_path: '/x.md', content: 'hello' }, tool_response: 'ok' });
@@ -135,6 +146,55 @@ check('slash-containing URI password fully redacted', !in2e.includes('pa/ss'), i
 check('at-sign-containing URI password fully redacted', !in2e.includes('pa@ss') && !in2e.includes(']@ss@'), in2e);
 check('URI host survives userinfo redaction', in2e.includes('db.internal/app'), in2e);
 check('Cookie header value redacted', !out2e.includes('opaque-session-secret-value'), out2e);
+// Bare vendor provider keys (the prefixed shapes the worker's redaction
+// covers): none of them is named api_key=/token:, so KEYVALUE_RE cannot catch
+// them — only the vendor shapes can.
+const nvapiKey = 'nvapi-' + 'Aa1'.repeat(11);
+const groqKey = 'gsk_' + 'A'.repeat(52);
+const runcrateKey = 'rc_live_' + 'Aa1'.repeat(9);
+const xaiKey = 'xai-' + 'A'.repeat(80);
+const pplxKey = 'pplx-' + 'A'.repeat(48);
+received = [];
+await run('observation', {
+  session_id: 's1', cwd: '/home/claude', tool_name: 'Bash', tool_use_id: 'tu_2v',
+  tool_input: { command: `echo pinned to ${nvapiKey} for build.nvidia.com` },
+  tool_response: `keys on record: ${groqKey}, ${runcrateKey}, ${xaiKey}, ${pplxKey}`
+});
+const ing2v = received.find(r => r.body?.payload?.tool_use_id === 'tu_2v');
+const in2v = String(ing2v?.body.payload.tool_input || '');
+const out2v = String(ing2v?.body.payload.tool_response || '');
+check('bare nvidia key redacted', !in2v.includes(nvapiKey) && in2v.includes('[cmem-redacted]'), in2v);
+check('bare groq key redacted', !out2v.includes(groqKey), out2v);
+check('bare runcrate key redacted', !out2v.includes(runcrateKey), out2v);
+check('bare xai key redacted', !out2v.includes(xaiKey), out2v);
+check('bare perplexity key redacted', !out2v.includes(pplxKey), out2v);
+check('vendor-key marker kept', out2v.includes('[cmem-redacted]'), out2v);
+// A structured tool_response is JSON-stringified before redaction, so a key
+// right after a newline arrives as `\nKEY`. The `n` is a word character, so a
+// bare `\b` start cannot match there; every prefix shape must accept the
+// escaped-whitespace start too (the worker's perplexity_key form).
+const ghpKey = 'ghp_' + 'Bb2'.repeat(10);
+const structuredKeys = { nvidia: nvapiKey, groq: groqKey, runcrate: runcrateKey, xai: xaiKey, perplexity: pplxKey, github: ghpKey };
+for (const [vendor, key] of Object.entries(structuredKeys)) {
+  received = [];
+  await run('observation', {
+    session_id: 's1', cwd: '/home/claude', tool_name: 'Bash', tool_use_id: `tu_2s_${vendor}`,
+    tool_input: { command: 'cat .env' }, tool_response: { stdout: 'ready\n' + key }
+  });
+  const outS = String(received.find(r => r.body?.payload?.tool_use_id === `tu_2s_${vendor}`)?.body.payload.tool_response || '');
+  check(`${vendor} key after a newline in a structured response redacted`, !outS.includes(key) && outS.includes('[cmem-redacted]'), outS);
+}
+// Minimum-length keys whose last character is `-`: the whole key must become
+// one marker (a `\b` tail would stop before the `-` and leave the key whole).
+const nvapiHyphenKey = 'nvapi-' + 'Aa1'.repeat(10) + 'x-';
+const runcrateHyphenKey = 'rc_live_' + 'Aa1'.repeat(7) + 'xy-';
+received = [];
+await run('observation', {
+  session_id: 's1', cwd: '/home/claude', tool_name: 'Bash', tool_use_id: 'tu_2vh',
+  tool_input: { command: 'env' }, tool_response: `nim ${nvapiHyphenKey} end; rc ${runcrateHyphenKey} end`
+});
+const outHyphen = String(received.find(r => r.body?.payload?.tool_use_id === 'tu_2vh')?.body.payload.tool_response || '');
+check('hyphen-ending minimum-length vendor keys become one marker each', outHyphen === 'nim [cmem-redacted] end; rc [cmem-redacted] end', outHyphen);
 // Token-scheme Authorization: redacted in the request body AND in the spool on failed delivery
 received = [];
 await run('observation', {
@@ -188,6 +248,16 @@ console.log('\n[3] skip guard');
 received = [];
 await run('observation', { session_id: 's1', tool_name: 'mcp__memory__memory_write', tool_use_id: 'tu_3' });
 check('memory tool calls not captured', !received.some(r => r.url.startsWith('/api/hooks/ingest')));
+// the Claude-Mem connector as the Claude app names it, and as Claude Code names it
+for (const tool of ['mcp__Claude-Mem__memory_search', 'mcp__Claude-Mem__timeline', 'mcp__Claude-Mem__save_memory', 'mcp__claude_ai_Claude-Mem__get_observations', 'mcp__plugin_cmem-pro_cmem__memory_search']) {
+  received = [];
+  await run('observation', { session_id: 's1', tool_name: tool, tool_use_id: 'tu_3b' });
+  check(`${tool} not captured`, !received.some(r => r.url.startsWith('/api/hooks/ingest')));
+}
+// a tool that only mentions claude-mem later in its name is still captured
+received = [];
+await run('observation', { session_id: 's1', tool_name: 'mcp__github__search_claude-mem_issues', tool_use_id: 'tu_3c' });
+check('other tools are still captured', received.some(r => r.url.startsWith('/api/hooks/ingest')));
 
 // ---- 4. SessionStart context injection ----
 console.log('\n[4] SessionStart inject');
@@ -492,6 +562,13 @@ received = [];
 out = (await run('prompt-context', { session_id: 'd5', cwd: '/home/user', prompt: wake('chan_6Off', 'Offline', 'cmsg_O', 'hi') }, { ...DUET, CMEM_API_BASE: 'http://127.0.0.1:1' })).out;
 j = out.trim() ? JSON.parse(out) : null;
 check('unreachable cloud → honest notice', j?.hookSpecificOutput?.additionalContext.includes("can't reach cmem.ai") && !j.hookSpecificOutput.additionalContext.includes('automatically taking notes'), out);
+{
+  const ctx = j?.hookSpecificOutput?.additionalContext || '';
+  const proj = (ctx.match(/project="([^"]+)"/) || [])[1];
+  check('unreachable cloud → points at the plugin\'s cmem.ai connector for recall', ctx.includes('"cmem" connector on the CMEM Pro plugin\'s Connectors tab') && ctx.includes('Claude-Mem connector') && ctx.includes('memory_search'), out);
+  check('…searching this project first, then without a filter', !!proj && ctx.includes(`try project ${proj} first`) && ctx.includes('without a project filter'), out);
+  check('…and saving only if the connector offers save_memory', ctx.includes('If that connector offers save_memory') && ctx.includes(`(project: ${proj})`), out);
+}
 
 // a proxied host re-runs the hook with the proxy turned on; stdin and output survive the hop
 received = [];

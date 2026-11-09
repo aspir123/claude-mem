@@ -1,7 +1,7 @@
 // The active source's model: fixtures in sample mode, real records otherwise (spec §12). Every page reads it from
 // here; live requests change only through their data source, never in the browser.
 import { SAMPLE_REQUESTS, SaveRefusedError, assertConsistentRequest, type Request } from '../../data.ts'
-import { freshlyUpdatedRequestIds } from '../../live/update-queue.ts'
+import { freshlyUpdatedRequestIds, mergeRecentChanges, requestChanges } from '../../live/update-queue.ts'
 import type { WorkDataSource, WorkModel } from '../../live/work-data-source.ts'
 import type { SliceCreator } from '../create-store.ts'
 import type { WorkSlice } from '../store-types.ts'
@@ -24,11 +24,18 @@ export const createWorkSlice: SliceCreator<WorkSlice> = (set, get) => {
   const showModel = (model: WorkModel) => {
     const previous = get().work.load
     const changedIds = previous.state === 'loaded' ? new Set(freshlyUpdatedRequestIds(previous.model.requests, model.requests)) : new Set<string>()
+    const changes = previous.state === 'loaded' ? requestChanges(previous.model.requests, model.requests, Date.now()) : []
+    // A state move is an update too, even where the source carries no fingerprint (the sample).
+    for (const change of changes) changedIds.add(change.requestId)
     modelsShown++
     set((state) => {
       state.work.load = { state: 'loaded', model }
       state.work.connection = model.connection
       if (changedIds.size > 0) state.work.freshlyUpdatedIds = changedIds
+      // A change whose request left the model (grouped into an overall request, or removed) would open nothing.
+      const present = new Set(model.requests.map((request) => request.id))
+      const kept = mergeRecentChanges(state.work.recentChanges, changes).filter((change) => present.has(change.requestId))
+      if (kept.length !== state.work.recentChanges.length || changes.length > 0) state.work.recentChanges = kept
     })
     if (changedIds.size > 0) {
       clearTimeout(freshTimer)
@@ -97,7 +104,7 @@ export const createWorkSlice: SliceCreator<WorkSlice> = (set, get) => {
   }
 
   return {
-    work: { load: { state: 'loading' }, connection: null, freshlyUpdatedIds: new Set(), sourceKind: null, refreshError: null },
+    work: { load: { state: 'loading' }, connection: null, freshlyUpdatedIds: new Set(), recentChanges: [], sourceKind: null, refreshError: null },
 
     startWorkSource: (nextSource) => {
       const thisSession = ++session
@@ -122,18 +129,31 @@ export const createWorkSlice: SliceCreator<WorkSlice> = (set, get) => {
       await read()
     },
 
+    loadRequestDetail: (request, options) => {
+      const reading = activeSource('read request detail from')
+      if (request.detailLoaded !== false || !reading.loadRequestDetail) return Promise.resolve(request)
+      return reading.loadRequestDetail(request.id, request.detailRevision ?? request.contentFingerprint, options)
+    },
+
     receiveWorkModel: showModel,
 
     // A heartbeat that changes nothing re-renders nothing.
     receiveConnection: (connection) => {
       const shown = get().work.connection
-      if (shown && shown.state === connection.state && shown.label === connection.label && shown.detail === connection.detail && shown.tooltip === connection.tooltip) return
+      const sameSync = shown?.sync?.state === connection.sync?.state && shown?.sync?.label === connection.sync?.label
+        && shown?.sync?.detail === connection.sync?.detail && shown?.sync?.tone === connection.sync?.tone
+      if (shown && sameSync && shown.state === connection.state && shown.label === connection.label && shown.detail === connection.detail && shown.tooltip === connection.tooltip) return
       set((state) => { state.work.connection = connection })
     },
 
-    setRequestChecked: (requestId, checked, expectedFingerprint) =>
+    setRequestChecked: (requestId, checked, expectedFingerprint, expectedReviewHash) =>
       // Sample fixtures carry no fingerprint and the sample source ignores it; the local source refuses an empty one.
-      saving('save the check to', (to) => to.setRequestChecked(requestId, expectedFingerprint ?? '', checked), (result) => 'model' in result ? result.model : null),
+      saving('save the check to', (to) => to.setRequestChecked(requestId, expectedFingerprint ?? '', checked, expectedReviewHash), (result) => 'model' in result ? result.model : null),
+
+    answerRequestSuggestion: (suggestion, action) => saving('answer the suggestion in', (to) => {
+      if (!to.answerRequestSuggestion) throw new Error('Request suggestions are unavailable in this viewer.')
+      return to.answerRequestSuggestion(suggestion, action)
+    }, (result) => result.model),
 
     saveRuleChange: (change) => saving('save the rule change to', (to) => to.saveRuleChange(change), (result) => result.model),
 
@@ -142,6 +162,8 @@ export const createWorkSlice: SliceCreator<WorkSlice> = (set, get) => {
     markAgentFinished: async (agentId) => { await saving('save the agent to', (to) => to.markAgentFinished(agentId), (model) => model) },
 
     loadRulesInClaudeCode: async () => { await saving('load the rules from', (to) => to.loadRulesInClaudeCode(), (model) => model) },
+
+    refreshWork: () => activeSource('start a refresh on').refreshWork(),
 
     updateSampleRequest: (id, change) => {
       const load = get().work.load

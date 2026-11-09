@@ -5,6 +5,14 @@ on:
   push:
     branches: [main]
 
+
+# A newer push to the same branch or PR cancels the older run: its result is
+# already out of date. 174 of 224 CI push runs on main (Nov 1-7) were superseded
+# yet ran to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: typecheck · build · test · bundle-size
@@ -76,10 +84,6 @@ jobs:
       # the scoped step above no longer reaches it — run it explicitly.
       - name: Test (openclaw)
         run: bun test openclaw
-
-      # The My Work app's pure-logic tests live with the app (src/ui/my-work), outside tests/.
-      - name: Test (My Work viewer)
-        run: bun test src/ui/my-work/src/live src/ui/my-work/src/setup src/ui/my-work/src/store
 
       # The cowork plugin's suite lives outside tests/ (cowork/test), so the
       # scoped lane check above never reaches it — run it explicitly, the same
@@ -276,6 +280,17 @@ jobs:
       - name: viewer-host gate tests
         working-directory: services/viewer-host
         run: bun install --frozen-lockfile && bun test test
+
+      # The matrix's browser pages compile the real My Work source, whose
+      # dependencies live in that app's own package.
+      - name: Install My Work dependencies
+        working-directory: src/ui/my-work
+        run: npm ci --no-audit --no-fund
+
+      # The matrix allows a browser 10 s to start. This is the runner's first
+      # Chrome launch, so run one first and record how long it takes.
+      - name: Warm Chrome
+        run: time google-chrome --headless --no-sandbox --disable-gpu --dump-dom about:blank
 
       - name: protocol-v2 matrix e2e against local sync-api
         run: bun scripts/sync-matrix-e2e.ts
