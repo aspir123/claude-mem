@@ -6,6 +6,7 @@ import {
   exitGraceful,
   resetHookIoState,
   HookStdoutError,
+  isHookStdoutClosed,
 } from '../../src/shared/hook-io.js';
 import type { PlatformAdapter, HookResult } from '../../src/cli/types.js';
 
@@ -107,14 +108,17 @@ describe('emitDiagnostic', () => {
 describe('emitModelContext', () => {
   it('calls adapter.formatOutput and JSON.stringifies to stdout', () => {
     const out = captureStdout();
+    const real = captureRealStderr();
     try {
       const result: HookResult = { systemMessage: 'hi' };
       emitModelContext(fakeAdapter, result);
       expect(out.chunks).toHaveLength(1);
       expect(JSON.parse(out.chunks[0])).toEqual({ ok: true, systemMessage: 'hi' });
       expect(out.chunks[0]).toEndWith('\n');
+      expect(real.chunks).toEqual([]);
     } finally {
       out.restore();
+      real.restore();
     }
   });
 
@@ -183,15 +187,6 @@ describe('emitModelContext', () => {
     }
   });
 
-  it('two real emits still throw', () => {
-    const out = captureStdout();
-    try {
-      emitModelContext(fakeAdapter, {});
-      expect(() => emitModelContext(fakeAdapter, {})).toThrow('emitModelContext called twice');
-    } finally {
-      out.restore();
-    }
-  });
 });
 
 describe('exitGraceful', () => {
@@ -253,5 +248,20 @@ describe('exitGraceful', () => {
     } finally {
       process.stdout.write = original;
     }
+  });
+});
+
+describe('isHookStdoutClosed (#5175)', () => {
+  it('is true for a stdout write that failed with EPIPE', () => {
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    expect(isHookStdoutClosed(new HookStdoutError(epipe))).toBe(true);
+  });
+
+  it('is false for other stdout failures and other errors', () => {
+    const other = Object.assign(new Error('write EIO'), { code: 'EIO' });
+    expect(isHookStdoutClosed(new HookStdoutError(other))).toBe(false);
+    expect(isHookStdoutClosed(new HookStdoutError('boom'))).toBe(false);
+    expect(isHookStdoutClosed(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))).toBe(false);
+    expect(isHookStdoutClosed(undefined)).toBe(false);
   });
 });

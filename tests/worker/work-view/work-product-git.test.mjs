@@ -2,7 +2,7 @@
 // Every command and output below is a recorded tool use from a real
 // ~/.claude-mem/claude-mem.db (tool_uses id in each comment), with long commit
 // bodies and unrelated output trimmed. Made-up samples say so.
-import test from 'node:test';
+import { test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { githubRepo, mergeProducts, productsFromToolUse } from '../../../src/services/work-view/work-product.mjs';
 
@@ -47,6 +47,27 @@ test('quiet git commits are found by their own subject printed back by git log, 
   ]);
   // A quiet commit whose subject is never printed back is not guessed (tool_uses 178279).
   assert.deepEqual(productsFromToolUse(bash(178279, '/usr/bin/git commit -q -F .scratch/hooks/msg-4962.txt', { stdout: '', stderr: '' })), []);
+});
+
+test('a quiet commit whose -m message is a $(cat <<EOF) heredoc takes its subject from the heredoc', () => {
+  // Claude Code's own commit form (made-up samples): -m "$(cat <<'EOF' ... EOF\n)".
+  const message = "$(cat <<'EOF'\nFix the parser\n\nLonger body.\nEOF\n)";
+  assert.deepEqual(brief(productsFromToolUse(bash(1, `git commit -q -m "${message}" && git log --oneline -1`, { stdout: 'abc1234 Fix the parser\n', stderr: '' }))), [
+    { kind: 'commit', title: 'abc1234 Fix the parser', sha: 'abc1234', branch: null, url: undefined },
+  ]);
+  assert.deepEqual(brief(productsFromToolUse(bash(2, `rtk git commit -m "${message.replace("'EOF'", 'EOF')}"`, 'ok abc1234\n'))), [
+    { kind: 'commit', title: 'abc1234 Fix the parser', sha: 'abc1234', branch: null, url: undefined },
+  ]);
+});
+
+test('a heredoc -m subject keeps its double quotes, which are literal inside the substitution', () => {
+  const message = "$(cat <<'EOF'\nFix \"all\" matching\n\nBody.\nEOF\n)";
+  assert.deepEqual(brief(productsFromToolUse(bash(1, `git commit -q -m "${message}" && git log --oneline -1`, { stdout: 'abc1234 Fix "all" matching\n', stderr: '' }))), [
+    { kind: 'commit', title: 'abc1234 Fix "all" matching', sha: 'abc1234', branch: null, url: undefined },
+  ]);
+  assert.deepEqual(brief(productsFromToolUse(bash(2, `rtk git commit -m "${message}"`, 'ok abc1234\n'))), [
+    { kind: 'commit', title: 'abc1234 Fix "all" matching', sha: 'abc1234', branch: null, url: undefined },
+  ]);
 });
 
 test('a command that only mentions git commit or git push made nothing', () => {

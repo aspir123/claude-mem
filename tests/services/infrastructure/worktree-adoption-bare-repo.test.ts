@@ -54,13 +54,13 @@ function makeBareRepo(bareDir: string): void {
   rmSync(seed, { recursive: true, force: true });
 }
 
-/** `alpha.git` with worktrees under `alpha-trees/`, and `beta/.bare` with worktrees inside `beta/`. */
-function makeLayouts(): { root: string; alphaBare: string; betaBare: string; dataDirectory: string } {
+/** Build the requested bare layouts with worktrees under `alpha-trees/` or inside `beta/`. */
+function makeLayouts(layouts: readonly ('alpha.git' | 'beta/.bare')[] = ['alpha.git']): { root: string; alphaBare: string; betaBare: string; dataDirectory: string } {
   tempRoot = realpathSync(mkdtempSync(path.join(tmpdir(), 'cm-4958-')));
   const alphaBare = path.join(tempRoot, 'alpha.git');
   const betaBare = path.join(tempRoot, 'beta', '.bare');
-  makeBareRepo(alphaBare);
-  makeBareRepo(betaBare);
+  if (layouts.includes('alpha.git')) makeBareRepo(alphaBare);
+  if (layouts.includes('beta/.bare')) makeBareRepo(betaBare);
   const dataDirectory = path.join(tempRoot, 'data');
   mkdirSync(dataDirectory, { recursive: true });
   return { root: tempRoot, alphaBare, betaBare, dataDirectory };
@@ -117,7 +117,7 @@ function sessionProject(dbPath: string, memorySessionId: string): string {
 
 describe('bare-repository worktree adoption (#4958)', () => {
   it('moves rows stored under the folder-only key to the worktree key, one repository at a time', async () => {
-    const { root, alphaBare, betaBare, dataDirectory } = makeLayouts();
+    const { root, alphaBare, betaBare, dataDirectory } = makeLayouts(['alpha.git', 'beta/.bare']);
     const alphaMain = path.join(root, 'alpha-trees', 'main');
     const betaMain = path.join(root, 'beta', 'main');
     const unrelatedMain = path.join(root, 'elsewhere', 'main');
@@ -158,11 +158,11 @@ describe('bare-repository worktree adoption (#4958)', () => {
       ['main', 'alpha/main'],
       ['main', 'beta/main'],
     ]);
-  });
+  }, 30_000);
 
   for (const layout of ['alpha.git', 'beta/.bare'] as const) {
     it(`folds merged and deleted worktrees into the repository key (${layout})`, async () => {
-      const { root, alphaBare, betaBare, dataDirectory } = makeLayouts();
+      const { root, alphaBare, betaBare, dataDirectory } = makeLayouts([layout]);
       const bare = layout === 'alpha.git' ? alphaBare : betaBare;
       const parent = layout === 'alpha.git' ? 'alpha' : 'beta';
       const treesDir = layout === 'alpha.git' ? path.join(root, 'alpha-trees') : path.join(root, 'beta');
@@ -188,6 +188,60 @@ describe('bare-repository worktree adoption (#4958)', () => {
       expect(result.orphanedWorktrees).toEqual([`${parent}/gone`]);
       expect(observation(dbPath, mergedRows.observationId).merged_into_project).toBe(parent);
       expect(observation(dbPath, goneRows.observationId).merged_into_project).toBe(parent);
-    });
+    }, 30_000);
   }
 });
+
+it('rekeys a legacy session in a ..-prefixed child without including sibling checkouts', async () => {
+  const { root, alphaBare, dataDirectory } = makeLayouts();
+  const main = path.join(root, 'alpha-trees', 'main');
+  git(alphaBare, 'worktree', 'add', '-q', main);
+  const descendant = path.join(main, '..notes', 'nested');
+  const sibling = path.join(root, 'alpha-trees', 'main-other');
+  mkdirSync(descendant, { recursive: true });
+  mkdirSync(sibling, { recursive: true });
+  const dbPath = path.join(dataDirectory, 'claude-mem.db');
+  const store = new SessionStore(dbPath);
+  const inside = seedSession(store, 'dotdot-child', 'main', descendant);
+  const outside = seedSession(store, 'sibling-checkout', 'main', sibling);
+  store.close();
+
+  const result = await adoptMergedWorktrees({ repoPath: main, dataDirectory });
+  expect(result.rekeyedSessions).toBe(1);
+  expect(result.rekeyedObservations).toBe(1);
+  expect(sessionProject(dbPath, inside.memorySessionId)).toBe('alpha/main');
+  expect(observation(dbPath, inside.observationId).project).toBe('alpha/main');
+  expect(sessionProject(dbPath, outside.memorySessionId)).toBe('main');
+  expect(observation(dbPath, outside.observationId).project).toBe('main');
+}, 30_000);
+
+for (const worktreeName of ['topic\nnotes', ' topic ']) {
+  const filesystemIt = process.platform === 'win32' ? it.skip : it;
+  filesystemIt(`keeps an unmerged live worktree with path ${JSON.stringify(worktreeName)} out of orphan adoption`, async () => {
+    const { root, alphaBare, dataDirectory } = makeLayouts();
+    const main = path.join(root, 'alpha-trees', 'main');
+    const topic = path.join(root, 'alpha-trees', worktreeName);
+    git(alphaBare, 'worktree', 'add', '-q', main);
+    git(alphaBare, 'worktree', 'add', '-q', '-b', 'topic', topic);
+    git(topic, 'config', 'user.email', 'test@example.com');
+    git(topic, 'config', 'user.name', 'Test');
+    writeFileSync(path.join(topic, 'topic.txt'), 'unmerged work\n');
+    git(topic, 'add', 'topic.txt');
+    git(topic, 'commit', '-q', '-m', 'unmerged topic');
+    const project = `alpha/${worktreeName}`;
+    const dbPath = path.join(dataDirectory, 'claude-mem.db');
+    const store = new SessionStore(dbPath);
+    const live = seedSession(store, 'newline-worktree', project, topic);
+    store.close();
+
+    const result = await adoptMergedWorktrees({ repoPath: main, dataDirectory });
+    expect(observation(dbPath, live.observationId)).toEqual({ project, merged_into_project: null });
+    expect(result.mergedBranches).not.toContain('topic');
+    expect(result.orphanedWorktrees).not.toContain(project);
+    expect(result.adoptedObservations).toBe(0);
+    const verify = new SessionStore(dbPath);
+    const remaps = verify.db.prepare("SELECT body FROM sync_outbox WHERE body LIKE '%remap_project%'").all();
+    verify.close();
+    expect(remaps).toEqual([]);
+  }, 30_000);
+}

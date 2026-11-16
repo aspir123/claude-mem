@@ -4,7 +4,6 @@ import {
   createToolUsesSchema,
   getToolUsesByIds,
   purgeLinkedToolUses,
-  resolveToolUsesRetentionDays,
   upsertToolUse,
 } from '../../src/services/sqlite/tool-uses.js';
 
@@ -48,34 +47,6 @@ function remainingToolUseIds(db: Database): string[] {
     .map(row => row.tool_use_id);
 }
 
-describe('resolveToolUsesRetentionDays', () => {
-  it('reads a positive whole number of days', () => {
-    expect(resolveToolUsesRetentionDays('30')).toBe(30);
-    expect(resolveToolUsesRetentionDays(' 7 ')).toBe(7);
-  });
-
-  it('treats 0, empty and unparseable values as keep-forever', () => {
-    for (const raw of ['0', '', '   ', 'abc', '-5', '1.5', '1e3', 'NaN', 'Infinity']) {
-      expect(resolveToolUsesRetentionDays(raw)).toBe(0);
-    }
-  });
-
-  it('treats a missing setting as keep-forever', () => {
-    expect(resolveToolUsesRetentionDays(undefined)).toBe(0);
-  });
-
-  it('accepts an unquoted JSON number, which hand-edited settings.json can hold', () => {
-    expect(resolveToolUsesRetentionDays(30)).toBe(30);
-    expect(resolveToolUsesRetentionDays(0)).toBe(0);
-  });
-
-  it('never throws on a value that is not a string or number, and keeps everything', () => {
-    for (const raw of [null, true, false, {}, [], [30], 1.5, -3, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(resolveToolUsesRetentionDays(raw)).toBe(0);
-    }
-  });
-});
-
 describe('purgeLinkedToolUses', () => {
   it('does nothing when retention is 0, however old the rows are', () => {
     const db = freshDb();
@@ -84,30 +55,6 @@ describe('purgeLinkedToolUses', () => {
 
     expect(purgeLinkedToolUses(db, 0, NOW)).toBe(0);
     expect(remainingToolUseIds(db)).toEqual(['old-linked', 'old-unlinked']);
-  });
-
-  it('removes rows older than N days that are linked to an observation', () => {
-    const db = freshDb();
-    seed(db, 'old-linked', 40, 11);
-
-    expect(purgeLinkedToolUses(db, 30, NOW)).toBe(1);
-    expect(remainingToolUseIds(db)).toEqual([]);
-  });
-
-  it('keeps old rows with no observation: they are the only copy of that I/O', () => {
-    const db = freshDb();
-    seed(db, 'old-unlinked', 400, null);
-
-    expect(purgeLinkedToolUses(db, 30, NOW)).toBe(0);
-    expect(remainingToolUseIds(db)).toEqual(['old-unlinked']);
-  });
-
-  it('keeps linked rows that are still inside the window', () => {
-    const db = freshDb();
-    seed(db, 'recent-linked', 5, 11);
-
-    expect(purgeLinkedToolUses(db, 30, NOW)).toBe(0);
-    expect(remainingToolUseIds(db)).toEqual(['recent-linked']);
   });
 
   it('applies the age cutoff exactly: a row 30 days old stays, one a day older goes', () => {

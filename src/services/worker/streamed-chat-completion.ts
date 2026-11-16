@@ -147,6 +147,11 @@ export interface ChatCompletionRequest {
   liveness: StreamLiveness | null;
   /** Names the provider in error messages. */
   label: string;
+  /**
+   * False: no `max_completion_tokens` resend (#4003). An image request is
+   * never resent that way; its refusal reaches `classify` instead.
+   */
+  allowMaxCompletionTokensRetry?: boolean;
   /** The provider's classifier, for HTTP errors, network errors and in-stream error objects. */
   classify: (input: ChatCompletionClassifyInput) => ClassifiedProviderError;
 }
@@ -183,7 +188,8 @@ interface StreamChunk {
   usage?: unknown;
   error?: { code?: unknown; message?: unknown } | null;
   choices?: Array<{
-    delta?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown; tool_calls?: unknown } | null;
+    index?: unknown;
+    delta?: { content?: unknown; refusal?: unknown; reasoning?: unknown; reasoning_content?: unknown; reasoning_details?: unknown; tool_calls?: unknown } | null;
     finish_reason?: unknown;
   }>;
 }
@@ -289,7 +295,9 @@ export async function sendChatCompletion(request: ChatCompletionRequest): Promis
   const { max_tokens: _ignoredCap, ...bodyWithoutCap } = request.body;
   const bodies = [
     { ...bodyWithoutCap, max_tokens: request.maxOutputTokens },
-    { ...bodyWithoutCap, max_completion_tokens: request.maxOutputTokens },
+    ...(request.allowMaxCompletionTokensRetry === false
+      ? []
+      : [{ ...bodyWithoutCap, max_completion_tokens: request.maxOutputTokens }]),
   ];
   // Re-read per send: another query may have learned the endpoint refuses streaming.
   let streamThisSend = request.liveness !== null && streamsChatCompletion(request.url);
@@ -375,7 +383,18 @@ async function assembleStream(opened: OpenedExchange, request: ChatCompletionReq
       try {
         chunk = JSON.parse(event.data) as StreamChunk;
       } catch (parseError: unknown) {
-        throw outputFailure(`${request.label} stream chunk could not be read: ${asError(parseError).message}`, parseError, STREAM_INTERRUPTED_CODE);
+        // Same rule as a stream that broke off: before any output the send is
+        // ambiguous and may be resent once; after output started it was billed.
+        const error = asError(parseError);
+        if (outputStarted) {
+          throw outputFailure(`${request.label} stream chunk could not be read: ${error.message}`, error, STREAM_INTERRUPTED_CODE);
+        }
+        throw new ClassifiedProviderError(`${request.label} stream chunk could not be read: ${error.message}`, {
+          kind: 'transient',
+          failedBeforeOutput: true,
+          code: STREAM_INTERRUPTED_CODE,
+          cause: error,
+        });
       }
       if (chunk === null || typeof chunk !== 'object') continue;
 
@@ -402,17 +421,25 @@ async function assembleStream(opened: OpenedExchange, request: ChatCompletionReq
       if (model === undefined && typeof chunk.model === 'string' && chunk.model) model = chunk.model;
       if (chunk.usage && typeof chunk.usage === 'object') usage = chunk.usage as Record<string, unknown>;
 
-      const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
-      if (!choice) continue;
-      const delta = choice.delta ?? undefined;
-      const text = deltaText(delta?.content);
-      content += text;
-      // Reasoning and tool-call deltas are billed output too: once any arrived,
-      // a resend would pay for them again.
-      if (text || isNonEmpty(delta?.reasoning) || isNonEmpty(delta?.reasoning_content) || isNonEmpty(delta?.tool_calls)) {
-        outputStarted = true;
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      for (const [position, choice] of choices.entries()) {
+        if (!choice) continue;
+        const delta = choice.delta ?? undefined;
+        const text = deltaText(delta?.content);
+        // Every choice's generated output was billed, including alternatives
+        // that are not selected for the observation. Refusal, reasoning and tool-call
+        // deltas are billed output too: once any arrived, a resend would pay
+        // for them again.
+        if (text || isNonEmpty(delta?.refusal) || isNonEmpty(delta?.reasoning) || isNonEmpty(delta?.reasoning_content)
+          || isNonEmpty(delta?.reasoning_details) || isNonEmpty(delta?.tool_calls)) {
+          outputStarted = true;
+        }
+        // Stream frames can interleave or reorder alternatives. Keep the first
+        // completion by its identity, with the existing index-less compatibility.
+        if (choice.index !== 0 && !(choice.index === undefined && position === 0)) continue;
+        content += text;
+        if (typeof choice.finish_reason === 'string' && choice.finish_reason) finishReason = choice.finish_reason;
       }
-      if (typeof choice.finish_reason === 'string' && choice.finish_reason) finishReason = choice.finish_reason;
     }
   } catch (streamError: unknown) {
     if (streamError instanceof ClassifiedProviderError) throw streamError;

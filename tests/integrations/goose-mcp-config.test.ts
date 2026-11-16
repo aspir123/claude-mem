@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
+import { homedir, tmpdir } from 'os';
 import path from 'path';
-import { mergeGooseYamlConfig, uninstallGooseMcpIntegration } from '../../src/services/integrations/McpIntegrations.js';
+import { getGooseConfigPath, mergeGooseYamlConfig, uninstallGooseMcpIntegration } from '../../src/services/integrations/McpIntegrations.js';
 
 // Goose starts MCP servers only from the top-level `extensions` mapping of
 // ~/.config/goose/config.yaml (stdio entries with `cmd` and `args`); a
@@ -128,6 +128,23 @@ describe('Goose install registers claude-mem as a Goose extension', () => {
     });
   });
 
+  for (const endMarker of ['...', '... # end of settings']) {
+    it(`registers before the YAML document end and restores the document on uninstall (${endMarker})`, () => {
+      const original = `---\nGOOSE_PROVIDER: ollama\nGOOSE_MODE: smart_approve\n${endMarker}\n`;
+      writeFileSync(configPath, original);
+      expect(read()).toEqual({ GOOSE_PROVIDER: 'ollama', GOOSE_MODE: 'smart_approve' });
+
+      mergeGooseYamlConfig(configPath, '/plugin/scripts/mcp-server.cjs');
+      expect(read()).toEqual({
+        GOOSE_PROVIDER: 'ollama', GOOSE_MODE: 'smart_approve',
+        extensions: { 'claude-mem': claudeMemExtension('/plugin/scripts/mcp-server.cjs') },
+      });
+      expect(readFileSync(configPath, 'utf8')).toEndWith(endMarker + '\n');
+      expect(uninstallGooseMcpIntegration(configPath)).toBe(0);
+      expect(readFileSync(configPath, 'utf8')).toBe(original);
+    });
+  }
+
   it('finds the extensions mapping of a config saved with a byte order mark', () => {
     writeFileSync(configPath, '\uFEFF' + 'extensions:\n  developer:\n    bundled: true\n    enabled: true\n    name: developer\n    timeout: 300\n    type: builtin\n');
 
@@ -242,5 +259,20 @@ describe('Goose uninstall removes the claude-mem extension', () => {
     expect(uninstallGooseMcpIntegration(configPath)).toBe(1);
     expect(uninstallGooseMcpIntegration(path.join(tmp, 'missing.yaml'))).toBe(1);
     expect(readFileSync(configPath, 'utf-8')).toBe(original);
+  });
+});
+
+// Goose takes its config directory from etcetera's app strategy for
+// Block/goose (crates/goose/src/config/paths.rs).
+describe('getGooseConfigPath', () => {
+  it('uses ~/.config/goose on macOS and Linux', () => {
+    const expected = path.join(homedir(), '.config', 'goose', 'config.yaml');
+    expect(getGooseConfigPath('darwin', {})).toBe(expected);
+    expect(getGooseConfigPath('linux', {})).toBe(expected);
+  });
+
+  it('uses %APPDATA%\\Block\\goose\\config on Windows', () => {
+    expect(getGooseConfigPath('win32', { APPDATA: 'C:\\Users\\a\\AppData\\Roaming' }))
+      .toBe('C:\\Users\\a\\AppData\\Roaming\\Block\\goose\\config\\config.yaml');
   });
 });

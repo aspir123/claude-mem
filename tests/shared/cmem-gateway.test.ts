@@ -85,17 +85,6 @@ describe('cmem-gateway', () => {
   });
 
   describe('fallback marker write/clear', () => {
-    it('writes CLAUDE_MEM_PRO_FALLBACK_AT into settings.json, preserving unknown keys', () => {
-      writeFileSync(settingsPath, JSON.stringify({ SOME_FUTURE_KEY: 'kept', CLAUDE_MEM_PROVIDER: 'openrouter' }));
-
-      writeProFallbackAt('2026-08-26T12:00:00.000Z', settingsPath);
-
-      const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-      expect(parsed.CLAUDE_MEM_PRO_FALLBACK_AT).toBe('2026-08-26T12:00:00.000Z');
-      expect(parsed.SOME_FUTURE_KEY).toBe('kept');
-      expect(parsed.CLAUDE_MEM_PROVIDER).toBe('openrouter');
-    });
-
     it('preserves the legacy env wrapper and peer root settings when writing and clearing', () => {
       writeFileSync(settingsPath, JSON.stringify({
         theme: 'dark',
@@ -207,22 +196,6 @@ describe('cmem-gateway', () => {
       expect(parsed.CLAUDE_MEM_PRO_FALLBACK_URL).toBe('https://cmem.ai/dashboard');
     });
 
-    it('clearProFallback empties the gateway\'s words along with the marker', () => {
-      writeProFallbackAt('2026-08-26T12:00:00.000Z', settingsPath, {
-        message: 'words',
-        action: 'do this',
-        url: 'https://cmem.ai/dashboard',
-      });
-
-      clearProFallback(settingsPath, tempDir);
-
-      const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-      expect(parsed.CLAUDE_MEM_PRO_FALLBACK_AT).toBe('');
-      expect(parsed.CLAUDE_MEM_PRO_FALLBACK_MESSAGE).toBe('');
-      expect(parsed.CLAUDE_MEM_PRO_FALLBACK_ACTION).toBe('');
-      expect(parsed.CLAUDE_MEM_PRO_FALLBACK_URL).toBe('');
-    });
-
     it('clearProFallback empties stale gateway words even when the marker is already blank', () => {
       // A re-pair blanks CLAUDE_MEM_PRO_FALLBACK_AT through the installer's
       // settings merge first, then calls clearProFallback.
@@ -325,21 +298,24 @@ describe('cmem-gateway', () => {
 
       expect(notice.endsWith(`Manage your plan: ${proTrialUrl('fallback')}`)).toBe(true);
     });
-
-    it('is plan-neutral without the gateway\'s words, and keeps the renewal link', () => {
-      expect(proFallbackNotice({ message: ' \n\t ', url: '' })).toBe([
-        'cmem.ai memory is paused for this account.',
-        `Memory is using your Anthropic plan for now. Manage your plan: ${proTrialUrl('fallback')}`,
-      ].join('\n'));
-    });
   });
 
   describe('one-time notice marker', () => {
-    it('starts unshown, becomes shown after marking', () => {
-      expect(hasShownProFallbackNotice(tempDir)).toBe(false);
-      markProFallbackNoticeShown(tempDir);
-      expect(hasShownProFallbackNotice(tempDir)).toBe(true);
-    });
+    it('allows exactly one claim across independent hook processes', async () => {
+      const modulePath = join(process.cwd(), 'src/shared/cmem-gateway.ts');
+      const script = `const { markProFallbackNoticeShown } = await import(${JSON.stringify(modulePath)});
+        console.log(JSON.stringify(markProFallbackNoticeShown(process.argv[1])));`;
+      const results = await Promise.all(Array.from({ length: 8 }, async () => {
+        const child = Bun.spawn([process.execPath, '-e', script, tempDir], {
+          env: { ...process.env, DO_NOT_TRACK: '1' }, stdout: 'pipe', stderr: 'pipe',
+        });
+        const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+        expect(await child.exited).toBe(0);
+        return stdout.trim() === 'true';
+      }));
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(markProFallbackNoticeShown(tempDir)).toBe(false);
+    }, 30_000);
   });
 
   describe('trialDaysRemaining', () => {

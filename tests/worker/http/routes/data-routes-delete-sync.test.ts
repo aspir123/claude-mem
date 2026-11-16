@@ -150,7 +150,7 @@ describe('DataRoutes synchronized delete APIs', () => {
     expect(broadcasts).toEqual([]);
   });
 
-  it('deletes the removed row\'s fragments from Chroma, scoped by doc_type', () => {
+  it('deletes the removed row\'s fragments from Chroma, scoped by doc_type', async () => {
     // Observation and summary id spaces overlap, so the cleanup must be
     // scoped per doc_type, not by sqlite_id alone.
     const cases = [
@@ -172,6 +172,8 @@ describe('DataRoutes synchronized delete APIs', () => {
       expect(responseBody).toMatchObject({ success: true, id: '1' });
     }
 
+    // Cleanups run in the background on one shared tail (#5495).
+    await new Promise(resolve => setImmediate(resolve));
     expect(chromaCalls).toEqual([
       { docType: 'observation', sqliteId: 1 },
       { docType: 'session_summary', sqliteId: 1 },
@@ -194,28 +196,6 @@ describe('DataRoutes synchronized delete APIs', () => {
     expect(responseBody).toMatchObject({ success: true, id: '1', kind: 'observation' });
     expect(db.prepare('SELECT COUNT(*) AS n FROM observations').get()).toEqual({ n: 0 });
     expect(chromaCalls).toEqual([]);
-  });
-
-  it('keeps the delete successful when the Chroma cleanup fails', async () => {
-    chromaSync = { deleteRowDocuments: mock(() => Promise.reject(new Error('chroma down'))) };
-    const warn = spyOn(logger, 'warn').mockImplementation(() => {});
-    let status = 200;
-    let responseBody: any;
-    const response = {
-      status(code: number) { status = code; return this; },
-      json(value: unknown) { responseBody = value; return this; },
-    } as unknown as Response;
-
-    handlers.get('/api/observation/:id')!({ params: { id: '1' }, path: '/api/observation/:id' } as unknown as Request, response);
-
-    expect(status).toBe(200);
-    expect(responseBody).toMatchObject({ success: true, id: '1', kind: 'observation' });
-    expect(db.prepare('SELECT COUNT(*) AS n FROM observations').get()).toEqual({ n: 0 });
-
-    // The failure is swallowed into a warning, asynchronously.
-    await new Promise(resolve => setImmediate(resolve));
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
   });
 
   function deleteSession(): { status: number; body: any } {

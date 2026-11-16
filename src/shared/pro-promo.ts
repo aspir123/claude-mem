@@ -28,9 +28,7 @@ export type ProPromoSource =
   | 'welcome-hint'
   | 'viewer'
   /** One-time session-start notice after the cmem gateway stops serving the account and memory falls back on-plan. */
-  | 'fallback'
-  /** Hand-written links in the cursor-hooks setup docs — no TS caller. */
-  | 'docs';
+  | 'fallback';
 
 /**
  * The standard free trial cmem.ai grants, in days. The server assigns the
@@ -59,7 +57,13 @@ export const PRO_TRIAL_PITCH = `${PRO_TRIAL_LABEL} — memory runs off-plan. Get
  * One-line pitch + link, for plain-text surfaces (hook banners, welcome hint).
  * Callers that want ANSI styling should compose from PRO_TRIAL_PITCH and
  * proTrialUrl() instead so the escape codes stay at the presentation layer.
+ *
+ * `plan` is CLAUDE_MEM_PRO_PLAN. The pitch is left out once the install has a
+ * plan (trial, pro or a TeamBrain seat) and kept for installs with no plan
+ * (empty or `none`), as decided on #5540.
  */
-export function proTrialLine(source: ProPromoSource): string {
+export function proTrialLine(source: ProPromoSource, plan = ''): string {
+  const trimmedPlan = plan.trim();
+  if (trimmedPlan === 'trial' || trimmedPlan === 'pro' || trimmedPlan === 'teambrain_seat') return '';
   return `${String.fromCodePoint(0x2728)} ${PRO_TRIAL_PITCH} ${proTrialUrl(source)}`;
 }

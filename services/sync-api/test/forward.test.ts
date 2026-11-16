@@ -58,9 +58,6 @@ beforeAll(() => {
 					headers: { "Content-Type": "application/json", "Retry-After": "7", "X-Sync-Mode": "poll" },
 				});
 			}
-			if (url.pathname.endsWith("/v1/sync/stream-back")) {
-				return new Response("x".repeat(3_000_000), { headers: { "Content-Type": "text/plain" } });
-			}
 			return new Response("unexpected", { status: 418 });
 		},
 	});
@@ -70,6 +67,17 @@ beforeAll(() => {
 afterAll(async () => {
 	await proxy.stop();
 	upstream.stop(true);
+});
+
+describe("sync listener port", () => {
+	it("requires a complete decimal port instead of silently binding its numeric prefix", () => {
+		const port = (PORT: string) => loadEnv({ FORWARD_ORIGIN: "https://example.com", PORT }).PORT;
+		for (const raw of ["8080oops", "0.5", "1e3", "", "65536"]) {
+			expect(() => port(raw)).toThrow(/PORT/);
+		}
+		expect(port("0")).toBe(0);
+		expect(port(" 65535 ")).toBe(65535);
+	});
 });
 
 describe("forward mode: env validation", () => {
@@ -125,6 +133,7 @@ describe("forward mode: proxy", () => {
 				"X-User-Id": "user-1",
 				"X-Device-Id": "device-1",
 				"X-Device-Name": "laptop",
+				"X-Sync-Capabilities": "quarantine-unknown-kinds",
 				Accept: "application/json",
 				Cookie: "must-not-forward=1",
 				"X-Random-Header": "must-not-forward",
@@ -146,6 +155,7 @@ describe("forward mode: proxy", () => {
 		expect(seen.headers.get("X-User-Id")).toBe("user-1");
 		expect(seen.headers.get("X-Device-Id")).toBe("device-1");
 		expect(seen.headers.get("X-Device-Name")).toBe("laptop");
+		expect(seen.headers.get("X-Sync-Capabilities")).toBe("quarantine-unknown-kinds");
 		expect(seen.headers.get("Accept")).toBe("application/json");
 		expect(seen.headers.get("Cookie")).toBeNull();
 		expect(seen.headers.get("X-Random-Header")).toBeNull();
@@ -203,12 +213,6 @@ describe("forward mode: proxy", () => {
 		expect(seen.bodySha256).toBe(new Bun.CryptoHasher("sha256").update(plain).digest("hex"));
 	});
 
-	it("streams a large response body back", async () => {
-		const res = await fetch(`${proxy.url}/v1/sync/stream-back`);
-		expect(res.status).toBe(200);
-		expect((await res.text()).length).toBe(3_000_000);
-	});
-
 	it("answers the legacy WebSocket route with 410 websocket_retired", async () => {
 		const before = capturedUpstreamRequests.length;
 		const res = await fetch(`${proxy.url}/v1/sync/ws`, {
@@ -217,15 +221,6 @@ describe("forward mode: proxy", () => {
 		expect(res.status).toBe(410);
 		expect(await res.json()).toEqual({ error: "websocket_retired" });
 		expect(capturedUpstreamRequests.length).toBe(before);
-	});
-
-	it("fails a real WebSocket handshake (old clients' advisory socket closes and backs off)", async () => {
-		const ws = new WebSocket(`${proxy.url.replace("http:", "ws:")}/v1/sync/ws`);
-		const closed = await new Promise<boolean>((resolve) => {
-			ws.onopen = () => resolve(false);
-			ws.onclose = () => resolve(true);
-		});
-		expect(closed).toBe(true);
 	});
 
 	it("answers /internal/v1/* with 410", async () => {

@@ -25,7 +25,9 @@ describe('native memory lookup recognition', () => {
   });
   it('scopes custom roots exactly, rejects sibling-prefix paths and traversal', () => {
     expect(memorySearchQuery(hook('Read', { file_path: '/notes/own/lesson.md' }), ['/notes/own'])).toBe('lesson');
-    expect(memorySearchLookup(hook('Read', { file_path: '/notes/own/lesson.md' }), ['/notes/own'])).toEqual({query:'lesson',memoryPath:'/notes/own/lesson.md'});
+    // memoryPath comes back resolved against the session cwd, so its absolute
+    // form is host-shaped (D:\notes\... on Windows); a POSIX literal cannot match there.
+    expect(memorySearchLookup(hook('Read', { file_path: '/notes/own/lesson.md' }), ['/notes/own'])).toEqual({query:'lesson',memoryPath:path.resolve('/project', '/notes/own/lesson.md')});
     expect(memorySearchQuery(hook('Read', { file_path: '/notes/own-other/lesson.md' }), ['/notes/own'])).toBeNull();
     expect(memorySearchQuery(hook('Read', { file_path: '/notes/own/../private/lesson.md' }), ['/notes/own'])).toBeNull();
   });
@@ -109,12 +111,36 @@ describe('memory folder watcher', () => {
     expect(saved).toHaveLength(3);
   });
 
-  it('refuses symlinks, oversize and non-Markdown files; retries failed saves', () => {
+  // Creating a symlink needs a privilege Windows does not grant by default
+  // (EPERM without Developer Mode or admin). Probe once instead of assuming
+  // the platform, so the refusal test below runs wherever symlinks can exist.
+  const canCreateSymlinks = (() => {
+    const probeDir = mkdtempSync(path.join(tmpdir(), 'cmem-symlink-probe-'));
+    try {
+      symlinkSync(path.join(probeDir, 'missing.md'), path.join(probeDir, 'link.md'));
+      return true;
+    } catch {
+      return false;
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true });
+    }
+  })();
+
+  it.skipIf(!canCreateSymlinks)('refuses symlinked note files and directories', () => {
     const root = temp();
     const outside = temp();
     writeFileSync(path.join(outside, 'secret.md'), 'outside note');
     symlinkSync(path.join(outside, 'secret.md'), path.join(root, 'link.md'));
     symlinkSync(outside, path.join(root, 'linked-dir'));
+    const saved: SaveMemoryInput[] = [];
+    const watcher = new MemoryFileWatcher([{ path: root, project: 'p' }], note => saved.push(note), 10);
+    watcher.scan(0);
+    watcher.scan(11);
+    expect(saved).toEqual([]);
+  });
+
+  it('refuses oversize and non-Markdown files; retries failed saves', () => {
+    const root = temp();
     writeFileSync(path.join(root, 'big.md'), 'x'.repeat(65_537));
     writeFileSync(path.join(root, 'skip.txt'), 'not Markdown');
     writeFileSync(path.join(root, 'allowed.md'), 'allowed');
@@ -132,7 +158,8 @@ describe('memory folder watcher', () => {
     const root = temp();
     writeFileSync(path.join(root, 'note.md'), 'durable preference');
     const db = new Database(':memory:');
-    db.exec('CREATE TABLE observations (id INTEGER PRIMARY KEY, title TEXT, project TEXT, metadata TEXT)');
+    db.exec(`CREATE TABLE observations (id INTEGER PRIMARY KEY, title TEXT, project TEXT, metadata TEXT, memory_session_id TEXT);
+      CREATE TABLE sdk_sessions (memory_session_id TEXT PRIMARY KEY, platform_source TEXT)`);
     const manager = {
       getConnection: () => db,
       getSessionStore: () => ({ getOrCreateManualSession: () => 'manual', storeObservation: (_session: string, project: string, observation: {title: string; metadata: string}) => {
@@ -162,21 +189,53 @@ describe('memory folder watcher', () => {
     expect(nudged).toBe(1);
   });
 
-  it('deduplicates the same file fingerprint across concurrent processes', async () => {
+  it('waits for an uncommitted file fingerprint before deduplicating across processes', async () => {
     const root = temp();
     const database = path.join(root, 'race.db');
     const db = new Database(database);
-    db.exec('PRAGMA journal_mode=WAL; CREATE TABLE observations (id INTEGER PRIMARY KEY, title TEXT, project TEXT, metadata TEXT)');
+    db.exec(`PRAGMA journal_mode=WAL; CREATE TABLE observations (id INTEGER PRIMARY KEY, title TEXT, project TEXT, metadata TEXT, memory_session_id TEXT);
+      CREATE TABLE sdk_sessions (memory_session_id TEXT PRIMARY KEY, platform_source TEXT)`);
     const module = path.resolve(import.meta.dir, '../../src/services/memory/save-memory.ts');
     const worker = path.join(root, 'save-race.ts');
     writeFileSync(worker, `import {Database} from 'bun:sqlite';
 import {saveMemory} from ${JSON.stringify(module)};
 const db = new Database(${JSON.stringify(database)}); db.exec('PRAGMA busy_timeout=5000');
-const manager = {getConnection:()=>db,getSessionStore:()=>({getOrCreateManualSession:()=> 'manual',storeObservation:(_s,p,o)=>{const r=db.query('INSERT INTO observations (title, project, metadata) VALUES (?,?,?)').run(o.title,p,o.metadata);return {id:Number(r.lastInsertRowid),createdAtEpoch:0};}}),getCloudSync:()=>null,getChromaSync:()=>null};
-saveMemory(manager,'p',{text:'note',metadata:{sourceFingerprint:'shared-race-fingerprint'}}); db.close();`);
-    const children = Array.from({length: 4}, () => Bun.spawn([process.execPath, worker], { stdout: 'pipe', stderr: 'pipe' }));
-    expect(await Promise.all(children.map(child => child.exited))).toEqual([0, 0, 0, 0]);
-    expect((db.query('SELECT COUNT(*) AS n FROM observations').get() as {n: number}).n).toBe(1);
-    db.close();
+const manager = {getConnection:()=>({
+  transaction:fn=>{
+    const transaction=db.transaction(fn);
+    const deferred=(...args)=>transaction(...args);
+    deferred.immediate=(...args)=>{console.log('ready');return transaction.immediate(...args);};
+    return deferred;
+  },
+  query:sql=>({get:(...args)=>{const row=db.query(sql).get(...args);console.log('ready');return row;}}),
+}),getSessionStore:()=>({getOrCreateManualSession:()=> 'manual',storeObservation:(_s,p,o)=>{const r=db.query('INSERT INTO observations (title, project, metadata) VALUES (?,?,?)').run(o.title,p,o.metadata);return {id:Number(r.lastInsertRowid),createdAtEpoch:0};}}),getCloudSync:()=>null,getChromaSync:()=>null};
+const result=saveMemory(manager,'p',{text:'note',metadata:{sourceFingerprint:'shared-race-fingerprint'}}); console.log(JSON.stringify(result)); db.close();`);
+    db.exec('BEGIN IMMEDIATE');
+    const existing = db.query('INSERT INTO observations (title, project, metadata) VALUES (?, ?, ?)')
+      .run('existing note', 'p', JSON.stringify({sourceFingerprint:'shared-race-fingerprint'}));
+    const child = Bun.spawn([process.execPath, worker], { stdout: 'pipe', stderr: 'pipe' });
+    let committed = false;
+    try {
+      const reader = child.stdout.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value)).toContain('ready');
+      db.exec('COMMIT'); committed = true;
+      let output = '';
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        output += new TextDecoder().decode(chunk.value);
+      }
+      expect(await new Response(child.stderr).text()).toBe('');
+      expect(await child.exited).toBe(0);
+      expect(output).toContain('"duplicate":true');
+      expect(output).toContain(`"id":${existing.lastInsertRowid}`);
+      expect((db.query('SELECT COUNT(*) AS n FROM observations').get() as {n: number}).n).toBe(1);
+    } finally {
+      if (!committed) db.exec('ROLLBACK');
+      child.kill();
+      await child.exited;
+      db.close();
+    }
   });
 });

@@ -19,8 +19,16 @@ const INTEGRATION_PATH_PATTERNS: RegExp[] = [
   /^tests\/services\/smart-file-read\//,
 ];
 
-// Unit-test locations whose files still spend real seconds waiting on timers.
+// Unit-test locations that build or run external tools, or wait on real timers.
 const INTEGRATION_TIMER_HEAVY_FILES = new Set<string>([
+  'tests/infrastructure/context-reader-packaging.test.ts',
+  'tests/infrastructure/plugin-distribution.test.ts',
+  'tests/launcher/claude-mem-launcher.test.ts',
+  'tests/launcher/install-launcher.test.ts',
+  'tests/npx-cli/browser-setup-install.test.ts',
+  'tests/services/auto-update/auto-update-installer-npx.test.ts',
+  'tests/services/vector/local-embedder-encode.test.ts',
+  'tests/work-view/skill-scripts-python.test.ts',
 ]);
 
 // The same names `bun test` treats as test files.
@@ -29,10 +37,15 @@ const BUN_TEST_FILE_EXTENSION = /\.(c|m)?[jt]sx?$/;
 
 function listAllTestFiles(): string[] {
   const files: string[] = [];
-  for (const path of new Glob('tests/**/*').scanSync({ onlyFiles: true })) {
+  for (const root of ['tests', 'src/ui/my-work/src/live', 'src/ui/my-work/src/setup', 'src/ui/my-work/src/store']) {
+  for (const scannedPath of new Glob(`${root}/**/*`).scanSync({ onlyFiles: true })) {
+    // On Windows the scan yields `tests\integration\…`. The lane patterns,
+    // the node_modules check and the file name below all split on `/`.
+    const path = scannedPath.replaceAll('\\', '/');
     if (path.includes('/node_modules/')) continue;
     const name = path.slice(path.lastIndexOf('/') + 1);
     if (BUN_TEST_FILE_NAME.test(name) && BUN_TEST_FILE_EXTENSION.test(name)) files.push(path);
+  }
   }
   return files.sort();
 }

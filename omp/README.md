@@ -4,8 +4,7 @@ An [OMP](https://omp.sh) hook adapter that records OMP sessions into the same
 claude-mem store that Claude Code, Cursor, and OpenCode already write to —
 one shared memory across all your agents.
 
-OMP loads hook modules from `~/.omp/agent/hooks/pre/*.ts` (user-global;
-`$PI_CODING_AGENT_DIR/hooks/pre` when that is set) or
+OMP loads hook modules from its selected agent directory's `hooks/pre/*.ts` or
 `<cwd>/.omp/hooks/pre/*.ts` (per-project) on every session start. This hook
 translates OMP lifecycle events into claude-mem's REST V1 event shape, so no
 OMP-side plugin or modification is required.
@@ -48,8 +47,19 @@ Behavioral notes (matching the OpenClaw adapter's conventions):
   worker did not record that prompt; one that arrives before any prompt is sent
   at once.
 - A session is finalized only after the worker recorded one of its prompts.
-- The `context` handler always preserves the original conversation — it
-  re-spreads `event.messages` and appends exactly one system message.
+- The `context` handler preserves the original conversation and appends one
+  transient `custom` message (`claude-mem:context`), without writing it to session
+  history. OMP drops unsupported `system` conversation messages. It converts
+  `custom` messages to developer content; framing the retrieved history as
+  reference data is not a prompt-injection sandbox.
+- Context requests always retain the current `cwd`. They filter to source `omp`
+  by default; when `CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES` is `"true"`
+  (or boolean `true` in settings), they omit that source filter so the worker
+  can apply the central cross-host policy. A defined environment value, even
+  empty, takes precedence over `settings.json`. The context cache includes this
+  effective policy, so source-policy changes take effect on the next context
+  callback without waiting for its 60s TTL. This does not broaden the worker's
+  project scope or change capture's `platformSource`.
 
 ## Install
 
@@ -62,6 +72,14 @@ npx claude-mem install --ide omp
 This copies `omp/hooks/claude-mem.ts` to `~/.omp/agent/hooks/pre/claude-mem.ts`,
 where OMP auto-discovers it for every session. No restart of OMP is needed —
 the hook loads at the next session start.
+
+Install and uninstall follow OMP's active profile: `OMP_PROFILE` takes precedence
+over the legacy `PI_PROFILE`, and a named profile uses
+`~/.omp/profiles/<name>/agent/hooks/pre/claude-mem.ts`. `PI_CONFIG_DIR` changes the
+`.omp` config directory name. In the default profile, `PI_CODING_AGENT_DIR` can
+override the agent directory. Run install and uninstall with the same profile
+environment used to start OMP; an explicitly empty or `default` `OMP_PROFILE`
+selects the default profile.
 
 Manual install (no claude-mem CLI):
 

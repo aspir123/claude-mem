@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import express from 'express';
 import type { Server } from 'http';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
@@ -8,6 +8,9 @@ import { pathToFileURL } from 'url';
 import { HookSpoolRoutes } from '../../src/services/worker/http/routes/HookSpoolRoutes.js';
 import { HookSpool, type HookSpoolConsumedMarkers } from '../../src/shared/hook-spool.js';
 import { REMOTE_SPOOL_TIMEOUT_MS, REMOTE_SPOOL_REQUEST_TIMEOUT_MS } from '../../src/shared/hook-spool-remote.js';
+import * as worker from '../../src/shared/worker-utils.js';
+import * as settings from '../../src/shared/hook-settings.js';
+import { uploadRemoteHookSpool } from '../../src/cli/spool-hook-event.js';
 
 const root = join(import.meta.dir, '..', '..');
 const moduleUrl = (path: string) => pathToFileURL(join(root, path)).href;
@@ -15,8 +18,9 @@ let directory: string;
 let spool: HookSpool;
 let server: Server;
 let port: number;
-let mode: 'normal' | 'legacy' | 'wrong-ack' | 'stalled-body' | 'slow-accept' | 'slow-reject';
+let mode: 'normal' | 'legacy' | 'wrong-ack' | 'slow-accept' | 'slow-reject';
 let requestPaths: string[];
+let livePayloads: unknown[];
 const markers: HookSpoolConsumedMarkers = {
   isConsumed: () => false, markConsumed() {}, clearConsumed() {}, pruneConsumedBefore() {},
 };
@@ -26,14 +30,10 @@ async function listen(): Promise<void> {
   app.use(express.json());
   app.use((req, res, next) => {
     requestPaths.push(req.path);
+    if (req.body?.entry?.kind === 'observation') livePayloads.push(req.body.entry.payload);
     if (mode === 'legacy') { res.status(202).json({ status: 'draining' }); return; }
     if (mode === 'wrong-ack') {
       res.status(202).json({ protocolVersion: 1, status: 'accepted', receipt: 'another-event' }); return;
-    }
-    if (mode === 'stalled-body') {
-      res.setHeader('Content-Type', 'application/json');
-      res.write('{"protocolVersion":1');
-      return;
     }
     if (mode === 'slow-accept' || mode === 'slow-reject') {
       const reject = mode === 'slow-reject';
@@ -67,6 +67,7 @@ beforeEach(async () => {
   spool = new HookSpool(join(directory, 'worker-spool'));
   mode = 'normal';
   requestPaths = [];
+  livePayloads = [];
   await listen();
 });
 afterEach(async () => {
@@ -74,25 +75,31 @@ afterEach(async () => {
   rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });
 
-async function child(action: 'observation' | 'stop' | 'flush' | 'poison' | 'post_run_command' | 'post_cascade_response', token: string = 'test-ingest-token') {
+async function child(action: 'metadata' | 'nudged_metadata' | 'stop' | 'flush' | 'poison' | 'post_run_command' | 'post_cascade_response', token: string = 'test-ingest-token', workerUrl = '', transport = 'http', hostAndPortFallback: string = String(port)) {
   const source = `
     const { spyOn } = await import('bun:test');
     const childProcess = await import('child_process');
     const { EventEmitter } = await import('events');
-    spyOn(childProcess, 'spawn').mockImplementation(() => {
+    const spawnedArguments = [];
+    spyOn(childProcess, 'spawn').mockImplementation((_command, args) => {
+      spawnedArguments.push(args);
       const child = new EventEmitter();
       child.unref = () => child;
       return child;
     });
-    const { uploadRemoteHookSpool, settleHookSpoolNudges } = await import(${JSON.stringify(moduleUrl('src/cli/spool-hook-event.ts'))});
+    const { uploadRemoteHookSpool, nudgeWorkerToDrainHookSpool, settleHookSpoolNudges } = await import(${JSON.stringify(moduleUrl('src/cli/spool-hook-event.ts'))});
     const { HookSpool } = await import(${JSON.stringify(moduleUrl('src/shared/hook-spool.ts'))});
     const common = { contentSessionId: 'remote-client', platformSource: 'codex', cwd: '/project' };
     const started = performance.now();
     if (${JSON.stringify(action)} === 'poison') {
-      new HookSpool().enqueue('observation', { ...common, toolName: 'exec_command', toolInput: {}, toolResponse: 'rejected capture', toolUseId: 'x'.repeat(2049) });
+      new HookSpool().enqueue('advisor_calls', { ...common, calls: [{ toolUseId: 'x'.repeat(2049), advice: 'rejected capture', occurredAtEpoch: Date.now() }] });
     }
-    if (${JSON.stringify(action)} === 'observation' || ${JSON.stringify(action)} === 'poison') {
-      new HookSpool().enqueue('observation', { ...common, toolName: 'exec_command', toolInput: { cmd: 'read fixture' }, toolResponse: 'client routing rule', toolUseId: 'client-tool-1' });
+    if (${JSON.stringify(action)} === 'nudged_metadata') {
+      new HookSpool().enqueue('advisor_calls', { ...common, calls: [{ toolUseId: 'client-tool-1', advice: 'client routing rule', occurredAtEpoch: Date.now() }] });
+      await nudgeWorkerToDrainHookSpool();
+      await settleHookSpoolNudges();
+    } else if (${JSON.stringify(action)} === 'metadata' || ${JSON.stringify(action)} === 'poison') {
+      new HookSpool().enqueue('advisor_calls', { ...common, calls: [{ toolUseId: 'client-tool-1', advice: 'client routing rule', occurredAtEpoch: Date.now() }] });
     } else if (${JSON.stringify(action)} === 'stop') {
       new HookSpool().enqueue('advisor_calls', { ...common, calls: [{ toolUseId: 'advisor-1', advice: 'keep the queued event', occurredAtEpoch: Date.now() }] });
       new HookSpool().enqueue('summarize', { ...common, lastAssistantMessage: 'done' });
@@ -107,13 +114,15 @@ async function child(action: 'observation' | 'stop' | 'flush' | 'poison' | 'post
       await settleHookSpoolNudges();
     }
     await uploadRemoteHookSpool();
-    console.log(JSON.stringify({ elapsedMs: performance.now() - started, entries: new HookSpool().entries() }));
+    console.log(JSON.stringify({ elapsedMs: performance.now() - started, entries: new HookSpool().entries(), spawnedArguments }));
   `;
   const proc = Bun.spawn([process.execPath, '-e', source], {
     cwd: root,
     env: { ...process.env, CLAUDE_MEM_DATA_DIR: join(directory, 'client'),
-      CLAUDE_MEM_WORKER_HOST: '127.0.0.1', CLAUDE_MEM_WORKER_PORT: String(port),
-      CLAUDE_MEM_WORKER_AUTOSTART: 'false', CLAUDE_MEM_HOOK_SPOOL_TRANSPORT: 'http',
+      CLAUDE_MEM_WORKER_HOST: '127.0.0.1', CLAUDE_MEM_WORKER_PORT: hostAndPortFallback,
+      CLAUDE_PLUGIN_ROOT: join(root, 'plugin'),
+      CLAUDE_MEM_WORKER_URL: workerUrl,
+      CLAUDE_MEM_WORKER_AUTOSTART: 'false', CLAUDE_MEM_HOOK_SPOOL_TRANSPORT: transport,
       CLAUDE_MEM_WORKER_INGEST_TOKEN: token, CLAUDE_MEM_RUNTIME: 'worker', CLAUDE_MEM_TELEMETRY: '0' },
     stdout: 'pipe', stderr: 'pipe',
   });
@@ -121,7 +130,7 @@ async function child(action: 'observation' | 'stop' | 'flush' | 'poison' | 'post
     new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
   ]);
   if (exit !== 0) throw new Error(`client exited ${exit}: ${stderr}`);
-  return JSON.parse(stdout.trim().split('\n').pop()!) as { elapsedMs: number; entries: unknown[] };
+  return JSON.parse(stdout.trim().split('\n').pop()!) as { elapsedMs: number; entries: unknown[]; spawnedArguments: string[][] };
 }
 
 describe('remote hook spool forwarding', () => {
@@ -131,8 +140,9 @@ describe('remote hook spool forwarding', () => {
   ] as const) {
     it(`delivers a Windsurf ${action} with omitted tool fields without quarantining it`, async () => {
       expect((await child(action)).entries).toEqual([]);
-      expect(spool.entries()).toHaveLength(1);
-      expect(spool.entries()[0].payload).toMatchObject({
+      expect(spool.entries()).toHaveLength(0);
+      expect(livePayloads).toHaveLength(1);
+      expect(livePayloads[0]).toMatchObject({
         contentSessionId: 'windsurf-remote-session', platformSource: 'windsurf', ...expected,
       });
       const corrupt = join(directory, 'client/state/hook-spool/corrupt');
@@ -144,20 +154,41 @@ describe('remote hook spool forwarding', () => {
   }
 
   it('hands the event to a different spool and removes the acknowledged client copy', async () => {
-    expect((await child('observation')).entries).toEqual([]);
+    expect((await child('metadata')).entries).toEqual([]);
     expect(spool.entries()).toHaveLength(1);
-    expect(spool.entries()[0].payload).toMatchObject({ toolUseId: 'client-tool-1', toolResponse: 'client routing rule' });
+    expect(spool.entries()[0].payload).toMatchObject({ calls: [{ toolUseId: 'client-tool-1', advice: 'client routing rule' }] });
     expect(requestPaths).toEqual(['/api/spool/ingest']);
   });
 
-  it('coalesces Stop events without stranding the summary or session end', async () => {
-    expect((await child('stop')).entries).toEqual([]);
-    expect(spool.entries().map(e => e.kind)).toEqual(['advisor_calls', 'summarize', 'session_end']);
+  it('schedules the uploader for a worker URL in auto mode and delivers to the URL, not host and port', async () => {
+    // Port 1 is the host-and-port fallback: nothing listens there, so a client that ignores the URL fails to deliver.
+    const result = await child('nudged_metadata', 'test-ingest-token', `http://127.0.0.1:${port}`, 'auto', '1');
+    expect(result.spawnedArguments).toHaveLength(1);
+    expect(result.spawnedArguments[0].at(-1)).toBe('upload-spool');
+    expect(result.entries).toEqual([]);
+    expect(spool.entries()).toHaveLength(1);
+    expect(requestPaths).toEqual(['/api/spool/ingest']);
   });
 
-  it('retains capture while offline and replays it on the next hook after recovery', async () => {
+  it('does not schedule the uploader in auto mode for a loopback worker with no URL', async () => {
+    const result = await child('nudged_metadata', 'test-ingest-token', '', 'auto');
+    expect(result.spawnedArguments).toEqual([]);
+  });
+
+  it('keeps the event queued for an insecure worker URL instead of falling back to host and port', async () => {
+    const result = await child('metadata', 'test-ingest-token', 'http://worker.example:37777', 'auto');
+    expect(result.entries).toHaveLength(1);
+    expect(requestPaths).toEqual([]);
+  });
+
+  it('delivers Stop metadata and retires legacy summary fragments', async () => {
+    expect((await child('stop')).entries).toEqual([]);
+    expect(spool.entries().map(e => e.kind)).toEqual(['advisor_calls', 'session_end']);
+  });
+
+  it('retains metadata while offline and replays it on the next hook after recovery', async () => {
     await close();
-    const offline = await child('observation');
+    const offline = await child('metadata');
     expect(offline.entries).toHaveLength(1);
     const original = offline.entries[0];
     await listen();
@@ -167,17 +198,17 @@ describe('remote hook spool forwarding', () => {
 
   it('never interprets a legacy bodyless nudge response as event acceptance', async () => {
     mode = 'legacy';
-    expect((await child('observation')).entries).toHaveLength(1);
+    expect((await child('metadata')).entries).toHaveLength(1);
     expect(spool.entries()).toEqual([]);
   });
 
   it('retains the event when the acknowledgement names a different event', async () => {
     mode = 'wrong-ack';
-    expect((await child('observation')).entries).toHaveLength(1);
+    expect((await child('metadata')).entries).toHaveLength(1);
   });
 
   it('retains an event with missing or rejected credentials', async () => {
-    expect((await child('observation', '')).entries).toHaveLength(1);
+    expect((await child('metadata', '')).entries).toHaveLength(1);
     expect(requestPaths).toEqual([]);
     expect((await child('flush', 'incorrect-token')).entries).toHaveLength(1);
     expect(spool.entries()).toEqual([]);
@@ -186,24 +217,42 @@ describe('remote hook spool forwarding', () => {
   it('preserves a permanently rejected event in quarantine and still delivers the next valid event', async () => {
     expect((await child('poison')).entries).toEqual([]);
     expect(spool.entries()).toHaveLength(1);
-    expect(spool.entries()[0].payload).toMatchObject({ toolUseId: 'client-tool-1' });
+    expect(spool.entries()[0].payload).toMatchObject({ calls: [{ toolUseId: 'client-tool-1' }] });
     const rejected = join(directory, 'client/state/hook-spool/corrupt');
     const { readdirSync, readFileSync } = await import('fs');
     expect(readdirSync(rejected)).toHaveLength(1);
     expect(readFileSync(join(rejected, readdirSync(rejected)[0]), 'utf8')).toContain('rejected capture');
   });
 
-  it('bounds an upload whose response body never completes', async () => {
-    mode = 'stalled-body';
-    const result = await child('observation');
-    expect(result.entries).toHaveLength(1);
-    expect(result.elapsedMs).toBeGreaterThanOrEqual(REMOTE_SPOOL_REQUEST_TIMEOUT_MS - 100);
-    expect(result.elapsedMs).toBeLessThan(REMOTE_SPOOL_REQUEST_TIMEOUT_MS + 700);
-  }, REMOTE_SPOOL_REQUEST_TIMEOUT_MS + 3_000);
+  it('passes the upload and idle timeouts to the worker transport', async () => {
+    spool.enqueue('advisor_calls', { contentSessionId: 'timeout-session', platformSource: 'codex',
+      calls: [{ toolUseId: 'timeout-tool', advice: 'metadata', occurredAtEpoch: Date.now() }] });
+    const entry = spool.entries()[0];
+    const config = spyOn(settings, 'loadFromFileOnce').mockReturnValue({
+      CLAUDE_MEM_WORKER_INGEST_TOKEN: 'test-ingest-token', CLAUDE_MEM_WORKER_URL: '',
+    } as any);
+    const post = spyOn(worker, 'workerHttpRequest').mockRejectedValue(new Error('fixture timeout'));
+    const drain = spyOn(HookSpool.prototype, 'drain').mockImplementation(async accept => {
+      expect(await accept(entry, () => {})).toBe(false);
+      return { drained: 0, retained: 1, quarantined: 0, expired: 0 };
+    });
+    try {
+      await uploadRemoteHookSpool();
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0]).toEqual(['/api/spool/ingest', expect.objectContaining({
+        timeoutMs: REMOTE_SPOOL_REQUEST_TIMEOUT_MS,
+        idleTimeoutMs: REMOTE_SPOOL_REQUEST_TIMEOUT_MS,
+      })]);
+    } finally {
+      drain.mockRestore();
+      post.mockRestore();
+      config.mockRestore();
+    }
+  });
 
   it('accepts an event whose acknowledgement arrives after the scheduling budget', async () => {
     mode = 'slow-accept';
-    const result = await child('observation');
+    const result = await child('metadata');
     expect(result.elapsedMs).toBeGreaterThan(REMOTE_SPOOL_TIMEOUT_MS);
     expect(result.entries).toEqual([]);
     expect(spool.entries()).toHaveLength(1);
@@ -218,7 +267,7 @@ describe('remote hook spool forwarding', () => {
     mode = 'normal';
     expect((await child('flush')).entries).toEqual([]);
     expect(spool.entries()).toHaveLength(1);
-    expect(spool.entries()[0].payload).toMatchObject({ toolUseId: 'client-tool-1' });
+    expect(spool.entries()[0].payload).toMatchObject({ calls: [{ toolUseId: 'client-tool-1' }] });
     expect(requestPaths).toEqual(['/api/spool/ingest', '/api/spool/ingest']);
   });
 });

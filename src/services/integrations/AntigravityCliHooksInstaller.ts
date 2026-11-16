@@ -1,7 +1,7 @@
 
 import path from 'path';
 import { homedir } from 'os';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, mkdirSync } from 'fs';
 import { execSync } from 'child_process';
 import { logger } from '../../utils/logger.js';
 import {
@@ -11,8 +11,9 @@ import {
 } from './install-paths.js';
 import { writeMcpJsonConfig, PLACEHOLDER_CONTEXT } from './McpIntegrations.js';
 import { readJsonSafe } from '../../utils/json-utils.js';
-import { injectContextIntoMarkdownFile } from '../../utils/context-injection.js';
+import { findContextBlockRange, injectContextIntoMarkdownFile } from '../../utils/context-injection.js';
 import { ANTIGRAVITY_HOOK_TIMEOUT_MS } from '../../shared/host-hook-limits.js';
+import { parseJsonWithBom, writeJsonFileAtomic, writeTextFileAtomic } from '../../shared/atomic-json.js';
 
 // agy hook schema (builtin `agy-customizations/docs/hooks.md`): each top-level
 // key of hooks.json is a hook NAME, mapping to an object of event keys. Only
@@ -109,24 +110,36 @@ const HOOK_TIMEOUT_SECONDS = ANTIGRAVITY_HOOK_TIMEOUT_MS / 1000;
 // builtin docs/hooks.md, "Supported Event Types").
 const ANTIGRAVITY_GROUPED_EVENTS = new Set<string>(['PreToolUse', 'PostToolUse']);
 
-// The 5 hook events `agy` fires, mapped to claude-mem's internal handlers:
+// The 5 hook events claude-mem registers in `agy`, mapped to its internal handlers:
 //   - SessionStart   → context     (inject startup memory once when a session starts;
 //                                    prevents invalidating LLM prefix cache on every
 //                                    turn/invocation, issue #4911)
-//   - PreToolUse     → observation (records tool intent; adapter emits
-//                                    `{"decision":"allow"}` so the call proceeds)
+//   - PreInvocation  → session-init (agy has no prompt-submit hook. Records the
+//                                    prompt on the first model call of a user turn
+//                                    only; a follow-up call after a tool step gets
+//                                    file-context for the files that step read.
+//                                    See runAntigravityPreInvocation, #5078)
 //   - PostToolUse    → observation (records the tool result)
 //   - PostInvocation → observation (records the assistant response, pulled from
 //                                    the transcript's PLANNER_RESPONSE node)
 //   - Stop           → summarize   (session/turn end → summary)
+// PreToolUse is not registered. A PreToolUse hook must answer with a decision,
+// and agy treats "allow" as auto-approval, so a `*`-matched observation hook
+// there skipped agy's own permission prompt for every tool and recorded each
+// call twice (#5078). Observations come from PostToolUse, as on Claude Code.
 // Note: SessionStart is the official agy lifecycle event for startup context injection
 // (builtin `agy-customizations/docs/hooks.md`). Mapping PreInvocation to context
-// injected ephemeral context into every model call, destroying prefix cache hit rates.
+// injected the memory timeline into every model call, destroying prefix cache hit
+// rates (#4911). PreInvocation → session-init doesn't bring that back: it injects
+// nothing on most calls. It injects only (a) file-context after a tool step read a
+// file with history, deduped per session and file, so a file's timeline is injected
+// once until a newer observation lands, and (b) semantic context on a new user turn
+// when CLAUDE_MEM_SEMANTIC_INJECT is on (default off).
 // Legacy Gemini-CLI names (BeforeAgent/AfterAgent/BeforeTool/AfterTool/Notification/
 // PreCompress) are not present in agy.
 const ANTIGRAVITY_EVENT_TO_INTERNAL_EVENT: Record<string, string> = {
   'SessionStart': 'context',
-  'PreToolUse': 'observation',
+  'PreInvocation': 'session-init',
   'PostToolUse': 'observation',
   'PostInvocation': 'observation',
   'Stop': 'summarize',
@@ -138,8 +151,11 @@ const ANTIGRAVITY_EVENT_TO_INTERNAL_EVENT: Record<string, string> = {
 // hook with exit status 1). On Windows, a space inside the path can't be
 // quoted away either, so resolve the 8.3 short path to remove the space; if 8.3
 // generation is disabled we fall back to the raw path with a warning rather
-// than blocking the install.
-function toSpaceFreePath(filePath: string): string {
+// than blocking the install. `%I`, not `%~I`: this runs at the cmd command
+// line, where `%~I` is a syntax error ("%~I was unexpected at this time"),
+// so every lookup failed and paths with spaces were never shortened.
+// Exported for tests.
+export function toSpaceFreePath(filePath: string): string {
   if (!filePath.includes(' ')) return filePath;
   if (process.platform !== 'win32') {
     console.warn(
@@ -151,7 +167,7 @@ function toSpaceFreePath(filePath: string): string {
   }
   try {
     const shortPath = execSync(
-      `for %~I in ("${filePath}") do @echo %~sI`,
+      `for %I in ("${filePath}") do @echo %~sI`,
       { shell: 'cmd.exe', encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] },
     ).trim();
     if (shortPath && !shortPath.includes(' ')) return shortPath;
@@ -227,7 +243,7 @@ function readAntigravitySettings(): AntigravitySettingsJson {
 
   const content = readFileSync(GEMINI_SETTINGS_PATH, 'utf-8');
   try {
-    return JSON.parse(content) as AntigravitySettingsJson;
+    return parseJsonWithBom<AntigravitySettingsJson>(content);
   } catch (error) {
     if (error instanceof Error) {
       logger.error('WORKER', 'Corrupt JSON in Antigravity CLI (shared Gemini) settings', { path: GEMINI_SETTINGS_PATH }, error);
@@ -240,7 +256,7 @@ function readAntigravitySettings(): AntigravitySettingsJson {
 
 function writeAntigravitySettings(settings: AntigravitySettingsJson): void {
   mkdirSync(GEMINI_CONFIG_DIR, { recursive: true });
-  writeFileSync(GEMINI_SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n');
+  writeJsonFileAtomic(GEMINI_SETTINGS_PATH, settings);
 }
 
 // Read the standalone `hooks.json` agy loads. Returns the whole file (named
@@ -248,30 +264,35 @@ function writeAntigravitySettings(settings: AntigravitySettingsJson): void {
 // unparseable) content throws so we never clobber a user's hand-edited hooks.
 // The on-disk value may still be the legacy event-keyed shape; callers migrate
 // or strip that via stripLegacyEventHooks().
-function readAntigravityHooksConfig(): AntigravityHooksConfig {
-  if (!existsSync(GEMINI_HOOKS_CONFIG_PATH)) {
+function readAntigravityHooksConfig(
+  hooksConfigPath: string = GEMINI_HOOKS_CONFIG_PATH,
+): AntigravityHooksConfig {
+  if (!existsSync(hooksConfigPath)) {
     return {};
   }
-  const content = readFileSync(GEMINI_HOOKS_CONFIG_PATH, 'utf-8');
+  const content = readFileSync(hooksConfigPath, 'utf-8');
   if (!content.trim()) {
     return {};
   }
   try {
-    return JSON.parse(content) as AntigravityHooksConfig;
+    return parseJsonWithBom<AntigravityHooksConfig>(content);
   } catch (error) {
     logger.error(
       'WORKER',
       'Corrupt JSON in Antigravity CLI hooks config',
-      { path: GEMINI_HOOKS_CONFIG_PATH },
+      { path: hooksConfigPath },
       error instanceof Error ? error : new Error(String(error)),
     );
-    throw new Error(`Corrupt JSON in ${GEMINI_HOOKS_CONFIG_PATH}, refusing to overwrite user hooks`);
+    throw new Error(`Corrupt JSON in ${hooksConfigPath}, refusing to overwrite user hooks`);
   }
 }
 
-function writeAntigravityHooksConfig(hooksConfig: AntigravityHooksConfig): void {
-  mkdirSync(path.dirname(GEMINI_HOOKS_CONFIG_PATH), { recursive: true });
-  writeFileSync(GEMINI_HOOKS_CONFIG_PATH, JSON.stringify(hooksConfig, null, 2) + '\n');
+function writeAntigravityHooksConfig(
+  hooksConfig: AntigravityHooksConfig,
+  hooksConfigPath: string = GEMINI_HOOKS_CONFIG_PATH,
+): void {
+  mkdirSync(path.dirname(hooksConfigPath), { recursive: true });
+  writeJsonFileAtomic(hooksConfigPath, hooksConfig);
 }
 
 // Merge claude-mem's named hook into an existing hooks.json, preserving other
@@ -286,8 +307,12 @@ function mergeNamedHook(
 
   // Prior versions of claude-mem (#4057) mapped context to PreInvocation,
   // which injected context on every turn and invalidated prefix caching (#4911).
-  // Clean up PreInvocation on upgrade if it was registered for claude-mem.
+  // Drop whatever PreInvocation entry the hook has; the loop below re-adds the
+  // current session-init mapping, so a stale `context` handler never survives.
   delete merged.PreInvocation;
+  // Prior versions also registered PreToolUse, which auto-approved every tool
+  // call (#5078).
+  delete merged.PreToolUse;
 
   for (const event of Object.keys(ANTIGRAVITY_EVENT_TO_INTERNAL_EVENT)) {
     const value = (incoming as Record<string, unknown>)[event];
@@ -347,6 +372,95 @@ export function mergeHooksIntoConfig(
   return config;
 }
 
+// A PreInvocation handler is stale when it still routes to `context` — the
+// pre-#4911 mapping that injected the memory timeline on every model call.
+// The current mapping routes PreInvocation to session-init.
+function hasStalePreInvocationHandlers(handlers: unknown): boolean {
+  return Array.isArray(handlers) &&
+    handlers.some((h: any) => typeof h?.command === 'string' && /\bcontext\s*$/.test(h.command));
+}
+
+// Stale entries an in-place plugin upgrade can leave on the named `claude-mem`
+// hook when install is not re-run: a PreToolUse entry (registered until
+// #5085) and a PreInvocation entry routing to `context` (until #4911).
+// Exported for tests (#5665).
+export function findStaleAntigravityHooks(
+  config: AntigravityHooksConfig,
+): { hasStalePreToolUse: boolean; hasStalePreInvocation: boolean } {
+  const namedHook = config[HOOK_NAME];
+  if (!namedHook || typeof namedHook !== 'object' || Array.isArray(namedHook)) {
+    return { hasStalePreToolUse: false, hasStalePreInvocation: false };
+  }
+  const loose = namedHook as Record<string, unknown>;
+  const preToolUse = loose['PreToolUse'];
+  return {
+    hasStalePreToolUse: Array.isArray(preToolUse) && preToolUse.length > 0,
+    hasStalePreInvocation: hasStalePreInvocationHandlers(loose['PreInvocation']),
+  };
+}
+
+// Migrate stale hooks.json entries in place when a hook or worker run finds
+// them (#5665). A leftover PreToolUse entry is fatal to the user's session:
+// agy fires it before every tool call, the current adapter answers `{}` (no
+// `decision` field, removed in #5085), and agy denies the call — 100% of tool
+// calls fail until the file is migrated, which previously only happened when
+// the user thought to re-run `install --ide antigravity`. The stale entries
+// point at this binary, so any of its hook invocations can heal the file on
+// the way in. Best-effort by contract: never throws, writes only when a stale
+// entry is actually present, and leaves a corrupt file exactly as found
+// (install refuses to overwrite those too). Returns true when it rewrote the
+// file.
+export function healStaleAntigravityHooksConfig(
+  hooksConfigPath: string = GEMINI_HOOKS_CONFIG_PATH,
+): boolean {
+  try {
+    if (!existsSync(hooksConfigPath)) return false;
+
+    let config: AntigravityHooksConfig;
+    try {
+      config = readAntigravityHooksConfig(hooksConfigPath);
+    } catch {
+      return false;
+    }
+
+    const stale = findStaleAntigravityHooks(config);
+    if (!stale.hasStalePreToolUse && !stale.hasStalePreInvocation) return false;
+
+    const workerServicePath = findWorkerServicePath();
+    let healed: AntigravityHooksConfig;
+    if (workerServicePath) {
+      healed = mergeHooksIntoConfig(
+        config,
+        buildAntigravityHooksConfig(findBunPath(), workerServicePath),
+      );
+    } else {
+      // The canonical commands can't be rebuilt without the worker path;
+      // still remove the entries that break tool calls and leave the rest of
+      // the named hook (and every other hook) exactly as found.
+      const namedHook: Record<string, unknown> = {
+        ...(config[HOOK_NAME] as Record<string, unknown>),
+      };
+      delete namedHook.PreToolUse;
+      if (stale.hasStalePreInvocation) delete namedHook.PreInvocation;
+      healed = { ...config, [HOOK_NAME]: namedHook as AntigravityNamedHook };
+    }
+
+    writeAntigravityHooksConfig(healed, hooksConfigPath);
+    logger.info('WORKER', 'Migrated stale Antigravity CLI hooks in hooks.json (stale PreToolUse / PreInvocation entries from an older install)', {
+      path: hooksConfigPath,
+      hasStalePreToolUse: stale.hasStalePreToolUse,
+      hasStalePreInvocation: stale.hasStalePreInvocation,
+    });
+    return true;
+  } catch (error) {
+    logger.warn('WORKER', 'Failed to migrate stale Antigravity CLI hooks', {
+      path: hooksConfigPath,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
 function setupGeminiMdContextSection(): void {
   const contextTag = '<claude-mem-context>';
   const contextEndTag = '</claude-mem-context>';
@@ -369,7 +483,7 @@ ${contextEndTag}`;
   const newContent = content + separator + placeholder + '\n';
 
   mkdirSync(GEMINI_CONFIG_DIR, { recursive: true });
-  writeFileSync(GEMINI_MD_PATH, newContent);
+  writeTextFileAtomic(GEMINI_MD_PATH, newContent);
 }
 
 // B0 found `~/.gemini/config/mcp_config.json` existing but genuinely empty (0
@@ -381,7 +495,7 @@ ${contextEndTag}`;
 // the shared writer, so an empty placeholder doesn't get misread as corrupt.
 function seedEmptyMcpConfigFile(mcpConfigPath: string): void {
   if (existsSync(mcpConfigPath) && readFileSync(mcpConfigPath, 'utf-8').trim() === '') {
-    writeFileSync(mcpConfigPath, '{}\n');
+    writeTextFileAtomic(mcpConfigPath, '{}\n');
   }
 }
 
@@ -489,19 +603,20 @@ function removeClaudeMemFromMcpConfig(mcpConfigPath: string): boolean {
   }
 
   delete config.mcpServers['claude-mem'];
-  writeFileSync(mcpConfigPath, JSON.stringify(config, null, 2) + '\n');
+  writeJsonFileAtomic(mcpConfigPath, config);
   return true;
 }
 
-function removeContextTagBlock(filePath: string): boolean {
+export function removeContextTagBlock(filePath: string): boolean {
   if (!existsSync(filePath)) return false;
 
-  let content = readFileSync(filePath, 'utf-8');
-  const contextRegex = /\n?<claude-mem-context>[\s\S]*?<\/claude-mem-context>\n?/;
-  if (!contextRegex.test(content)) return false;
+  const content = readFileSync(filePath, 'utf-8');
+  const block = findContextBlockRange(content);
+  if (!block) return false;
 
-  content = content.replace(contextRegex, '');
-  writeFileSync(filePath, content);
+  const start = content[block.start - 1] === '\n' ? block.start - 1 : block.start;
+  const end = content[block.end] === '\n' ? block.end + 1 : block.end;
+  writeTextFileAtomic(filePath, content.slice(0, start) + content.slice(end));
   return true;
 }
 
@@ -600,11 +715,13 @@ function removeAntigravityHooksFromSettings(): void {
 }
 
 // Count the underlying handler objects in a named hook (used for the uninstall
-// summary so grouped and flat events are both counted).
+// summary so grouped and flat events are both counted). Every event on the hook
+// is counted, since uninstall removes the whole hook, including the PreToolUse
+// entry an older install left there (#5078).
 function countNamedHookHandlers(namedHook: AntigravityNamedHook): number {
   let count = 0;
 
-  for (const event of Object.keys(ANTIGRAVITY_EVENT_TO_INTERNAL_EVENT)) {
+  for (const event of Object.keys(namedHook)) {
     const value = (namedHook as Record<string, unknown>)[event];
     if (!Array.isArray(value)) continue;
 
@@ -653,16 +770,20 @@ export function describeAntigravityHooks(
   let hasStalePreInvocation = false;
   const namedHook = config[HOOK_NAME];
   if (namedHook && typeof namedHook === 'object' && !Array.isArray(namedHook)) {
+    // PreInvocation is current when it routes to session-init; only the
+    // pre-#4911 handler that routed it to `context` is stale, and that one is
+    // not the mapped event, so it isn't listed as installed.
+    const preInvocation = (namedHook as Record<string, unknown>)['PreInvocation'];
+    if (hasStalePreInvocationHandlers(preInvocation)) {
+      hasStalePreInvocation = true;
+    }
+
     for (const event of Object.keys(ANTIGRAVITY_EVENT_TO_INTERNAL_EVENT)) {
+      if (event === 'PreInvocation' && hasStalePreInvocation) continue;
       const value = (namedHook as Record<string, unknown>)[event];
       if (Array.isArray(value) && value.length > 0) {
         installedEvents.push(event);
       }
-    }
-
-    const preInvocation = (namedHook as Record<string, unknown>)['PreInvocation'];
-    if (Array.isArray(preInvocation) && preInvocation.length > 0) {
-      hasStalePreInvocation = true;
     }
   }
 

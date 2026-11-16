@@ -74,6 +74,61 @@ describe('worker Dumb search with real SQLite fixtures', () => {
     expect(result.observations[0].content).toContain('SUMMARY_DETAIL');
   });
 
+  for (const kind of ['observation', 'summary'] as const) for (const limit of [1, 2, 20]) {
+    it(`keeps a matching ${kind} when prompts fill the index limit of ${limit}`, async () => {
+      const title = 'Authentication token expiry';
+      const memory = store.getOrCreateManualSession(project);
+      const observation = store.getObservationById(Number(authId))!;
+      const summaryId = store.storeSummary(memory, project, {
+        request: 'Authentication expiry', investigated: 'SUMMARY_DETAIL', learned: '', completed: '', next_steps: '', notes: null,
+      }, 1, 0, epoch).id;
+      const summary = store.getSessionSummariesByIds([summaryId])[0];
+      const adapterManager = { search: async () => ({
+        observations: kind === 'observation' ? [observation] : [],
+        sessions: kind === 'summary' ? [summary] : [],
+        prompts: Array.from({ length: limit }, (_, i) => ({
+          id: 999 + i, project, prompt_text: title, created_at_epoch: epoch,
+        })),
+      }) } as unknown as SearchManager;
+      const result = await new ProgressiveMemorySearch(adapterManager, store).run({
+        query: title, project, limit, maxDetails: 1, depthBefore: 0, depthAfter: 0,
+      });
+      expect(result.step).toBe(3);
+      expect(result.observations).toHaveLength(1);
+      expect(result.observations[0].id).toBe(kind === 'observation' ? authId : `S${summaryId}`);
+    });
+  }
+
+  it('uses the detail selector prefix rule when protecting a memory from prompts', async () => {
+    const id = seed(project, 'Authenticating requests', 'PREFIX_MATCH_DETAIL', epoch);
+    const adapterManager = { search: async () => ({
+      observations: [store.getObservationById(Number(id))!], sessions: [],
+      prompts: [{ id: 999, project, prompt_text: 'Authentication', created_at_epoch: epoch }],
+    }) } as unknown as SearchManager;
+    const result = await new ProgressiveMemorySearch(adapterManager, store).run({
+      query: 'authentication', project, limit: 1, maxDetails: 1, depthBefore: 0, depthAfter: 0,
+    });
+    expect(result.step).toBe(3);
+    expect(result.observations.map(row => row.id)).toEqual([id]);
+  });
+
+  it.each([
+    ['stop-word-only memories', 'What did we do for the garden', 'STOP_WORD_ONLY_DETAIL', 'what did we do for the authentication expiry', 'What did we do for the authentication expiry'],
+    ['matches beyond the bounded title', `${'Garden '.repeat(40)}authentication`, 'TRUNCATED_TITLE_DETAIL', 'authentication expiry', 'Authentication expiry'],
+    ['unrelated observations', 'Gardening notes', 'UNRELATED_BODY', 'Authentication expiry', 'Authentication expiry'],
+    ['no matching memories', null, null, 'Authentication expiry', 'Authentication expiry'],
+  ] as const)('keeps prompt-only matches visible with %s', async (_name, title, narrative, query, prompt) => {
+    const observations = title === null ? [] : [store.getObservationById(Number(seed(project, title, narrative!, epoch)))!];
+    const adapterManager = { search: async () => ({
+      observations, sessions: [],
+      prompts: [{ id: 999, project, prompt_text: prompt, created_at_epoch: epoch }],
+    }) } as unknown as SearchManager;
+    const result = await new ProgressiveMemorySearch(adapterManager, store).run({ query, project, limit: 1 });
+    expect(result.step).toBe(1);
+    expect(result.index.map(row => row.id)).toEqual(['P999']);
+    expect(result.observations).toEqual([]);
+  });
+
   it('reranks semantic candidates beyond the requested limit before cutting the index (#4865)', async () => {
     const target = 'candidate-limit-fixture';
     const query = 'Authentication token expiry correction';
@@ -246,31 +301,14 @@ describe('worker timeline context window', () => {
     }
     expect(captured.length).toBeGreaterThan(0);
 
-    const plan = db.prepare(`EXPLAIN QUERY PLAN ${captured[0]}`).all() as Array<{ id: number; parent: number; detail: string }>;
-    const byParent = new Map<number, Array<{ id: number; parent: number; detail: string }>>();
-    for (const row of plan) byParent.set(row.parent, [...(byParent.get(row.parent) ?? []), row]);
-    const subtree = (id: number): Array<{ detail: string }> => (byParent.get(id) ?? [])
-      .flatMap(child => [child, ...subtree(child.id)]);
-    // LEFT-MOST SUBQUERY + one UNION ALL per remaining arm.
-    const arms = plan.filter(row => row.detail === 'LEFT-MOST SUBQUERY' || row.detail === 'UNION ALL');
-    expect(arms).toHaveLength(3);
-    // What this PR guarantees: the LIMIT lives inside each arm, so SQLite plans
-    // each arm as its own bounded subquery (a CO-ROUTINE node) that stops after
-    // `limit` rows instead of streaming every matching row of the project into
-    // the CTE. An arm without an internal LIMIT has no such node.
-    //
-    // Deliberately not pinned: how an arm sorts. Whether a `USE TEMP B-TREE`
-    // node appears depends on which index the planner picks for the arm's
-    // ORDER BY, so requiring (or forbidding) one would turn this test red when a
-    // better index is added later. Sorting is not what this test claims.
-    //
-    // Honest limit of the guarantee: the `user_prompts` arm still gathers the
-    // project's prompts. Its project filter lives on the joined `sdk_sessions`,
-    // and `user_prompts` has no `(session_db_id, created_at_epoch)` index that
-    // could bound it by project; adding that index is deliberately out of scope.
-    const boundedArms = arms.map(arm => subtree(arm.id))
-      .filter(nodes => nodes.some(node => node.detail.startsWith('CO-ROUTINE (subquery')));
-    expect(boundedArms).toHaveLength(3);
+    for (const sql of captured) {
+      const union = sql.slice(sql.indexOf('WITH memory_index AS (') + 'WITH memory_index AS ('.length, sql.lastIndexOf('SELECT * FROM memory_index'));
+      const arms = union.split(/\bUNION\s+ALL\b/i);
+      expect(arms).toHaveLength(3);
+      for (const arm of arms) {
+        expect(arm).toMatch(/\bORDER\s+BY[\s\S]*\bLIMIT\s+\?\s*\)(?:\s*\))?\s*$/i);
+      }
+    }
   });
 
   it('returns exactly the boundary window rows for matched and mismatched anchors', () => {

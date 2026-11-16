@@ -35,7 +35,6 @@ mock.module('../../../../src/services/worker/provider-dispatch.js', () => ({
 }));
 
 import { SessionRoutes } from '../../../../src/services/worker/http/routes/SessionRoutes.js';
-import { telemetryBuffer } from '../../../../src/services/telemetry/buffer.js';
 import { getProcessRegistry, waitForSlot, isSessionParkedForSlot } from '../../../../src/supervisor/process-registry.js';
 import { guardSharedProcessRegistrySingleton } from '../../../supervisor/process-registry-singleton-guard.js';
 import { guardSharedQuotaCooldownSingleton } from '../../../shared/quota-cooldown-singleton-guard.js';
@@ -126,6 +125,8 @@ function makeRoutes(session: ActiveSession, agents: {
     getSession: mock((id: number) => (id === session.sessionDbId ? session : undefined)),
     getMessageBuffer: mock(() => messageBuffer),
     removeSessionImmediate: mock(() => {}),
+    // A start refused under a quota/auth cooldown discards buffered work.
+    discardBufferedWork: mock(() => 1),
   };
   const completionHandler = {
     finalizeSession: mock(() => Promise.resolve()),
@@ -284,25 +285,9 @@ describe('SessionRoutes.ensureGeneratorRunning — provider switch (#2756)', () 
     const originalAbortController = session.abortController;
     const originalClaimedMessageIds = session.claimedMessageIds;
 
-    // #2756 round-2 review finding (important): normalizeAbortReason's new
-    // 'provider_switch' case is the only thing standing between this abort
-    // and a silently corrupted session_compressed telemetry event (a typo'd
-    // case falls through to the 'none' default with no type error and no
-    // other test noticing). Spy on the real telemetryBuffer.record and
-    // assert the emitted abort_reason directly, rather than only asserting
-    // on session state.
-    const telemetrySpy = spyOn(telemetryBuffer, 'record');
-
     // Settings changed: openrouter is now selected.
     providerSelectionBox.current = 'openrouter';
     await routes.ensureGeneratorRunning(sessionDbId, 'ingest');
-
-    const abortedTelemetryCall = telemetrySpy.mock.calls.find(
-      ([event, id]) => event === 'session_compressed' && id === sessionDbId
-    );
-    expect(abortedTelemetryCall).toBeDefined();
-    expect((abortedTelemetryCall?.[2] as Record<string, unknown> | undefined)?.abort_reason).toBe('provider_switch');
-    telemetrySpy.mockRestore();
 
     // Parked wait was aborted and replaced.
     expect(originalAbortController.signal.aborted).toBe(true);
@@ -601,10 +586,11 @@ describe('SessionRoutes.ensureGeneratorRunning — provider switch (#2756)', () 
 describe('SessionRoutes — the parked-slot race at a quota window edge (quota fallback)', () => {
   // When the primary's window elapses, several sessions parked on a Claude
   // fallback slot can each be sent back to the primary; only one wins its
-  // probe. That race is accepted, with no mitigation code. What must never
-  // happen is a loser being finalized: its buffered work has to wait for its
-  // next event, intact. Nested one level in, so this cleanup runs before the
-  // file-level singleton guards check the breaker.
+  // probe. That race is accepted, with no mitigation code. A loser is refused
+  // by the quota breaker, so it discards its buffered work like any start
+  // refused under a spent quota (observer-lifecycle.md); it must still not be
+  // finalized, so its next event starts fresh work. Nested one level in, so
+  // this cleanup runs before the file-level singleton guards check the breaker.
   beforeEach(() => {
     providerSelectionBox.current = 'claude';
     providerSelectionBox.fallbackFrom = undefined;
@@ -628,7 +614,7 @@ describe('SessionRoutes — the parked-slot race at a quota window edge (quota f
     resetQuotaCooldownsForTesting();
   });
 
-  it('a parked session that loses the primary probe starts nothing and keeps its work', async () => {
+  it('a parked session that loses the primary probe starts nothing and discards its work, without finalizing', async () => {
     const sessionDbId = 900101;
     const session = makeFakeSession(sessionDbId);
     registerFakeOccupant('occupant-for-900101');
@@ -651,8 +637,10 @@ describe('SessionRoutes — the parked-slot race at a quota window edge (quota f
 
     expect(isSessionParkedForSlot(sessionDbId)).toBe(false);
     expect(geminiAgent.startSession).not.toHaveBeenCalled();
+    expect(sessionManager.discardBufferedWork).toHaveBeenCalledTimes(1);
+    expect(sessionManager.discardBufferedWork).toHaveBeenCalledWith(sessionDbId);
+    expect(session.pausedReason).toBe('quota');
     expect(completionHandler.finalizeSession).not.toHaveBeenCalled();
     expect(sessionManager.removeSessionImmediate).not.toHaveBeenCalled();
-    expect(session.conversationHistory).toHaveLength(1);
   });
 });

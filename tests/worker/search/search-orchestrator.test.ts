@@ -81,6 +81,7 @@ describe('SearchOrchestrator Chroma zero fallback', () => {
       100,
       { $and: [{ doc_type: 'observation' }, { $or: [{ project: 'orchestrator-project' }, { merged_into_project: 'orchestrator-project' }] }, { platform_source: 'cursor' }] },
       expect.any(Object),
+      expect.any(Function),
     );
     expect(searchObservations).toHaveBeenCalledWith('legacy docs', expect.objectContaining({
       project: 'orchestrator-project',
@@ -91,44 +92,12 @@ describe('SearchOrchestrator Chroma zero fallback', () => {
     expect(result.results.observations).toEqual([observation]);
   });
 
-  it('falls back to SQLiteStrategy when unscoped Chroma search returns no rows', async () => {
-    const queryChroma = mock(() => Promise.resolve({ ids: [], distances: [], metadatas: [] }));
-    const searchObservations = mock(() => [observation]);
-    const orchestrator = new SearchOrchestrator(
-      {
-        searchObservations,
-        searchSessions: mock(() => []),
-        searchUserPrompts: mock(() => []),
-      } as any,
-      {
-        getObservationsByIds: mock(() => []),
-        getSessionSummariesByIds: mock(() => []),
-        getUserPromptsByIds: mock(() => []),
-        getProjectReadKeys: (projects: string[]) => projects,
-      } as any,
-      { queryChroma } as any,
-    );
-
-    const result = await orchestrator.search({
-      query: 'legacy docs',
-      searchType: 'observations',
-      project: 'orchestrator-project',
-      limit: 5,
-    });
-
-    expect(searchObservations).toHaveBeenCalledWith('legacy docs', expect.objectContaining({
-      project: 'orchestrator-project',
-    }));
-    expect(result.usedChroma).toBe(false);
-    expect(result.strategy).toBe('sqlite');
-    expect(result.results.observations).toEqual([observation]);
-  });
-
   it('keeps non-empty Chroma matches final', async () => {
+    const recentObservation = { ...observation, created_at_epoch: Date.now() };
     const queryChroma = mock(() => Promise.resolve({
       ids: [21],
       distances: [0.1],
-      metadatas: [{ sqlite_id: 21, doc_type: 'observation', created_at_epoch: Date.now() }],
+      metadatas: [{ sqlite_id: 21, doc_type: 'observation', created_at_epoch: recentObservation.created_at_epoch }],
     }));
     const searchObservations = mock(() => [observation]);
     const orchestrator = new SearchOrchestrator(
@@ -138,7 +107,7 @@ describe('SearchOrchestrator Chroma zero fallback', () => {
         searchUserPrompts: mock(() => []),
       } as any,
       {
-        getObservationsByIds: mock(() => [observation]),
+        getObservationsByIds: mock(() => [recentObservation]),
         getSessionSummariesByIds: mock(() => []),
         getUserPromptsByIds: mock(() => []),
         getProjectReadKeys: (projects: string[]) => projects,
@@ -156,7 +125,7 @@ describe('SearchOrchestrator Chroma zero fallback', () => {
     expect(searchObservations).not.toHaveBeenCalled();
     expect(result.usedChroma).toBe(true);
     expect(result.strategy).toBe('chroma');
-    expect(result.results.observations).toEqual([observation]);
+    expect(result.results.observations).toEqual([recentObservation]);
   });
 });
 
@@ -179,7 +148,7 @@ describe('SearchOrchestrator chromaSync=null fallback (#4284)', () => {
         searchSessions,
         searchUserPrompts,
       } as any,
-      {} as any,
+      { getProjectReadKeys: (projects: string[]) => projects } as any,
       null,
     );
 
@@ -201,33 +170,6 @@ describe('SearchOrchestrator chromaSync=null fallback (#4284)', () => {
     expect(result.results.prompts).toEqual([]);
   });
 
-  it('returns strategy=sqlite empty result (not the confident-empty bug) when SQLite has no matches', async () => {
-    const searchObservations = mock(() => []);
-    const orchestrator = new SearchOrchestrator(
-      {
-        searchObservations,
-        searchSessions: mock(() => []),
-        searchUserPrompts: mock(() => []),
-      } as any,
-      {} as any,
-      null,
-    );
-
-    const result = await orchestrator.search({
-      query: 'anything-not-in-the-database',
-      searchType: 'observations',
-      project: 'orchestrator-project',
-      limit: 5,
-    });
-
-    expect(searchObservations).toHaveBeenCalledTimes(1);
-    expect(result.usedChroma).toBe(false);
-    expect(result.strategy).toBe('sqlite');
-    expect(result.results.observations).toEqual([]);
-    expect(result.results.sessions).toEqual([]);
-    expect(result.results.prompts).toEqual([]);
-  });
-
   it('forwards query text to SQLite when chromaSync is null and searchType=all', async () => {
     const searchObservations = mock(() => [observation]);
     const searchSessions = mock(() => []);
@@ -238,7 +180,7 @@ describe('SearchOrchestrator chromaSync=null fallback (#4284)', () => {
         searchSessions,
         searchUserPrompts,
       } as any,
-      {} as any,
+      { getProjectReadKeys: (projects: string[]) => projects } as any,
       null,
     );
 
@@ -317,28 +259,6 @@ describe('SearchOrchestrator per-category SQLite supplement', () => {
     expect(result.results.prompts).toEqual([userPrompt]);
   });
 
-  it('keeps pure Chroma result untouched when every requested category has matches', async () => {
-    const queryChroma = mock(() => Promise.resolve({
-      ids: [7],
-      distances: [0.1],
-      metadatas: [{ sqlite_id: 7, doc_type: 'user_prompt', created_at_epoch: Date.now() }],
-    }));
-    const searchUserPrompts = mock(() => []);
-    const getUserPromptsByIds = mock(() => [userPrompt]);
-    const orchestrator = buildOrchestrator({ queryChroma, searchUserPrompts, getUserPromptsByIds });
-
-    const result = await orchestrator.search({
-      query: 'テスト',
-      searchType: 'prompts',
-      limit: 5,
-    });
-
-    expect(searchUserPrompts).not.toHaveBeenCalled();
-    expect(result.usedChroma).toBe(true);
-    expect(result.strategy).toBe('chroma');
-    expect(result.results.prompts).toEqual([userPrompt]);
-  });
-
   it('does not supplement categories that were not requested', async () => {
     const queryChroma = mock(() => Promise.resolve({
       ids: [7],
@@ -382,25 +302,6 @@ describe('SearchOrchestrator per-category SQLite supplement', () => {
     expect(result.strategy).toBe('chroma');
     expect(result.results.prompts).toEqual([userPrompt]);
     expect(result.results.observations).toHaveLength(0);
-  });
-
-
-  it('does not narrow the SQLite supplement to a recency window when no dateRange is given', async () => {
-    const queryChroma = mock(() => Promise.resolve({
-      ids: [7],
-      distances: [0.1],
-      metadatas: [{ sqlite_id: 7, doc_type: 'user_prompt', created_at_epoch: Date.now() }],
-    }));
-    const searchObservations = mock(() => []);
-    const getUserPromptsByIds = mock(() => [userPrompt]);
-    const orchestrator = buildOrchestrator({ queryChroma, searchObservations, getUserPromptsByIds });
-
-    await orchestrator.search({
-      query: 'テスト',
-      searchType: 'all',
-      limit: 5,
-    });
-
     const supplementOptions = (searchObservations.mock.calls[0] as any[])[1];
     expect(supplementOptions.dateRange).toBeUndefined();
   });

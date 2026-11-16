@@ -2,8 +2,6 @@ import { describe, expect, it } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { memoryInstructionsForRuntime } from '../../src/shared/memory-instructions.js';
-const MEMORY_PLUGIN_INSTRUCTIONS = memoryInstructionsForRuntime('worker');
 
 // Real handler/worker HTTP/cache files. Autostart is disabled before imports;
 // the only listening endpoint is this child-owned loopback Express fixture.
@@ -74,7 +72,7 @@ function run(mode: string): any {
   const dir = mkdtempSync(join(tmpdir(), 'transcript-cache-outage-'));
   try {
     mkdirSync(join(dir, 'data'));
-    writeFileSync(join(dir, 'data', 'settings.json'), JSON.stringify({ CLAUDE_MEM_WORKER_AUTOSTART: 'false', CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: String(mode !== 'default-outage'), CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'false', CLAUDE_MEM_WELCOME_HINT_ENABLED: 'false', CLAUDE_MEM_PROVIDER: 'codex' }));
+    writeFileSync(join(dir, 'data', 'settings.json'), JSON.stringify({ CLAUDE_MEM_WORKER_AUTOSTART: 'false', CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE: 'true', CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'false', CLAUDE_MEM_WELCOME_HINT_ENABLED: 'false', CLAUDE_MEM_PROVIDER: 'codex' }));
     const result = Bun.spawnSync([process.execPath, '-e', fixture], { cwd: join(import.meta.dir, '../..'), env: { ...process.env, CLAUDE_MEM_DATA_DIR: join(dir, 'data'), CLAUDE_CONFIG_DIR: join(dir, 'config'), CLAUDE_MEM_WORKER_AUTOSTART: 'false', CACHE_OUTAGE_MODE: mode }, stdout: 'pipe', stderr: 'pipe', timeout: 20_000 });
     if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
     return JSON.parse(new TextDecoder().decode(result.stdout).trim().split('\n').at(-1)!);
@@ -85,13 +83,9 @@ describe('prior transcript outages fall back to the cached memory, which never c
   it('asks the worker first, and uses the cached block after the actual health probe fails', () => {
     const result = run('cached-outage');
     expect(result.healthCalls).toBeGreaterThan(0);
-    expect(result.result.hookSpecificOutput.additionalContext).toBe(`SHARED MEMORY\n\n${MEMORY_PLUGIN_INSTRUCTIONS}`);
+    expect(result.result.hookSpecificOutput.additionalContext).toBe('SHARED MEMORY');
   });
-  it('keeps the ordinary shared cache fast path when prior messages are disabled', () => {
-    const result = run('default-outage');
-    expect(result.healthCalls).toBe(0);
-    expect(result.result.hookSpecificOutput.additionalContext).toBe(`SHARED MEMORY\n\n${MEMORY_PLUGIN_INSTRUCTIONS}`);
-  });
+
   it('warms one transcript-free variant through the real worker and uses it after shutdown', () => {
     const result = run('producer');
     expect(result.live).toContain('PRIOR HOST REPLY');

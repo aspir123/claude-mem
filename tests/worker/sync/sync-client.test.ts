@@ -17,6 +17,14 @@ import { observationChange, type TestHubChange } from './content-v2-helpers.js';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+async function waitFor(condition: () => boolean, timeoutMs = 4_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for active polls');
+    await sleep(5);
+  }
+}
+
 const SELF = 'device-fixture';
 const REMOTE = 'device-a';
 type HubOp = TestHubChange;
@@ -135,6 +143,7 @@ describe('SyncClient', () => {
     expect(state.requests[0].headers['X-User-Id']).toBe('user-42');
     expect(state.requests[0].headers['X-Device-Id']).toBe(SELF);
     expect(state.requests[0].headers['X-Device-Name']).toBe('test laptop');
+    expect(state.requests[0].headers['X-Sync-Capabilities']).toBe('quarantine-unknown-kinds');
   });
 
   it('loops while more=true, presenting the advanced cursor each page', async () => {
@@ -333,6 +342,19 @@ describe('SyncClient', () => {
     ]);
   });
 
+  it('quarantines wire integers outside the local range and commits the rest of the page', async () => {
+    const bad = observationChange(2, '12', REMOTE, { discovery_tokens: '9007199254740992' });
+    const { impl } = makeHub({ epoch: '1', ops: [hubOp(1, '11'), bad, hubOp(3, '13')] });
+    const client = makeClient(impl);
+
+    await client.pullOnce({ timeoutMs: 5_000 });
+    expect(apply.getCursor()).toBe('3');
+    expect(count('observations')).toBe(2);
+    expect(db.prepare('SELECT seq, raw_body FROM sync_pull_quarantine').all()).toEqual([
+      { seq: '2', raw_body: JSON.stringify(bad) },
+    ]);
+  });
+
   it('pulls past a forked device\'s same-revision collision after a hub rebuild (the cursor-0 wedge)', async () => {
     const { state, impl } = makeHub({ epoch: '1', ops: [hubOp(1, '11749')] });
     const client = makeClient(impl);
@@ -409,7 +431,7 @@ describe('SyncClient', () => {
         isSessionActive: () => true,
       });
       client.start();
-      await sleep(150);
+      await waitFor(() => state.requests.length >= 3);
 
       // Catch-up pull + several 20ms-tier polls; the 60s idle tier alone
       // could have produced only the catch-up pull.
@@ -456,6 +478,26 @@ describe('SyncClient', () => {
       expect(state.requests.length).toBeGreaterThan(suspendedAt);
       await sleep(100); // resumed 10ms cadence is ticking again
       expect(state.requests.length).toBeGreaterThan(suspendedAt + 1);
+    });
+
+    it('never suspends when suspendAfterMs is infinite (CLAUDE_MEM_CLOUD_SYNC_KEEP_PULLING)', async () => {
+      const { state, impl } = makeHub({ epoch: '1', ops: [] });
+      let now = 1_000_000;
+      const client = makeClient(impl, {
+        activePollMs: 10,
+        idlePollMs: 10,
+        suspendAfterMs: Number.POSITIVE_INFINITY,
+        isSessionActive: () => false,
+        now: () => now,
+      });
+      client.start();
+      await sleep(50);
+      now += 10 * 86_400_000; // days with no sessions
+      await sleep(50);
+      const later = state.requests.length;
+      await sleep(100);
+      expect(state.requests.length).toBeGreaterThan(later); // still polling
+      client.stop();
     });
 
     it('onHeadSeq also resumes a suspended loop', async () => {

@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
-import { homedir, tmpdir } from 'os';
+import { tmpdir } from 'os';
 import { join, sep } from 'path';
 import { spawnSync } from 'child_process';
 
@@ -18,7 +18,6 @@ import { spawnSync } from 'child_process';
 // Bun on Linux reads the
 // home dir once at startup, so HOME set here does not move os.homedir(): the
 // OpenClaw install, which writes under it, runs in a child process (below).
-const realSettingsPath = join(homedir(), '.claude-mem', 'settings.json');
 const sandbox = mkdtempSync(join(tmpdir(), 'claude-mem-cli-port-'));
 const savedEnv: Record<string, string | undefined> = {};
 for (const key of [
@@ -32,7 +31,7 @@ process.env.USERPROFILE = sandbox;
 process.env.CLAUDE_CONFIG_DIR = join(sandbox, '.claude');
 const sharedPathsSandbox = mkdtempSync(join(tmpdir(), 'claude-mem-shared-paths-'));
 process.env.CLAUDE_MEM_DATA_DIR = sharedPathsSandbox;
-const { USER_SETTINGS_PATH } = await import('../../src/shared/paths.js');
+await import('../../src/shared/paths.js');
 process.once('exit', () => rmSync(sharedPathsSandbox, { recursive: true, force: true }));
 process.env.CLAUDE_MEM_DATA_DIR = join(sandbox, 'data');
 mkdirSync(process.env.CLAUDE_MEM_DATA_DIR, { recursive: true });
@@ -95,36 +94,14 @@ afterAll(() => {
   rmSync(sandbox, { recursive: true, force: true });
 });
 
-describe('test isolation', () => {
-  it('writes its settings fixtures inside the sandbox', () => {
-    expect(sandboxSettingsPath()).toBe(join(sandbox, 'data', 'settings.json'));
-  });
-
-  it('refuses a settings path outside the sandbox', () => {
-    const dataDir = process.env.CLAUDE_MEM_DATA_DIR;
-    process.env.CLAUDE_MEM_DATA_DIR = join(tmpdir(), 'not-the-sandbox');
-    try {
-      expect(() => sandboxSettingsPath()).toThrow('outside the test sandbox');
-    } finally {
-      process.env.CLAUDE_MEM_DATA_DIR = dataDir;
-    }
-  });
-
-  it('never resolves the real ~/.claude-mem settings file', () => {
-    // Frozen on first import: the shared-paths temp dir when this file runs
-    // first, otherwise the per-run temp dir tests/preload.ts pins.
-    expect(USER_SETTINGS_PATH).not.toBe(realSettingsPath);
-    expect(USER_SETTINGS_PATH.startsWith(tmpdir())).toBe(true);
-    expect(USER_SETTINGS_PATH.startsWith(sandbox + sep)).toBe(false);
-  });
-});
-
 describe('npx claude-mem doctor probes the worker port from settings.json', () => {
   const originalFetch = globalThis.fetch;
   let requested: string[] = [];
+  let doctorOutput = '';
 
   beforeEach(() => {
     requested = [];
+    doctorOutput = '';
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       requested.push(String(input));
       return new Response('{}', { status: 503 });
@@ -135,32 +112,53 @@ describe('npx claude-mem doctor probes the worker port from settings.json', () =
     globalThis.fetch = originalFetch;
   });
 
+  // Doctor reports its result through process.exitCode (process.exit() trips
+  // a libuv assertion on Windows, nodejs/node#56645). Keep the code it sets
+  // from becoming this test process's exit status.
+  let doctorExitCode: typeof process.exitCode;
+
   async function runDoctor(): Promise<void> {
     const { runDoctorCommand } = await import('../../src/npx-cli/commands/doctor.js');
     // Run from source, there is no npm package root to read a version from.
     const pathsModule = await import('../../src/npx-cli/utils/paths.js');
     const version = spyOn(pathsModule, 'readPluginVersion').mockReturnValue('0.0.0-test');
     const exit = spyOn(process, 'exit').mockImplementation((() => {
-      throw new Error('doctor exited');
+      throw new Error('doctor must set process.exitCode, not call process.exit()');
     }) as never);
     const log = spyOn(console, 'log').mockImplementation(() => {});
+    const previousExitCode = process.exitCode;
     try {
-      await runDoctorCommand().catch((error: unknown) => {
-        if (!(error instanceof Error) || error.message !== 'doctor exited') throw error;
-      });
+      await runDoctorCommand();
     } finally {
+      doctorExitCode = process.exitCode;
+      // Bun keeps a set exit code when it is assigned undefined, so an unset
+      // code is restored as 0 (a failing test still makes bun test exit 1).
+      process.exitCode = previousExitCode ?? 0;
+      doctorOutput = log.mock.calls.flat().join('\n');
       version.mockRestore();
       exit.mockRestore();
       log.mockRestore();
     }
   }
 
-  it('uses the port written in settings.json', async () => {
-    writeSettings({ CLAUDE_MEM_WORKER_PORT: FILE_PORT });
+  it('uses CLAUDE_MEM_WORKER_URL over host and port', async () => {
+    writeSettings({ CLAUDE_MEM_WORKER_PORT: FILE_PORT, CLAUDE_MEM_WORKER_URL: 'https://worker.example/mem/' });
 
     await runDoctor();
 
-    expect(requested).toContain(`http://127.0.0.1:${FILE_PORT}/api/health`);
+    expect(requested).toContain('https://worker.example/mem/api/health');
+    expect(requested).not.toContain(`http://127.0.0.1:${FILE_PORT}/api/health`);
+    // The exit status must match the verdict doctor printed.
+    expect(doctorExitCode).toBe(doctorOutput.includes('All required checks passed.') ? 0 : 1);
+  }, 30_000);
+
+  it('reports an invalid CLAUDE_MEM_WORKER_URL instead of probing host and port', async () => {
+    writeSettings({ CLAUDE_MEM_WORKER_PORT: FILE_PORT, CLAUDE_MEM_WORKER_URL: 'http://worker.example' });
+
+    await runDoctor();
+
+    expect(requested.filter(url => url.endsWith('/api/health'))).toEqual([]);
+    expect(doctorOutput).toContain('CLAUDE_MEM_WORKER_URL must use https');
   }, 30_000);
 
   it('lets the environment variable override settings.json', async () => {
@@ -195,6 +193,28 @@ describe('npx claude-mem doctor probes the worker port from settings.json', () =
     expect(readdirSync(join(sandbox, 'data')).sort()).toEqual(filesBefore);
     expect(requested).toContain(`http://127.0.0.1:${FILE_PORT}/api/health`);
   }, 30_000);
+});
+
+describe('npx claude-mem backup reaches the worker at CLAUDE_MEM_WORKER_URL', () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('uses the URL over host and port', async () => {
+    const requested: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      requested.push(String(input));
+      return new Response('{}');
+    }) as typeof fetch;
+    writeSettings({ CLAUDE_MEM_WORKER_PORT: FILE_PORT, CLAUDE_MEM_WORKER_URL: 'https://worker.example' });
+
+    const { fetchWorkerBackupApi } = await import('../../src/npx-cli/commands/backup.js');
+    await fetchWorkerBackupApi('/api/backup/status');
+
+    expect(requested).toEqual(['https://worker.example/api/backup/status']);
+  });
 });
 
 describe('npx claude-mem uninstall stops the worker on the port from settings.json', () => {

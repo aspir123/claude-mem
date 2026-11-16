@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, afterAll } from 'bun:test';
 import { execFileSync, spawnSync } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -7,7 +9,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '../..');
 
 // Plugin installs run the files committed under plugin/, not a fresh build.
-// CI runs this before `npm run build`, which would overwrite a broken bundle (#4728).
+// A build overwrites the working tree (#4728) and renames hashed My Work assets,
+// so the syntax check runs on the committed blobs, extracted from HEAD.
+const committedPluginRoot = mkdtempSync(path.join(tmpdir(), 'committed-plugin-'));
+afterAll(() => rmSync(committedPluginRoot, { recursive: true, force: true }));
+
 const committedPluginScripts = execFileSync(
   'git',
   ['ls-files', '--', 'plugin/scripts', 'plugin/sqlite', 'plugin/ui'],
@@ -15,6 +21,10 @@ const committedPluginScripts = execFileSync(
 )
   .split('\n')
   .filter((trackedPath) => /\.c?js$/.test(trackedPath));
+
+const archivePath = path.join(committedPluginRoot, 'scripts.tar');
+execFileSync('git', ['archive', `--output=${archivePath}`, 'HEAD', ...committedPluginScripts], { cwd: projectRoot });
+execFileSync('tar', ['-xf', archivePath, '-C', committedPluginRoot]);
 
 describe('Committed plugin bundles', () => {
   it('contain no merge-conflict markers', () => {
@@ -32,14 +42,20 @@ describe('Committed plugin bundles', () => {
     expect(committedPluginScripts).toContain('plugin/scripts/worker-service.cjs');
   });
 
-  for (const scriptPath of committedPluginScripts) {
-    it(`parses ${scriptPath}`, () => {
-      const syntaxCheck = spawnSync('node', ['--check', scriptPath], {
-        cwd: projectRoot,
-        encoding: 'utf-8',
+  it('parses every committed runtime script', async () => {
+    const results = await Promise.all(committedPluginScripts.map(async scriptPath => {
+      const child = Bun.spawn(['node', '--check', scriptPath], {
+        cwd: committedPluginRoot,
+        stdout: 'ignore',
+        stderr: 'pipe',
       });
-      expect(syntaxCheck.stderr).toBe('');
-      expect(syntaxCheck.status).toBe(0);
-    });
-  }
+      const [stderr, status] = await Promise.all([
+        new Response(child.stderr).text(), child.exited,
+      ]);
+      return { scriptPath, stderr, status };
+    }));
+    for (const result of results) {
+      expect(result).toEqual({ scriptPath: result.scriptPath, stderr: '', status: 0 });
+    }
+  });
 });

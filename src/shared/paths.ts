@@ -1,13 +1,13 @@
 import { join, dirname, basename, sep } from 'path';
 import { homedir } from 'os';
-import { existsSync, mkdirSync, readFileSync } from 'fs';
+import { mkdirSync, chmodSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { SettingsDefaultsManager } from './SettingsDefaultsManager.js';
-import { readJsonFileWithBom } from './atomic-json.js';
-import { settingsTarget } from './settings-document.js';
+import { resolveDataDir } from './data-dir.js';
 import { expandHome } from './expand-home.js';
 
 export { expandHome } from './expand-home.js';
+export { resolveDataDir } from './data-dir.js';
 
 function getDirname(): string {
   if (typeof __dirname !== 'undefined') {
@@ -17,29 +17,6 @@ function getDirname(): string {
 }
 
 const _dirname = getDirname();
-
-export function resolveDataDir(): string {
-  if (process.env.CLAUDE_MEM_DATA_DIR) {
-    return expandHome(process.env.CLAUDE_MEM_DATA_DIR);
-  }
-
-  const defaultDataDir = join(homedir(), '.claude-mem');
-  const settingsPath = join(defaultDataDir, 'settings.json');
-  try {
-    if (existsSync(settingsPath)) {
-      const raw = readJsonFileWithBom<unknown>(settingsPath);
-      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return defaultDataDir;
-      const settings = settingsTarget(raw as Record<string, unknown>);
-      if (typeof settings.CLAUDE_MEM_DATA_DIR === 'string' && settings.CLAUDE_MEM_DATA_DIR) {
-        return expandHome(settings.CLAUDE_MEM_DATA_DIR);
-      }
-    }
-  } catch {
-    // settings file missing or corrupt — fall through to default
-  }
-
-  return defaultDataDir;
-}
 
 export const DATA_DIR = resolveDataDir();
 // #2753 — the literal default config dir, independent of process.env state.
@@ -73,6 +50,28 @@ export const OBSERVER_SESSIONS_PROJECT = basename(OBSERVER_SESSIONS_DIR);
 
 export function ensureDir(dirPath: string): void {
   mkdirSync(dirPath, { recursive: true });
+}
+
+/** The owner-only mode for a directory that holds credentials or captured content. */
+export const OWNER_ONLY_DIR_MODE = 0o700;
+
+/**
+ * Create a directory only its owner can read, and narrow an existing one to the same mode.
+ *
+ * `mkdirSync` alone is subject to the umask, so an install created under a permissive umask would
+ * leave `~/.claude-mem` — the database, `.env` and the hook spool live there — readable by every
+ * other account on the machine. The chmod tightens directories that already exist, the way
+ * `claude-mem-launcher.ts` and `auto-update-launch.ts` treat the folders they own. Windows applies
+ * no mode: the profile's own ACL already limits the data directory to the user.
+ */
+export function ensurePrivateDir(dirPath: string): void {
+  mkdirSync(dirPath, { recursive: true, mode: OWNER_ONLY_DIR_MODE });
+  if (process.platform === 'win32') return;
+  try {
+    chmodSync(dirPath, OWNER_ONLY_DIR_MODE);
+  } catch {
+    // A filesystem that refuses chmod (some network mounts) must not stop startup; the mkdir mode still applies.
+  }
 }
 
 /** mkdir failures that retrying can never fix: the data dir is a file, sits under one, or is not writable. */
@@ -139,6 +138,14 @@ export const paths = {
   serverRuntime: () => join(DATA_DIR, '.server-beta.runtime.json'),
   settings: () => join(DATA_DIR, 'settings.json'),
   database: () => join(DATA_DIR, DB_FILENAME),
+  // Automatic snapshot target (BackupManager). Nested under backups/auto so
+  // the manager's retention sweep never touches the legacy one-off backups
+  // that live directly in backups/.
+  backups: () => join(DATA_DIR, 'backups', 'auto'),
+  // A restore staged by `npx claude-mem restore`, applied by the next worker
+  // boot before it opens the database, and the outcome of the last one.
+  pendingRestore: () => join(DATA_DIR, 'backups', 'restore-pending.json'),
+  lastRestore: () => join(DATA_DIR, 'backups', 'last-restore.json'),
   chroma: () => join(DATA_DIR, 'chroma'),
   combinedCerts: () => join(DATA_DIR, 'combined_certs.pem'),
   transcriptsConfig: () => join(DATA_DIR, 'transcript-watch.json'),

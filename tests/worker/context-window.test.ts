@@ -8,6 +8,7 @@ import {
   FALLBACK_CONTEXT_WINDOW_TOKENS,
   MIN_CONTEXT_WINDOW_TOKENS,
   __resetContextWindowCacheForTests,
+  fetchOpenRouterModelCatalog,
 } from '../../src/services/worker/context-window';
 import { OBS_PROMPT_FIELD_MAX_CHARS } from '../../src/sdk/prompts';
 import { cmemProOrigin } from '../../src/shared/cmem-gateway';
@@ -61,36 +62,16 @@ describe('resolveContextWindowTokens', () => {
     expect((global.fetch as any).mock.calls[0][0]).toBe('https://openrouter.ai/api/v1/models');
   });
 
-  it('falls back when the model is absent from the catalogue', async () => {
-    mockCatalogueFetch();
-
-    const window = await resolveContextWindowTokens('openrouter', 'nonexistent/model', OPENROUTER_URL);
-
-    expect(window).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
-  });
-
-  it('falls back when the catalogue entry has no numeric context_length', async () => {
-    mockCatalogueFetch();
-
-    const window = await resolveContextWindowTokens('openrouter', 'broken/no-window', OPENROUTER_URL);
-
-    expect(window).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
-  });
-
-  it('falls back on a non-OK catalogue response', async () => {
-    mockCatalogueFetch('upstream error', 500);
-
-    const window = await resolveContextWindowTokens('openrouter', 'deepseek/deepseek-v4-flash', OPENROUTER_URL);
-
-    expect(window).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
-  });
-
-  it('falls back without throwing when fetch rejects (offline/timeout)', async () => {
-    global.fetch = mock(() => Promise.reject(new Error('network down')));
-
-    const window = await resolveContextWindowTokens('openrouter', 'deepseek/deepseek-v4-flash', OPENROUTER_URL);
-
-    expect(window).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
+  it.each([
+    ['the model is absent from the catalogue', 'nonexistent/model', () => mockCatalogueFetch()],
+    ['the catalogue entry has no numeric context_length', 'broken/no-window', () => mockCatalogueFetch()],
+    ['the catalogue response is not OK', 'deepseek/deepseek-v4-flash', () => mockCatalogueFetch('upstream error', 500)],
+    ['fetch rejects (offline/timeout)', 'deepseek/deepseek-v4-flash', () => {
+      global.fetch = mock(() => Promise.reject(new Error('network down')));
+    }],
+  ] as const)('falls back when %s', async (_label, model, arrange) => {
+    arrange();
+    expect(await resolveContextWindowTokens('openrouter', model, OPENROUTER_URL)).toBe(FALLBACK_CONTEXT_WINDOW_TOKENS);
   });
 
   it('serves a second call within the TTL from the cache (single fetch)', async () => {
@@ -307,5 +288,42 @@ describe('estimateCondenseTokens', () => {
 
   it('counts an empty string as nothing', () => {
     expect(estimateCondenseTokens('')).toBe(0);
+  });
+});
+
+describe('fetchOpenRouterModelCatalog (shared with image qualification)', () => {
+  let originalFetch: typeof global.fetch;
+  beforeEach(() => {
+    __resetContextWindowCacheForTests();
+    originalFetch = global.fetch;
+  });
+  afterEach(() => {
+    global.fetch = originalFetch;
+    mock.restore();
+  });
+
+  it('keeps id, canonical slug, alias target, modalities and parameters, and drops pricing', async () => {
+    global.fetch = mock(() => Promise.resolve(new Response(JSON.stringify({ data: [
+      { id: '~vendor/latest', alias_target: { slug: 'vendor/model' }, pricing: { prompt: '1' } },
+      {
+        id: 'vendor/model', canonical_slug: 'vendor/model-2026', context_length: 65536, alias_target: null,
+        architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'], tokenizer: 'x' },
+        supported_parameters: ['max_tokens', 'temperature'], pricing: { prompt: '1' }, top_provider: { context_length: 65536 },
+      },
+      { id: 'vendor/no-arch', architecture: { input_modalities: 'image' }, supported_parameters: 'max_tokens' },
+      { context_length: 1 },
+    ] }), { status: 200 }))) as any;
+
+    const catalog = await fetchOpenRouterModelCatalog();
+    expect(catalog?.models).toEqual([
+      { id: '~vendor/latest', canonical_slug: null, alias_target: { slug: 'vendor/model' }, context_length: null, architecture: null, supported_parameters: null },
+      {
+        id: 'vendor/model', canonical_slug: 'vendor/model-2026', alias_target: null, context_length: 65536,
+        architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] }, supported_parameters: ['max_tokens', 'temperature'],
+      },
+      { id: 'vendor/no-arch', canonical_slug: null, alias_target: null, context_length: null, architecture: null, supported_parameters: null },
+    ]);
+    expect(catalog?.contextLengthById.get('vendor/model')).toBe(65536);
+    expect(JSON.stringify(catalog?.models)).not.toContain('pricing');
   });
 });

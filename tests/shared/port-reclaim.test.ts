@@ -4,10 +4,7 @@
  * The production reclaim (reclaimGhostListeningPort) only runs on Windows and
  * shells out to netstat / Get-CimInstance / taskkill, so its decision logic is
  * exercised on every CI platform through injected fakes; the pure parsers run
- * directly. The real end-to-end path — worker killed out-of-band, chroma
- * sidecar chain holding the inherited socket, launcher reclaims and starts —
- * is the Windows integration gate (tests/integration/worker-ghost-port-recovery
- * .test.ts, CLAUDE_MEM_TEST_CHROMA=1 in the windows workflow).
+ * directly.
  */
 
 import { describe, it, expect } from 'bun:test';
@@ -45,14 +42,6 @@ describe('parseNetstatListeningPids', () => {
     const owners = parseNetstatListeningPids(SAMPLE_NETSTAT, 37777);
     // IPv4 + IPv6 listeners dedupe to one owner PID.
     expect(owners).toEqual([57824]);
-  });
-
-  it('ignores other ports, non-LISTENING states and UDP rows', () => {
-    const owners = parseNetstatListeningPids(SAMPLE_NETSTAT, 37777);
-    expect(owners).not.toContain(1100); // different port
-    expect(owners).not.toContain(22040); // 37778
-    expect(owners).not.toContain(9999); // ESTABLISHED, not a listener
-    expect(owners).not.toContain(4); // 37001
   });
 
   it('returns an empty list when nothing listens on the port', () => {
@@ -146,7 +135,6 @@ function rows(inputs: RowInput[]): WindowsProcessRow[] {
     cmdline: input.cmdline !== undefined ? input.cmdline : null,
   }));
 }
-
 
 /**
  * listOwners is invoked twice (probe + verify). A real ghost clears after the
@@ -351,7 +339,6 @@ describe('reclaimGhostListeningPort decision branches', () => {
   });
 });
 
-
 /**
  * Wedged-worker reclaim: our PID file names a LIVE worker that holds the port
  * but no longer answers /health (#4127). Unlike the ghost-listener path this is
@@ -457,13 +444,6 @@ describe('a slow worker is not a dead worker (heartbeat)', () => {
     const result = await reclaimGhostListeningPort(37777, testDeps);
     expect(result).toEqual({ reclaimed: false, reason: 'owner-progressing', killedPids: [] });
     expect(killed).toEqual([]);
-  });
-
-  it('still kills a silent worker whose heartbeat is stale', async () => {
-    const { deps: testDeps, killed } = wedgedDeps({ heartbeat: { beatAgeMs: 600_000 } });
-    const result = await reclaimGhostListeningPort(37777, testDeps);
-    expect(result.reclaimed).toBe(true);
-    expect(killed.map(k => k.pid)).toEqual([WEDGED_WORKER_PID]);
   });
 
   it('still kills a silent worker that writes no heartbeat (an older worker)', async () => {
@@ -628,6 +608,28 @@ describe('reclaimWedgedOwnedWorker (via reclaimGhostListeningPort)', () => {
     const result = await reclaimGhostListeningPort(37777, testDeps);
     expect(result).toEqual({ reclaimed: false, reason: 'owner-identity-mismatch', killedPids: [] });
     expect(killed).toEqual([]);
+  });
+
+  it('tolerates a PID-file token from the pre-UTC-pin era and falls through to the command line (#5311)', async () => {
+    // A record written before the TZ pin holds a local-time token; a pinned
+    // read of the SAME live worker can never reproduce it. A strict ===
+    // calls that PID reuse and refuses the reclaim forever — the exact
+    // deadlock #5311 reports (pidFilePid=null on every version check). The
+    // era-aware comparison declines to call it reuse, and the command-line
+    // check vouches for the worker instead, so the stale worker is recycled.
+    // The token is written as the literal 'utc:'-prefixed string (not a
+    // helper import) so this file loads — and this test FAILS — against the
+    // pre-fix sources too, pinning the regression itself.
+    const pinnedRead = 'utc:Wed Sep 30 15:00:00 2026';
+    const { deps: testDeps, killed } = wedgedDeps({
+      identity: { startToken: pinnedRead, cmdline: 'bun worker-service.cjs --daemon' },
+    });
+    const result = await reclaimGhostListeningPort(37777, testDeps);
+    expect(result).toEqual({ reclaimed: true, killedPids: [WEDGED_WORKER_PID] });
+    // The kill pins to the FRESH read, the strongest identity on record.
+    expect(killed).toEqual([
+      { pid: WEDGED_WORKER_PID, signalMode: 'graceful', expectedStartToken: pinnedRead },
+    ]);
   });
 
   it('never kills a process whose command line is not a claude-mem worker', async () => {

@@ -4,6 +4,8 @@ export interface NormalizedHookInput {
   platform?: string;   
   prompt?: string;
   toolName?: string;
+  /** Exact host tool name before normalization, retained for configured exclusions. */
+  nativeToolName?: string;
   toolInput?: unknown;
   toolResponse?: unknown;
   /**
@@ -15,6 +17,8 @@ export interface NormalizedHookInput {
    */
   toolUseId?: string;
   transcriptPath?: string;
+  /** Claude Code SubagentStop only: the finished subagent's own transcript (agent_transcript_path). */
+  agentTranscriptPath?: string;
   lastAssistantMessage?: string;
   reason?: string;
   turnId?: string;
@@ -22,7 +26,7 @@ export interface NormalizedHookInput {
   stopHookActive?: boolean;
   permissionMode?: string;
   model?: string;
-  sessionSource?: 'startup' | 'resume' | 'clear' | 'compact';
+  sessionSource?: 'startup' | 'resume' | 'clear' | 'compact' | 'fork';
   /** Raw hook event name from the payload (e.g. Kimi binds both Stop and PreCompact to the same internal event — handlers use this to tell them apart). */
   hookEventName?: string;
   filePath?: string;
@@ -43,11 +47,17 @@ export interface NormalizedHookInput {
    */
   submittedPrompt?: string | null;
   agentType?: string;    
+  /**
+   * When the event happened at its source. Unset for a live hook: it happened
+   * now, and the handler stamps the hook's clock. The transcript watcher sets
+   * the line's own timestamp, or null when the line carries none. Lets the
+   * worker tell new work in a deleted session from content that predates the
+   * deletion (SessionStore.isBeforeSessionDeletion).
+   */
+  eventOccurredAtEpochMs?: number | null;
 }
 
 export interface HookResult {
-  /** Internal measurement hint; stripped before platform formatting/output. */
-  workStateTelemetry?: 'measure' | 'excluded' | 'unknown';
   continue?: boolean;
   suppressOutput?: boolean;
   hookSpecificOutput?: {

@@ -2,10 +2,7 @@ import { describe, it, expect } from 'bun:test';
 import {
   getAdvertisedMcpToolsForRuntime,
   SERVER_BETA_ONLY_TOOL_NAMES,
-  TEAMBRAIN_TOOL_NAMES,
-  withoutDisabledWorkStateTools,
-  withoutUnjoinedTeamBrainTools,
-  WORK_STATE_TOOL_NAMES,
+  WORKER_ONLY_TOOL_NAMES,
 } from '../../src/servers/mcp-tool-visibility.js';
 
 const allTools = [
@@ -21,6 +18,9 @@ const allTools = [
   { name: 'memory_search', description: '', inputSchema: {} },
   { name: 'memory_context', description: '', inputSchema: {} },
   { name: 'smart_search', description: '', inputSchema: {} },
+  { name: 'get_tool_uses', description: '', inputSchema: {} },
+  { name: 'save_memory', description: '', inputSchema: {} },
+  { name: 'dumb_search', description: '', inputSchema: {} },
   { name: 'work_state_write', description: '', inputSchema: {} },
   { name: 'work_state_read', description: '', inputSchema: {} },
   { name: 'team_brief', description: '', inputSchema: {} },
@@ -46,6 +46,26 @@ describe('MCP runtime-aware tool visibility', () => {
     }
   });
 
+  it('server runtime hides worker-only tools that always refuse it', () => {
+    const names = new Set(getAdvertisedMcpToolsForRuntime(allTools, 'server').map(tool => tool.name));
+
+    for (const toolName of WORKER_ONLY_TOOL_NAMES) {
+      expect(names.has(toolName)).toBe(false);
+    }
+    expect(names.has('search')).toBe(true);
+    expect(names.has('observation_search')).toBe(true);
+    expect(names.has('save_memory')).toBe(false);
+    expect(names.has('get_tool_uses')).toBe(false);
+  });
+
+  it('worker runtime keeps worker-only tools', () => {
+    const names = new Set(getAdvertisedMcpToolsForRuntime(allTools, 'worker').map(tool => tool.name));
+
+    for (const toolName of WORKER_ONLY_TOOL_NAMES) {
+      expect(names.has(toolName)).toBe(true);
+    }
+  });
+
   it('worker runtime still advertises core MCP worker tools', () => {
     const workerTools = getAdvertisedMcpToolsForRuntime(allTools, 'worker');
     const names = new Set(workerTools.map(tool => tool.name));
@@ -56,32 +76,4 @@ describe('MCP runtime-aware tool visibility', () => {
     expect(names.has('smart_search')).toBe(true);
   });
 
-  it('hides the work_state tools when CLAUDE_MEM_WORK_STATE_ENABLED=false (#4606)', () => {
-    const names = new Set(withoutDisabledWorkStateTools(getAdvertisedMcpToolsForRuntime(allTools, 'worker'), false).map(tool => tool.name));
-
-    for (const toolName of WORK_STATE_TOOL_NAMES) {
-      expect(names.has(toolName)).toBe(false);
-    }
-    expect(names.has('search')).toBe(true);
-    expect(names.has('smart_search')).toBe(true);
-  });
-
-  it('keeps the work_state tools while work state is on', () => {
-    const names = new Set(withoutDisabledWorkStateTools(getAdvertisedMcpToolsForRuntime(allTools, 'worker'), true).map(tool => tool.name));
-
-    for (const toolName of WORK_STATE_TOOL_NAMES) {
-      expect(names.has(toolName)).toBe(true);
-    }
-  });
-
-  it('advertises the team_* tools only once this install has joined a TeamBrain team', () => {
-    const unjoined = new Set(withoutUnjoinedTeamBrainTools(allTools, false).map(tool => tool.name));
-    const joined = new Set(withoutUnjoinedTeamBrainTools(allTools, true).map(tool => tool.name));
-
-    for (const toolName of TEAMBRAIN_TOOL_NAMES) {
-      expect(unjoined.has(toolName)).toBe(false);
-      expect(joined.has(toolName)).toBe(true);
-    }
-    expect(unjoined.has('search')).toBe(true);
-  });
 });

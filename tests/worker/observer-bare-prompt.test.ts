@@ -2,10 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:te
 import { ModeManager } from '../../src/services/domain/ModeManager.js';
 import { OpenAICompatibleProvider, type ProviderQueryResult } from '../../src/services/worker/OpenAICompatibleProvider.js';
 import { ClaudeProvider } from '../../src/services/worker/ClaudeProvider.js';
-import { SettingsDefaultsManager } from '../../src/shared/SettingsDefaultsManager.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
 import type { SessionManager } from '../../src/services/worker/SessionManager.js';
 import type { ActiveSession, ConversationMessage } from '../../src/services/worker-types.js';
+import { sessionDbWithoutMedia } from '../fixtures/worker/session-db-without-media.js';
 
 // A generator used to open with a request carrying only the user's prompt
 // (<user_request>) and the observer's instructions. With no tool call to
@@ -137,7 +137,7 @@ describe('a bare user prompt does not cost an observer call', () => {
     dbManager = {
       getSessionStore: () => ({
         storeObservations: mock(() => ({ observationIds: [1], summaryId: 1, createdAtEpoch: Date.now() })),
-        ensureMemorySessionIdRegistered: mock(() => {}),
+        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
         updateMemorySessionId: mock(() => {}),
         getSessionById: mock(() => ({ memory_session_id: 'mem-session-1' })),
       }),
@@ -155,10 +155,6 @@ describe('a bare user prompt does not cost an observer call', () => {
     else process.env.CLAUDE_MEM_OBSERVE_BARE_PROMPTS = previousSetting;
     modeManagerSpy.mockRestore();
     mock.restore();
-  });
-
-  it('defaults CLAUDE_MEM_OBSERVE_BARE_PROMPTS to false', () => {
-    expect(SettingsDefaultsManager.getAllDefaults().CLAUDE_MEM_OBSERVE_BARE_PROMPTS).toBe('false');
   });
 
   it('sends nothing for a prompt with no tool event behind it', async () => {

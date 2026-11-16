@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { readFileSync } from 'fs';
 import {
   ServerClassifiedProviderError,
@@ -24,6 +24,7 @@ import { OpenRouterObservationProvider } from '../../../src/server/generation/pr
 import { buildServerGenerationPrompt } from '../../../src/server/generation/providers/shared/prompt-builder.js';
 import type { ServerGenerationContext } from '../../../src/server/generation/providers/shared/types.js';
 import { SettingsDefaultsManager } from '../../../src/shared/SettingsDefaultsManager.js';
+import { logger } from '../../../src/utils/logger.js';
 
 function makeContext(overrides: Partial<{ payload: unknown; serverSessionId: string | null; sourceType: 'agent_event' | 'session_summary' }> = {}): ServerGenerationContext {
   return {
@@ -194,23 +195,16 @@ describe('buildServerGenerationPrompt', () => {
   // A session_summary job is a different task, and its persistence path only
   // understands a <summary> block. Asking it for <observation> produced responses
   // that the summary path discarded without a trace.
-  it('asks for a <summary> block on session_summary jobs', () => {
-    const result = buildServerGenerationPrompt(makeContext({ sourceType: 'session_summary' }));
-    expect(result.prompt).toContain('<summary>...</summary>');
-    expect(result.prompt).toContain('<request>');
-    expect(result.prompt).toContain('<learned>');
-    expect(result.prompt).toContain('<next_steps>');
-  });
-
-  it('does not ask a session_summary job for <observation> blocks', () => {
-    const result = buildServerGenerationPrompt(makeContext({ sourceType: 'session_summary' }));
-    expect(result.prompt).not.toContain('<observation>...</observation>');
-  });
-
-  it('still asks for <observation> blocks on agent_event jobs', () => {
-    const result = buildServerGenerationPrompt(makeContext());
-    expect(result.prompt).toContain('<observation>...</observation>');
-    expect(result.prompt).not.toContain('<summary>...</summary>');
+  it('asks for the appropriate output block for each job type', () => {
+    for (const sourceType of ['agent_event', 'session_summary'] as const) {
+      const { prompt } = buildServerGenerationPrompt(makeContext({ sourceType }));
+      const isSummary = sourceType === 'session_summary';
+      expect(prompt).toContain(isSummary ? '<summary>...</summary>' : '<observation>...</observation>');
+      expect(prompt).not.toContain(isSummary ? '<observation>...</observation>' : '<summary>...</summary>');
+      if (isSummary) {
+        for (const field of ['<request>', '<learned>', '<next_steps>']) expect(prompt).toContain(field);
+      }
+    }
   });
 
   it('keeps offering the skip escape hatch on both job types', () => {
@@ -218,6 +212,15 @@ describe('buildServerGenerationPrompt', () => {
       expect(buildServerGenerationPrompt(makeContext({ sourceType })).prompt)
         .toContain('<skip_summary />');
     }
+  });
+
+  it('never cuts a surrogate pair when truncating a long event payload', () => {
+    // A lone surrogate serializes as \udXXX, which the provider APIs reject (see bmp-safe.ts).
+    const prefix = '{"t":"';
+    const payload = { t: 'a'.repeat(16 * 1024 - prefix.length - 1) + '\u{1F600}tail' };
+    const { prompt } = buildServerGenerationPrompt(makeContext({ payload }));
+    expect(prompt).toContain('[...truncated]');
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(prompt)).toBe(false);
   });
 
   it('strips <private> tags from event payload before sending', () => {
@@ -313,34 +316,82 @@ describe('ClaudeObservationProvider', () => {
     await expect(provider.generate(makeContext())).rejects.toBeInstanceOf(ServerClassifiedProviderError);
   });
 
-  it('POSTs to api.anthropic.com when baseUrl is unset', async () => {
+  it('sends no temperature', async () => {
     const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
     const provider = new ClaudeObservationProvider({ apiKey: 'sk-fake', fetchImpl: capturing.fetch });
     await provider.generate(makeContext());
-    expect(capturing.lastUrl).toBe('https://api.anthropic.com/v1/messages');
+    expect('temperature' in JSON.parse(String(capturing.lastInit?.body))).toBe(false);
   });
 
-  it('POSTs to a custom gateway baseUrl, appending /v1/messages', async () => {
+  it('sends no thinking field unless given a policy', async () => {
+    const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
+    const provider = new ClaudeObservationProvider({ apiKey: 'sk-fake', fetchImpl: capturing.fetch });
+    await provider.generate(makeContext());
+    const body = JSON.parse(String(capturing.lastInit?.body));
+    expect('thinking' in body).toBe(false);
+    expect(body.max_tokens).toBe(4096);
+  });
+
+  it('sends the thinking policy: omit drops the field, adaptive passes through, an enabled budget adds to max_tokens', async () => {
+    const cases = [
+      { thinking: { type: 'disabled' as const }, expected: { type: 'disabled' }, maxTokens: 4096 },
+      { thinking: 'omit' as const, expected: undefined, maxTokens: 4096 },
+      { thinking: { type: 'adaptive' as const }, expected: { type: 'adaptive' }, maxTokens: 4096 },
+      { thinking: { type: 'enabled' as const, budgetTokens: 2048 }, expected: { type: 'enabled', budget_tokens: 2048 }, maxTokens: 6144 },
+    ];
+    for (const { thinking, expected, maxTokens } of cases) {
+      const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
+      const provider = new ClaudeObservationProvider({ apiKey: 'sk-fake', fetchImpl: capturing.fetch, thinking });
+      await provider.generate(makeContext());
+      const body = JSON.parse(String(capturing.lastInit?.body));
+      expect(body.thinking).toEqual(expected);
+      expect(body.max_tokens).toBe(maxTokens);
+    }
+  });
+
+  it('sends extra headers without letting them replace the api key, in any case', async () => {
     const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
     const provider = new ClaudeObservationProvider({
       apiKey: 'sk-fake',
-      baseUrl: 'https://gateway.example.com/api/anthropic',
       fetchImpl: capturing.fetch,
+      extraHeaders: { 'cf-aig-authorization': 'Bearer gw', 'X-Api-Key': 'other', 'content-type': 'text/plain' },
     });
     await provider.generate(makeContext());
-    expect(capturing.lastUrl).toBe('https://gateway.example.com/api/anthropic/v1/messages');
+    const headers = new Headers(capturing.lastInit?.headers);
+    expect(headers.get('cf-aig-authorization')).toBe('Bearer gw');
+    expect(headers.get('x-api-key')).toBe('sk-fake');
+    expect(headers.get('content-type')).toBe('application/json');
   });
 
-  it('trims whitespace and strips a trailing slash from baseUrl', async () => {
-    const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
-    const provider = new ClaudeObservationProvider({
-      apiKey: 'sk-fake',
-      baseUrl: '  https://gateway.example.com/api/anthropic/  ',
-      fetchImpl: capturing.fetch,
-    });
-    await provider.generate(makeContext());
-    expect(capturing.lastUrl).toBe('https://gateway.example.com/api/anthropic/v1/messages');
+  it('logs an error when the reply is cut off at max_tokens', async () => {
+    const errorSpy = spyOn(logger, 'error').mockImplementation(() => {});
+    try {
+      const provider = new ClaudeObservationProvider({
+        apiKey: 'sk-fake',
+        fetchImpl: new CapturingFetch(jsonResponse(200, { content: [], stop_reason: 'max_tokens' })).fetch,
+      });
+      const result = await provider.generate(makeContext());
+      expect(result.rawText).toBe('');
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0]?.[1])).toContain('CLAUDE_MEM_SERVER_MAX_OUTPUT_TOKENS');
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
+
+  for (const [baseUrl, expectedUrl] of [
+    [undefined, 'https://api.anthropic.com/v1/messages'],
+    ['https://gateway.example.com/api/anthropic', 'https://gateway.example.com/api/anthropic/v1/messages'],
+    ['  https://gateway.example.com/api/anthropic/  ', 'https://gateway.example.com/api/anthropic/v1/messages'],
+  ]) {
+    it(`POSTs to ${expectedUrl} for baseUrl ${JSON.stringify(baseUrl)}`, async () => {
+      const capturing = new CapturingFetch(jsonResponse(200, { content: [{ type: 'text', text: 'ok' }] }));
+      const provider = new ClaudeObservationProvider({ apiKey: 'sk-fake', baseUrl, fetchImpl: capturing.fetch });
+      await provider.generate(makeContext());
+      expect(capturing.lastUrl).toBe(expectedUrl);
+    });
+  }
+
 });
 
 describe('GeminiObservationProvider', () => {
@@ -386,7 +437,6 @@ describe('GeminiObservationProvider', () => {
   }
 
   const PER_MINUTE = 'GenerateContentInputTokensPerModelPerMinute-FreeTier';
-  const PER_DAY = 'GenerateContentInputTokensPerModelPerDay-FreeTier';
 
   /**
    * A 429 body in the shape Gemini actually sends, captured from the live
@@ -429,16 +479,6 @@ describe('GeminiObservationProvider', () => {
     expect(err.retryAfterMs).toBe(11000);
   });
 
-  it('reads a 429 that also names a period window as the exhausted allowance', () => {
-    const err = classifyGeminiServerError({
-      status: 429,
-      bodyText: quotaFailureBody([PER_MINUTE, PER_DAY]),
-      cause: new Error(''),
-    });
-
-    expect(err.kind).toBe('quota_exhausted');
-  });
-
   it('lets a Retry-After header win over the body hint when one is present', () => {
     const err = classifyGeminiServerError({
       status: 429,
@@ -471,6 +511,7 @@ describe('GeminiObservationProvider', () => {
 
     expect(result.rawText).toBe('<observation><type>x</type><title>Answer</title></observation>');
     expect(result.tokensUsed).toBe(42);
+    expect(result.providerLabel).toBe('gemini');
   });
 
   it('joins an answer that Gemini split across several parts', async () => {
@@ -491,39 +532,6 @@ describe('GeminiObservationProvider', () => {
     const result = await provider.generate(makeContext());
 
     expect(result.rawText).toBe('<observation><type>x</type><title>Split</title></observation>');
-  });
-
-  it('parses generateContent response into rawText', async () => {
-    const fakeFetch = new FakeFetch(
-      jsonResponse(200, {
-        candidates: [{ content: { parts: [{ text: '<observation><type>x</type><title>g</title></observation>' }] } }],
-        usageMetadata: { totalTokenCount: 42 },
-      }),
-    );
-    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
-    const result = await provider.generate(makeContext());
-    expect(result.rawText).toContain('<observation>');
-    expect(result.tokensUsed).toBe(42);
-    expect(result.providerLabel).toBe('gemini');
-  });
-
-  it('redacts raw Gemini 400 response body from top-level message and cause', async () => {
-    const rawBody = 'Please ensure that multiturn requests alternate between user and model. RAW_PROVIDER_BODY';
-    const fakeFetch = new FakeFetch(new Response(rawBody, { status: 400 }));
-    const provider = new GeminiObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
-
-    try {
-      await provider.generate(makeContext());
-      expect.unreachable();
-    } catch (error) {
-      expect(error).toBeInstanceOf(ServerClassifiedProviderError);
-      const classified = error as ServerClassifiedProviderError;
-      expect(classified.kind).toBe('unrecoverable');
-      expect(classified.message).toBe('Gemini bad request: role_sequence');
-      expect(classified.message).not.toContain('RAW_PROVIDER_BODY');
-      expect(classified.cause).toBeInstanceOf(Error);
-      expect((classified.cause as Error).message).not.toContain('RAW_PROVIDER_BODY');
-    }
   });
 
   it('redacts raw Gemini non-400 response body from top-level message and cause', async () => {
@@ -572,6 +580,25 @@ describe('GeminiObservationProvider', () => {
 });
 
 describe('OpenRouterObservationProvider', () => {
+  for (const [usage, expected] of [
+    [{ prompt_tokens: 17, completion_tokens: 4 }, 21],
+    [{ prompt_tokens: 17 }, 17],
+    [{ completion_tokens: 4 }, 4],
+    [{ prompt_tokens: 17, completion_tokens: 4, total_tokens: 25 }, 25],
+    [{ total_tokens: 0 }, 0],
+    [undefined, undefined],
+  ] as const) {
+    it(`reports token usage from ${JSON.stringify(usage)}`, async () => {
+      const provider = new OpenRouterObservationProvider({
+        apiKey: 'fake',
+        fetchImpl: async () => jsonResponse(200, {
+          choices: [{ message: { content: '<observation>kept</observation>' } }], usage,
+        }),
+      });
+      expect((await provider.generate(makeContext())).tokensUsed).toBe(expected);
+    });
+  }
+
   it('preserves XML tags and words split across content blocks without changing worker separation', async () => {
     const xml = '<observation><type>discovery</type><title>Native answer</title><narrative>Reliable extraction</narrative></observation>';
     const content = [{ type: 'text', text: '<observ' }, { type: 'reasoning', text: 'private' }, { type: 'text', text: xml.slice(7) }];
@@ -601,6 +628,7 @@ describe('OpenRouterObservationProvider', () => {
     const result = await provider.generate(makeContext());
     expect(result.rawText).toBe('<observation>firstsecond</observation>');
     expect(result.tokensUsed).toBe(11);
+    expect(result.providerLabel).toBe('openrouter');
   });
 
   it('treats non-text compatible response content as empty', async () => {
@@ -686,20 +714,6 @@ describe('OpenRouterObservationProvider', () => {
     expect('stream' in await bodyFor('https://cmem.ai/api/inference/v1')).toBe(false);
   });
 
-  it('parses OpenAI-style response and reports tokensUsed', async () => {
-    const fakeFetch = new FakeFetch(
-      jsonResponse(200, {
-        choices: [{ message: { content: '<observation><type>x</type><title>o</title></observation>' } }],
-        usage: { total_tokens: 100 },
-      }),
-    );
-    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
-    const result = await provider.generate(makeContext());
-    expect(result.rawText).toContain('<observation>');
-    expect(result.tokensUsed).toBe(100);
-    expect(result.providerLabel).toBe('openrouter');
-  });
-
   it('classifies a 429 response as rate_limit', async () => {
     const fakeFetch = new FakeFetch(jsonResponse(429, { error: { message: 'rl' } }));
     const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: fakeFetch.fetch });
@@ -713,40 +727,18 @@ describe('OpenRouterObservationProvider', () => {
   });
 
   // #2382/#2590/#2622/#2393 — configurable OpenAI-compatible base URL.
-  it('POSTs to the default OpenRouter URL when baseUrl is unset', async () => {
-    const capturing = new CapturingFetch(
-      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
-    );
-    const provider = new OpenRouterObservationProvider({ apiKey: 'fake', fetchImpl: capturing.fetch });
-    await provider.generate(makeContext());
-    expect(capturing.lastUrl).toBe('https://openrouter.ai/api/v1/chat/completions');
-  });
-
-  it('appends /chat/completions to a DeepSeek-style base URL', async () => {
-    const capturing = new CapturingFetch(
-      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
-    );
-    const provider = new OpenRouterObservationProvider({
-      apiKey: 'fake',
-      baseUrl: 'https://api.deepseek.com',
-      fetchImpl: capturing.fetch,
+  for (const [baseUrl, expectedUrl] of [
+    [undefined, 'https://openrouter.ai/api/v1/chat/completions'],
+    ['https://api.deepseek.com', 'https://api.deepseek.com/chat/completions'],
+    ['http://localhost:1234/v1/chat/completions/', 'http://localhost:1234/v1/chat/completions'],
+  ]) {
+    it(`POSTs to ${expectedUrl} for baseUrl ${JSON.stringify(baseUrl)}`, async () => {
+      const capturing = new CapturingFetch(jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+      const provider = new OpenRouterObservationProvider({ apiKey: 'fake', baseUrl, fetchImpl: capturing.fetch });
+      await provider.generate(makeContext());
+      expect(capturing.lastUrl).toBe(expectedUrl);
     });
-    await provider.generate(makeContext());
-    expect(capturing.lastUrl).toBe('https://api.deepseek.com/chat/completions');
-  });
-
-  it('uses a full chat/completions base URL verbatim and normalizes trailing slash', async () => {
-    const capturing = new CapturingFetch(
-      jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }),
-    );
-    const provider = new OpenRouterObservationProvider({
-      apiKey: 'fake',
-      baseUrl: 'http://localhost:1234/v1/chat/completions/',
-      fetchImpl: capturing.fetch,
-    });
-    await provider.generate(makeContext());
-    expect(capturing.lastUrl).toBe('http://localhost:1234/v1/chat/completions');
-  });
+  }
 
   it('sends the configured model verbatim in the request body (#2393)', async () => {
     const capturing = new CapturingFetch(

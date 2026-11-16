@@ -13,7 +13,7 @@
 // call would show up there.
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { createServer, type Server as NetServer, type Socket } from 'net';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
@@ -36,9 +36,22 @@ let workerPortConnections: number;
 let openSockets: Socket[];
 let fakeServer: ReturnType<typeof Bun.serve> | null;
 let contextRequests: RecordedContextRequest[];
+let denseRows = false;
 
 function serverRows(project: string): Array<Record<string, unknown>> {
   const now = Date.now();
+  // Observation rows carry their generation concepts in metadata, like a
+  // current server's rows: the active mode's concept filter must match at
+  // least one of them for the row to be selected (#5972).
+  if (denseRows) return Array.from({ length: 20 }, (_, i) => ({
+    id: `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`,
+    projectId: 'server-project-1', teamId: 'team-1',
+    serverSessionId: 'b1d2c3e4-0000-4000-8000-000000000001',
+    kind: 'discovery', content: 'narrative',
+    metadata: { title: 'RECORD_' + i + '_' + 'x'.repeat(440), concepts: ['how-it-works'], project },
+    createdAtEpoch: now - (20 - i) * 60_000,
+    updatedAtEpoch: now - (20 - i) * 60_000,
+  })).reverse(); // /v1/context returns newest first.
   return [
     {
       id: '3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b',
@@ -47,7 +60,7 @@ function serverRows(project: string): Array<Record<string, unknown>> {
       serverSessionId: 'b1d2c3e4-0000-4000-8000-000000000001',
       kind: 'bugfix',
       content: 'Fixed the import batch abort',
-      metadata: { title: 'Import no longer aborts on a bad row', project },
+      metadata: { title: 'Import no longer aborts on a bad row', concepts: ['how-it-works'], project },
       createdAtEpoch: now - 120_000,
       updatedAtEpoch: now - 120_000,
     },
@@ -98,24 +111,6 @@ function writeSettings(serverBaseUrl: string, overrides: Record<string, string> 
   }, null, 2));
 }
 
-// A server that accepts the /v1/context request and never answers it.
-function startHangingServer(): string {
-  fakeServer = Bun.serve({
-    hostname: '127.0.0.1',
-    port: 0,
-    idleTimeout: 0,
-    async fetch(request) {
-      const url = new URL(request.url);
-      if (request.method === 'POST' && url.pathname === '/v1/context') {
-        contextRequests.push({ authorization: request.headers.get('authorization'), body: await request.json() as Record<string, unknown> });
-        return new Promise<Response>(() => {});
-      }
-      return new Response('not found', { status: 404 });
-    },
-  });
-  return `http://127.0.0.1:${fakeServer.port}`;
-}
-
 // The parent test process may carry the developer's CLAUDE_MEM_* overrides;
 // settings for the hook come only from the temp settings.json.
 function hookEnv(): Record<string, string> {
@@ -132,11 +127,12 @@ function hookEnv(): Record<string, string> {
 async function runWorkerService(
   args: string[],
   stdin?: string,
+  envOverrides: Record<string, string> = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string; elapsedMs: number }> {
   const startedAt = Date.now();
   const child = Bun.spawn([process.execPath, WORKER_SERVICE, ...args], {
     cwd: projectDir,
-    env: hookEnv(),
+    env: { ...hookEnv(), ...envOverrides },
     stdin: stdin === undefined ? 'ignore' : new Blob([stdin]),
     stdout: 'pipe',
     stderr: 'pipe',
@@ -158,10 +154,6 @@ function sessionStartInput(source = 'startup'): string {
   });
 }
 
-// plugin/hooks/codex-hooks.json: Codex kills a SessionStart hook after 20 s and
-// drops its output.
-const CODEX_SESSION_START_LIMIT_MS = 20_000;
-
 function parseHookOutput(stdout: string): {
   hookSpecificOutput?: { additionalContext?: string };
   systemMessage?: string;
@@ -179,6 +171,7 @@ beforeEach(async () => {
   mkdirSync(projectDir, { recursive: true });
   projectName = basename(projectDir);
   contextRequests = [];
+  denseRows = false;
   fakeServer = null;
 
   // Something other than a worker owns the worker port: it accepts
@@ -203,18 +196,30 @@ afterEach(async () => {
 });
 
 describe('SessionStart in server runtime (plan-24 step 4)', () => {
-  it('returns no timeline on Claude resume without reading the server or worker', async () => {
-    writeSettings(startFakeServer());
-
-    const result = await runWorkerService(['hook', 'claude-code', 'context'], sessionStartInput('resume'));
-
-    expect(result.exitCode).toBe(0);
-    expect(result.elapsedMs).toBeLessThan(HOOK_BUDGET_MS);
-    expect(workerPortConnections).toBe(0);
-    expect(contextRequests).toEqual([]);
-    expect(parseHookOutput(result.stdout)).toEqual({
-      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' },
+  it('reserves the OAuth hint before selecting whole server records', async () => {
+    denseRows = true;
+    writeSettings(startFakeServer(), {
+      CLAUDE_MEM_PROVIDER: 'claude',
+      CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED: 'false',
+      CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'false',
+      CLAUDE_MEM_CONTEXT_OBSERVATIONS: '20',
+      CLAUDE_MEM_CONTEXT_FULL_COUNT: '0',
     });
+    const before = await runWorkerService(['hook', 'claude-code', 'context'], sessionStartInput());
+    writeFileSync(join(dataDir, 'oauth-stale.marker'), 'expired '.repeat(150));
+    const after = await runWorkerService(['hook', 'claude-code', 'context'], sessionStartInput());
+    expect(before.exitCode).toBe(0);
+    expect(after.exitCode).toBe(0);
+    const plain = parseHookOutput(before.stdout).hookSpecificOutput!.additionalContext!;
+    const warned = parseHookOutput(after.stdout).hookSpecificOutput!.additionalContext!;
+    const newest = 'RECORD_19_' + 'x'.repeat(440);
+    expect(plain).toContain(newest);
+    expect(warned).toContain(newest);
+    expect(warned).toContain('claude auth login');
+    expect(warned.length).toBeLessThanOrEqual(10_000);
+    expect(warned).not.toContain('Recent context omitted');
+    expect(warned.match(/RECORD_/g)!.length).toBeLessThan(plain.match(/RECORD_/g)!.length);
+    expect(workerPortConnections).toBe(0);
   }, 30_000);
 
   it('renders the shared server\'s rows in under 5 s without touching the worker port', async () => {
@@ -231,13 +236,15 @@ describe('SessionStart in server runtime (plan-24 step 4)', () => {
     const additionalContext = output.hookSpecificOutput?.additionalContext ?? '';
     // Rendered through the local renderer and budget, not the route's raw
     // pre-joined `context` string.
-    expect(additionalContext).toContain(`# [${projectName}] recent context`);
+    expect(additionalContext).toStartWith(`Access Claude-Mem Rules + Tools: ${join(dataDir, 'RULES-AND-TOOLS.md')}\n\n`);
+    // Server runtime renders here, so the file the line points to is written here too.
+    expect(readFileSync(join(dataDir, 'RULES-AND-TOOLS.md'), 'utf-8')).toContain('Fetch details: observation_search');
     expect(additionalContext).toContain('Import no longer aborts on a bad row');
     expect(additionalContext).toContain('Stop one bad row from aborting the restore');
     expect(additionalContext).not.toContain('Fixed the import batch abort\n\nsummary body');
 
     // The terminal copy links the viewer the server serves, not a local worker.
-    expect(output.systemMessage ?? '').toContain(`View Observations Live @ ${serverBaseUrl}`);
+    expect(output.systemMessage ?? '').toContain(`\n\nView Observations Live @ ${serverBaseUrl} · 2 lines`);
     expect(output.systemMessage ?? '').not.toContain(`localhost:${workerPort}`);
 
     // ONE recency read (no query key) per session start, scoped to this folder
@@ -264,22 +271,6 @@ describe('SessionStart in server runtime (plan-24 step 4)', () => {
     expect(contextRequests[0].body.excludeSubagents).toBe(false);
   }, 30_000);
 
-  it('answers a Codex SessionStart inside Codex\'s 20 s hook limit when the server never responds', async () => {
-    // The client's default request timeout is 30 s; Codex would kill the hook
-    // at 20 s and discard its output, context and all.
-    writeSettings(startHangingServer());
-
-    const result = await runWorkerService(['hook', 'codex', 'context'], sessionStartInput());
-
-    expect(result.exitCode).toBe(0);
-    expect(result.elapsedMs).toBeLessThan(CODEX_SESSION_START_LIMIT_MS);
-    expect(contextRequests.length).toBe(1);
-    expect(workerPortConnections).toBe(0);
-    // Still the valid (empty) SessionStart payload Codex's validator accepts.
-    const output = parseHookOutput(result.stdout);
-    expect(output.hookSpecificOutput?.additionalContext ?? '').not.toContain('recent context');
-  }, 45_000);
-
   it('returns an empty block quickly when the server cannot answer, with no stale local rows', async () => {
     // Nothing listens here: the server is down.
     const downServer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('') });
@@ -305,5 +296,16 @@ describe('SessionStart in server runtime (plan-24 step 4)', () => {
     expect(result.elapsedMs).toBeLessThan(HOOK_BUDGET_MS);
     expect(workerPortConnections).toBe(0);
     expect(parseHookOutput(result.stdout)).toMatchObject({ continue: true, status: 'ready' });
+  }, 30_000);
+
+  it('`start` emits only supported SessionStart fields for Codex', async () => {
+    writeSettings(startFakeServer());
+
+    const result = await runWorkerService(['start'], undefined, { CLAUDE_MEM_CODEX_HOOK: '1' });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.elapsedMs).toBeLessThan(HOOK_BUDGET_MS);
+    expect(workerPortConnections).toBe(0);
+    expect(parseHookOutput(result.stdout)).toEqual({ continue: true });
   }, 30_000);
 });

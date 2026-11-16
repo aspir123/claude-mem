@@ -1,6 +1,7 @@
 import {
   closeSync,
   existsSync,
+  fchmodSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
@@ -25,6 +26,91 @@ export function stripUtf8Bom(raw: string): string {
 
 export function parseJsonWithBom<T = unknown>(raw: string): T {
   return JSON.parse(stripUtf8Bom(raw)) as T;
+}
+
+/**
+ * Strip `//` and `/* *\/` comments and trailing commas from JSONC text,
+ * then parse it. Zed's settings.json is JSONC: the editor accepts both,
+ * strict JSON.parse does not. Strings are copied verbatim, so `//`, `/*`,
+ * `,}` and friends inside a string value are never touched. Throws on an
+ * unterminated string or block comment; JSON.parse throws on anything else
+ * that is still malformed.
+ */
+export function stripJsonComments(raw: string): string {
+  let out = '';
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (ch === '"') {
+      // Copy the string verbatim, honouring backslash escapes.
+      const start = i;
+      i++;
+      let closed = false;
+      while (i < raw.length) {
+        if (raw[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (raw[i] === '"') {
+          i++;
+          closed = true;
+          break;
+        }
+        if (raw[i] === '\n') throw new Error('Unterminated string in JSON');
+        i++;
+      }
+      if (!closed) throw new Error('Unterminated string in JSON');
+      out += raw.slice(start, i);
+      continue;
+    }
+    if (ch === '/' && raw[i + 1] === '/') {
+      const newline = raw.indexOf('\n', i + 2);
+      out += ' ';
+      i = newline === -1 ? raw.length : newline;
+      continue;
+    }
+    if (ch === '/' && raw[i + 1] === '*') {
+      const end = raw.indexOf('*/', i + 2);
+      if (end === -1) throw new Error('Unterminated block comment in JSON');
+      out += ' ';
+      i = end + 2;
+      continue;
+    }
+    if (ch === ',') {
+      // A trailing comma: drop it when only whitespace and comments
+      // separate it from a closing `}` or `]`.
+      let j = i + 1;
+      for (;;) {
+        while (j < raw.length && (raw[j] === ' ' || raw[j] === '\t' || raw[j] === '\n' || raw[j] === '\r')) j++;
+        if (raw[j] === '/' && raw[j + 1] === '/') {
+          const newline = raw.indexOf('\n', j + 2);
+          j = newline === -1 ? raw.length : newline;
+          continue;
+        }
+        if (raw[j] === '/' && raw[j + 1] === '*') {
+          const end = raw.indexOf('*/', j + 2);
+          if (end === -1) break;
+          j = end + 2;
+          continue;
+        }
+        break;
+      }
+      if (raw[j] === '}' || raw[j] === ']') {
+        i++;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+export function parseJsonc<T = unknown>(raw: string): T {
+  return JSON.parse(stripJsonComments(stripUtf8Bom(raw))) as T;
 }
 
 export function readJsonFileWithBom<T = unknown>(filepath: string): T {
@@ -129,7 +215,7 @@ export function renameWithWindowsRetry(
 }
 
 /**
- * Write JSON to disk with crash-safe atomic-rename semantics.
+ * Write a payload to disk with crash-safe atomic-rename semantics.
  *
  * Sequence: resolve symlinks at the destination, write payload to a uniquely
  * named temp file in the same directory as the resolved target, loop writeSync
@@ -143,9 +229,9 @@ export interface AtomicJsonWriteOptions {
   mode?: number;
 }
 
-export function writeJsonFileAtomic(
+function writeBufferAtomic(
   filepath: string,
-  data: any,
+  payload: Buffer,
   options: AtomicJsonWriteOptions = {}
 ): void {
   const resolved = resolveSymlinkWriteTarget(filepath);
@@ -155,7 +241,6 @@ export function writeJsonFileAtomic(
   const dir = dirname(resolved);
   const base = basename(resolved);
   const tmpPath = join(dir, `.${base}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`);
-  const payload = Buffer.from(JSON.stringify(data, null, 2) + '\n', 'utf-8');
 
   let mode = options.mode;
   if (mode === undefined) {
@@ -169,6 +254,9 @@ export function writeJsonFileAtomic(
   let fd: number | undefined;
   try {
     fd = mode !== undefined ? openSync(tmpPath, 'w', mode) : openSync(tmpPath, 'w');
+    // open(2) masks the mode with the umask (0660 under 022 lands as 0640), so
+    // set it exactly before the first byte: the rename must keep the file's mode.
+    if (mode !== undefined && !IS_WINDOWS_PLATFORM) fchmodSync(fd, mode);
 
     let written = 0;
     while (written < payload.length) {
@@ -205,4 +293,26 @@ export function writeJsonFileAtomic(
     try { unlinkSync(tmpPath); } catch { /* tempfile may not exist */ }
     throw err;
   }
+}
+
+/** Write JSON to disk atomically: pretty-printed, newline-terminated, via writeBufferAtomic. */
+export function writeJsonFileAtomic(
+  filepath: string,
+  data: any,
+  options: AtomicJsonWriteOptions = {}
+): void {
+  writeBufferAtomic(filepath, Buffer.from(JSON.stringify(data, null, 2) + '\n', 'utf-8'), options);
+}
+
+/**
+ * Write a text file (YAML, TOML, plain text) to disk atomically via
+ * writeBufferAtomic, writing exactly the bytes given: no serialization, no
+ * added trailing newline.
+ */
+export function writeTextFileAtomic(
+  filepath: string,
+  text: string,
+  options: AtomicJsonWriteOptions = {}
+): void {
+  writeBufferAtomic(filepath, Buffer.from(text, 'utf-8'), options);
 }

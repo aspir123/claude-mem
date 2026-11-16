@@ -32,6 +32,8 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
   'runtime_mode',
   'trigger',
   'count',
+  // How many worker_started / worker_stopped the daily event stands in for.
+  'restart_count',
   'has_summary',
   'is_update',
   // Install funnel shape — install_method is a package-manager enum parsed
@@ -230,6 +232,24 @@ export const ALLOWED_PROPERTY_KEYS: Set<string> = new Set([
     `${source}_${operation}_count`,
     ...['ok', 'error', 'excluded', 'disabled', 'unknown'].map(outcome => `${source}_${operation}_${outcome}_count`),
   ])),
+  // work_view_opened / work_view_switched — which My Work viewer page is on
+  // screen, as the viewer's own closed page ids (setup | work | rules | suggested | past-focus).
+  // Never a request title, prompt, observation, file path, or search text.
+  'view',
+  'previous_view',
+  // Which viewer sent the event, and the host it was opened on. Closed enum
+  // plus a hostname (no path, no user). Local is the worker; hosted is work.cmem.ai.
+  'viewer_host',
+  'hostname',
+  // auto_update_applied / auto_update_failed (src/services/auto-update/auto-update-apply.ts):
+  // from_version and to_version are claude-mem release versions, failure_stage
+  // and restore_result the supervisor's own closed enums
+  // (AutoUpdateApplyFailureStage, AutoUpdateRestoreResult). Never a path, a
+  // log line or an error message.
+  'from_version',
+  'to_version',
+  'failure_stage',
+  'restore_result',
 ]);
 
 const MAX_STRING_LENGTH = 200;
@@ -246,6 +266,12 @@ function copyAllowedProperties(
   for (const key of Object.keys(props)) {
     if (!ALLOWED_PROPERTY_KEYS.has(key)) continue;
     const value = props[key];
+    if (key === 'hostname' && typeof value === 'string' && /^[a-z0-9.-]{1,253}$/i.test(value)) {
+      // The viewer host is the field. The error redactor would turn a loopback
+      // address into [REDACTED], which is the opposite of what this field is for.
+      scrubbed[key] = value.toLowerCase();
+      continue;
+    }
     if (typeof value === 'string') {
       const truncated = value.length > MAX_STRING_LENGTH ? value.slice(0, MAX_STRING_LENGTH) : value;
       // Allowed keys are supposed to be enums/counters, but a call site can

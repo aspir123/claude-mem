@@ -3,12 +3,14 @@ import { Database } from 'bun:sqlite';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildAgentView, readAgentRecords } from '../../src/services/work-view/agent-view.mjs';
 import { reduceWorkState } from '../../src/services/work-view/data-source.mjs';
 import { buildRefreshTask } from '../../src/services/work-view/refresh-task.js';
 import { applyGroupDecisions, groupIdFor, groupingInput, linkBackwards, readCandidates, readLedger, runCli, validateGroupingAnswer } from '../../src/services/work-view/request-groups.mjs';
 import { buildHumanRequests } from '../../src/services/work-view/request-projection.mjs';
-import { NO_PROJECT, pathsIn, projectFromToolPaths, withDerivedProjects, projectRoot, upgradedGroupRoot } from '../../src/services/work-view/session-project.mjs';
+import { NO_PROJECT, folderNeedsProject, pathsIn, projectFromToolPaths, withDerivedProjects, projectRoot, upgradedGroupRoot } from '../../src/services/work-view/session-project.mjs';
+import { everyRequestInOther, focusWriter } from '../helpers/fake-focus-writer.js';
 
 const DAY = 86400000, NOW = 100 * DAY;
 const key = (session: string) => JSON.stringify(['conversation', 'claude', session]);
@@ -18,8 +20,8 @@ const prompt = (id: number, sessionId: number, text: string, at: number, number 
 const link = (conversations: string[]) => [{ kind: 'agent-judgment', conversations, evidence: 'the later ask continues the earlier one' }];
 
 /** sdk_sessions and tool_uses with the cwd columns real databases have. */
-function database() {
-  const db = new Database(':memory:');
+function database(path = ':memory:') {
+  const db = new Database(path);
   db.exec(`CREATE TABLE sdk_sessions (id INTEGER PRIMARY KEY, platform_source TEXT, content_session_id TEXT, memory_session_id TEXT, project TEXT, user_prompt TEXT, started_at_epoch INTEGER, cwd TEXT, custom_title TEXT, status TEXT, completed_at_epoch INTEGER);
     CREATE TABLE user_prompts (id INTEGER PRIMARY KEY, session_db_id INTEGER, prompt_number INTEGER, prompt_text TEXT, created_at_epoch INTEGER);
     CREATE TABLE tool_uses (id INTEGER PRIMARY KEY, session_db_id INTEGER, tool_name TEXT, tool_input TEXT, cwd TEXT, created_at_epoch INTEGER);
@@ -106,6 +108,35 @@ describe('requests stay inside one project root', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('a decision that names the request\'s projectRoot joins conversations from other roots and records that root', () => {
+    const projectOf = new Map([[key('a'), 'repo-one'], [key('b'), 'repo-two']]);
+    const decision = { title: 'Cards', conversations: [key('a'), key('b')], links: link([key('a'), key('b')]) };
+    const joined = applyGroupDecisions(null, { groups: [{ ...decision, projectRoot: 'repo-one' }] }, NOW, { projectOf });
+    expect(joined.conversations[key('b')]).toBe(groupIdFor(key('a')));
+    expect(joined.groups[groupIdFor(key('a'))].projectRoot).toBe('repo-one');
+    // A later decision's root replaces the stored one; an empty or non-string root is refused.
+    expect(applyGroupDecisions(joined, { groups: [{ ...decision, projectRoot: 'repo-two' }] }, NOW, { projectOf }).groups[groupIdFor(key('a'))].projectRoot).toBe('repo-two');
+    // A refresh answer cannot name a root, so a later conversation from the saved root still joins the group.
+    const grown = applyGroupDecisions(joined, { groups: [{ title: 'Cards', conversations: [key('a'), key('c')], links: link([key('a'), key('c')]) }] }, NOW, { projectOf: new Map([...projectOf, [key('c'), 'repo-one']]) });
+    expect(grown.conversations[key('c')]).toBe(groupIdFor(key('a')));
+    expect(grown.conversations[key('b')]).toBe(groupIdFor(key('a')));
+    expect(grown.groups[groupIdFor(key('a'))]).toMatchObject({ projectRoot: 'repo-one', rootNamed: true });
+    expect(() => applyGroupDecisions(null, { groups: [{ ...decision, projectRoot: ' ' }] }, NOW, { projectOf })).toThrow(/projectRoot must be a non-empty string/);
+    expect(() => applyGroupDecisions(null, { groups: [{ ...decision, projectRoot: 7 }] }, NOW, { projectOf })).toThrow(/projectRoot must be a non-empty string/);
+    const dir = mkdtempSync(join(tmpdir(), 'request-first-'));
+    try {
+      const db = database();
+      addSession(db, 1, 'a', 'repo-one', 'Build the release cards', NOW - 2 * DAY);
+      addSession(db, 2, 'b', 'repo-two', 'Continue the release cards', NOW - DAY);
+      const decisions = join(dir, 'decisions.json');
+      writeFileSync(decisions, JSON.stringify({ groups: [{ ...decision, projectRoot: 'repo-one' }] }));
+      let output: any;
+      runCli(['apply', decisions], { dir, database: db, now: NOW, print: (value: unknown) => { output = value; } });
+      expect(output).toEqual({ groups: 1, conversations: 2 });
+      expect(readLedger(dir).groups.groups[groupIdFor(key('a'))].projectRoot).toBe('repo-one');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('worktrees of one repo group together and link through a shared list or request id', () => {
     const projectOf = new Map([[key('a'), 'repo/tree-a'], [key('b'), 'repo/tree-b']]);
     const merged = applyGroupDecisions(null, { groups: [{ title: 'Cards', conversations: [key('a'), key('b')], links: link([key('a'), key('b')]) }] }, NOW, { projectOf });
@@ -118,12 +149,18 @@ describe('requests stay inside one project root', () => {
     expect(ids.proposedGroups.every((group: any) => group.conversations.length === 1)).toBe(true);
   });
 
-  it('the projection keeps a conversation out of another root\'s group, and a request id names one request per root', () => {
+  it('the projection keeps every conversation assigned to a group with a recorded root, checks the root only when none was recorded, and names one explicit request per root', () => {
     const groupId = groupIdFor(key('a'));
-    const ledger = { groups: { conversations: { [key('a')]: groupId, [key('b')]: groupId }, groups: { [groupId]: { title: 'Cards', anchor: key('a'), projectRoot: 'repo-one' } }, ignored: {} }, progress: {} };
+    const ledgerWith = (projectRoot: string | null, ignored = {}) => ({ groups: { conversations: { [key('a')]: groupId, [key('b')]: groupId }, groups: { [groupId]: { title: 'Cards', anchor: key('a'), projectRoot } }, ignored }, progress: {} });
     const sessions = [session(1, 'a', 'repo-one/tree', 'Build the release cards'), session(2, 'b', 'repo-two', 'Fix the card spacing')];
     const prompts = [prompt(11, 1, 'Build the release cards', 10), prompt(21, 2, 'Fix the card spacing', 20)];
-    expect(buildHumanRequests({ agents: [] }, { sessions, prompts }, { ledger }).humanRequests.map((request: any) => request.id).sort()).toEqual([key('b'), JSON.stringify(['overall-request', groupId])].sort());
+    const requests = (ledger: object) => buildHumanRequests({ agents: [] }, { sessions, prompts }, { ledger }).humanRequests;
+    // b worked in repo-two, but the request's root is recorded: the ledger's assignment stands and b joins the card.
+    expect(requests(ledgerWith('repo-one')).map((request: any) => [request.id, request.conversationKeys])).toEqual([[overall('a'), [key('a'), key('b')]]]);
+    // No root recorded: the anchor's root decides, so b stays its own card.
+    expect(requests(ledgerWith(null)).map((request: any) => request.id).sort()).toEqual([key('b'), overall('a')].sort());
+    // An ignored conversation stays out, whatever root the group recorded.
+    expect(requests(ledgerWith('repo-one', { [key('b')]: 'naming prompt' })).map((request: any) => [request.id, request.conversationKeys])).toEqual([[overall('a'), [key('a')]]]);
     const item = (id: string, project: string) => ({ id, title: id, kind: 'work-state', listId: id, project, requestId: 'r-1', lastUpdateEpoch: 1 });
     const view = { agents: [{ id: 'x', label: 'Codex', sessionId: 1, work: [item('one', 'repo-one/tree')] }, { id: 'y', label: 'Codex', sessionId: 2, work: [item('two', 'repo-two')] }] };
     const explicit = buildHumanRequests(view, { sessions, prompts }).humanRequests;
@@ -244,7 +281,7 @@ describe('only new opening prompts are checked', () => {
   it('the refresh sends the agent only new conversations, batch by batch, and keeps earlier decisions', async () => {
     const { db, dir } = ledgerFixture();
     try {
-      const task = buildRefreshTask({ needs: { due: 0, ungrouped: 2, goalsStale: false, unaligned: 0, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: join(import.meta.dir, '..', '..', 'plugin'), openDatabase: () => ({ prepare: db.prepare.bind(db), close() {} }), now: () => NOW });
+      const task = buildRefreshTask({ localDeviceId: () => '', needs: { due: 0, ungrouped: 2, goalsStale: false, unplaced: 0, needed: true }, reason: 'scheduled', dataDir: dir, ledgerDir: dir, pluginRoot: join(import.meta.dir, '..', '..', 'plugin'), openDatabase: () => ({ prepare: db.prepare.bind(db), close() {} }), now: () => NOW, saveFocus: focusWriter(db).save });
       const sent: string[][] = [];
       const ask = async (question: string) => {
         if (question.includes('Do only section 1')) {
@@ -262,6 +299,7 @@ describe('only new opening prompts are checked', () => {
           const shows = JSON.parse(readFileSync(/is in (\S+\.json)/.exec(question)![1], 'utf8'));
           return JSON.stringify({ reviews: shows.map((show: any) => ({ groupId: show.groupId, state: 'in-progress', percent: 10, summary: 'Started.', reviewBasis: show.reviewBasis })) });
         }
+        if (question.includes('Do only section 3')) return everyRequestInOther(question);
         return JSON.stringify({ narrative: 'Under way.', preferences: [] });
       };
       expect(await task.run(ask as any, 'codex')).toMatch(/^2 new conversations grouped/);
@@ -295,6 +333,36 @@ describe('the real project of an agent scratch-folder session', () => {
       if (previous === undefined) delete process.env.CLAUDE_MEM_PROJECT_NAME_SOURCE; else process.env.CLAUDE_MEM_PROJECT_NAME_SOURCE = previous;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('derives the project of a deleted temp checkout', () => {
+    const folder = mkdtempSync(join(tmpdir(), 'former-scratch-'));
+    rmSync(folder, { recursive: true });
+    expect(folderNeedsProject(folder, 'generated-task')).toBe(true);
+  });
+
+  it('uses the touched repository in the built request-progress skill after a temp checkout is removed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'skill-project-'));
+    const path = join(dir, 'claude-mem.db');
+    try {
+      const repo = join(dir, 'product');
+      gitRepo(repo);
+      const checkout = join(dir, 'removed');
+      mkdirSync(checkout);
+      const db = database(path);
+      try {
+        addSession(db, 1, 'scratch', 'generated-task', 'Fix the release script', Date.now(), checkout);
+        db.prepare('INSERT INTO tool_uses (session_db_id, tool_name, tool_input) VALUES (?, ?, ?)')
+          .run(1, 'Read', JSON.stringify({ file_path: join(repo, 'README.md') }));
+      } finally { db.close(true); }
+      rmSync(checkout, { recursive: true });
+      const cli = fileURLToPath(new URL('../../plugin/skills/request-progress/scripts/request-groups.mjs', import.meta.url));
+      const result = Bun.spawnSync([process.execPath, cli, 'candidates', '--brief'], {
+        env: { ...process.env, CLAUDE_MEM_DATA_DIR: dir, CLAUDE_MEM_DB: path, CLAUDE_MEM_PROJECT_NAME_SOURCE: 'path' },
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(JSON.parse(result.stdout.toString()).candidates).toMatchObject([{ project: 'product' }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('reads native Windows paths and working folders on Windows', () => {

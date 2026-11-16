@@ -1,8 +1,8 @@
 import * as p from '@clack/prompts';
 import { styleText } from 'node:util';
-import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, posix } from 'path';
 import {
   claudeSettingsPath,
   installedPluginsPath,
@@ -13,8 +13,10 @@ import {
   writeJsonFileAtomic,
 } from '../utils/paths.js';
 import { readJsonSafe } from '../../utils/json-utils.js';
+import { clearClaudeAutoMemoryOverride } from '../utils/claude-auto-memory.js';
+import { writeTextFileAtomic } from '../../shared/atomic-json.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { USER_SETTINGS_PATH, resolveDataDir } from '../../shared/paths.js';
 import { updateSettingsDocument } from '../../shared/settings-document.js';
 import { shutdownWorkerAndWait, type ShutdownResult } from '../../services/install/shutdown-helper.js';
 import { getWorkerPort } from '../../shared/worker-utils.js';
@@ -94,8 +96,7 @@ function removeFromInstalledPlugins(): void {
   }
 }
 
-function stripLegacyClaudeMemAlias(): void {
-  const home = homedir();
+export function stripLegacyClaudeMemAlias(home: string = homedir()): void {
   const candidateFiles = [
     join(home, '.bashrc'),
     join(home, '.zshrc'),
@@ -117,7 +118,9 @@ function stripLegacyClaudeMemAlias(): void {
     const filtered = lines.filter((line) => !aliasLineRegex.test(line));
     if (filtered.length === lines.length) continue; 
     try {
-      writeFileSync(filePath, filtered.join('\n'));
+      // The user's own shell rc: a crash mid-write must leave the previous
+      // contents, never a truncated file, so write through the shared helper.
+      writeTextFileAtomic(filePath, filtered.join('\n'));
       console.error(`Removed legacy claude-mem alias from ${filePath}`);
     } catch (error: unknown) {
       console.warn(`[uninstall] Could not rewrite ${filePath}:`, error instanceof Error ? error.message : String(error));
@@ -147,18 +150,7 @@ export function removeFromClaudeSettings(): void {
   // (ANTHROPIC_AUTH_TOKEN, AWS_REGION, etc.) are preserved. If the env
   // block becomes empty as a result, the block itself is dropped to keep
   // settings.json tidy.
-  if (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env)) {
-    if (
-      Object.prototype.hasOwnProperty.call(settings.env, 'CLAUDE_CODE_DISABLE_AUTO_MEMORY') &&
-      settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY === '1'
-    ) {
-      delete settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY;
-      dirty = true;
-      if (Object.keys(settings.env).length === 0) {
-        delete settings.env;
-      }
-    }
-  }
+  if (clearClaudeAutoMemoryOverride(settings)) dirty = true;
 
   if (dirty) {
     writeJsonFileAtomic(claudeSettingsPath(), settings);
@@ -249,6 +241,50 @@ export function uninstallShutdownNotice(result: ShutdownResult): { level: 'info'
     case 'worker-still-running':
       return { level: 'warn', message: `Worker service (PID ${result.blocker.pid}) did not confirm shutdown; continuing uninstall cleanup.` };
   }
+}
+
+/** PowerShell ends a single-quoted string at any of these; doubling one keeps it. */
+const POWERSHELL_SINGLE_QUOTES = /['‘’‚‛]/g;
+
+/**
+ * Where the data directory that uninstall keeps is, and a command that removes
+ * it. The directory honors CLAUDE_MEM_DATA_DIR. Windows shells have no
+ * `rm -rf`: PowerShell reads `-rf` as an unknown parameter and cmd has no `rm`.
+ * Windows gets a PowerShell command with the path in single quotes, where
+ * PowerShell expands nothing. Wrapping it in `powershell -c "…"` would let the
+ * shell it is pasted into expand `$name` or `$(…)` in the path, and a
+ * `…\$archive` directory would then remove its parent. Exported for tests.
+ */
+export function preservedDataDirectoryHint(
+  dataDirectory: string = resolveDataDir(),
+  platform: NodeJS.Platform = process.platform,
+  home: string = homedir(),
+): { location: string; removeCommand: string; shell: 'PowerShell' | 'sh' } {
+  if (platform === 'win32') {
+    const quoted = `'${dataDirectory.replace(POWERSHELL_SINGLE_QUOTES, (quote) => quote + quote)}'`;
+    return { location: dataDirectory, removeCommand: `Remove-Item -LiteralPath ${quoted} -Recurse -Force`, shell: 'PowerShell' };
+  }
+  if (dataDirectory === posix.join(home, '.claude-mem')) {
+    return { location: '~/.claude-mem', removeCommand: 'rm -rf ~/.claude-mem', shell: 'sh' };
+  }
+  // `--` because a relative CLAUDE_MEM_DATA_DIR such as `-memory` would otherwise be read as options.
+  return { location: dataDirectory, removeCommand: `rm -rf -- '${dataDirectory.replaceAll("'", "'\\''")}'`, shell: 'sh' };
+}
+
+/**
+ * `install --ide cursor` adds claude-mem's hooks to ~/.cursor/hooks.json and
+ * its server to ~/.cursor/mcp.json. uninstallCursorHooks() also removes hooks
+ * and scripts by the legacy script names alone, which the user's own hooks can
+ * share, so it runs only when one of claude-mem's entries is there. Exported
+ * for tests.
+ */
+export async function removeCursorIntegration(): Promise<number> {
+  const { hasCursorIntegration, uninstallCursorHooks } = await import('../../services/integrations/CursorHooksInstaller.js');
+  if (!hasCursorIntegration('user')) {
+    console.log('  Cursor hooks + MCP not installed; nothing to remove.');
+    return 0;
+  }
+  return uninstallCursorHooks('user');
 }
 
 export async function runUninstallCommand(): Promise<void> {
@@ -426,6 +462,7 @@ export async function runUninstallCommand(): Promise<void> {
       const { uninstallPiExtension } = await import('../../services/integrations/PiInstaller.js');
       return uninstallPiExtension();
     }},
+    { label: 'Cursor hooks + MCP', fn: removeCursorIntegration },
     { label: 'Windsurf hooks', fn: async () => {
       const { uninstallWindsurfHooks } = await import('../../services/integrations/WindsurfHooksInstaller.js');
       return uninstallWindsurfHooks();
@@ -433,6 +470,18 @@ export async function runUninstallCommand(): Promise<void> {
     { label: 'Goose MCP extension', fn: async () => {
       const { uninstallGooseMcpIntegration } = await import('../../services/integrations/McpIntegrations.js');
       return uninstallGooseMcpIntegration();
+    }},
+    { label: 'Copilot CLI MCP server', fn: async () => {
+      const { uninstallCopilotCliMcpIntegration } = await import('../../services/integrations/McpIntegrations.js');
+      return uninstallCopilotCliMcpIntegration();
+    }},
+    { label: 'Warp MCP server', fn: async () => {
+      const { uninstallWarpMcpIntegration } = await import('../../services/integrations/McpIntegrations.js');
+      return uninstallWarpMcpIntegration();
+    }},
+    { label: 'Zed MCP server', fn: async () => {
+      const { uninstallZedMcpIntegration } = await import('../../services/integrations/McpIntegrations.js');
+      return uninstallZedMcpIntegration();
     }},
     { label: 'OpenCode plugin', fn: async () => {
       const { uninstallOpenCodePlugin } = await import('../../services/integrations/OpenCodeInstaller.js');
@@ -450,9 +499,17 @@ export async function runUninstallCommand(): Promise<void> {
       const { uninstallAntigravityCliHooks } = await import('../../services/integrations/AntigravityCliHooksInstaller.js');
       return uninstallAntigravityCliHooks();
     }},
+    { label: 'Gemini CLI hooks', fn: async () => {
+      const { uninstallGeminiHooks } = await import('../../services/integrations/GeminiHooksInstaller.js');
+      return uninstallGeminiHooks();
+    }},
     { label: 'Kimi Code hooks + MCP', fn: async () => {
       const { uninstallKimiHooks } = await import('../../services/integrations/KimiHooksInstaller.js');
       return uninstallKimiHooks();
+    }},
+    { label: 'Devin hooks + MCP', fn: async () => {
+      const { uninstallDevinHooks } = await import('../../services/integrations/DevinHooksInstaller.js');
+      return uninstallDevinHooks();
     }},
     { label: 'OMP hooks', fn: async () => {
       const { uninstallOmpHooks } = await import('../../services/integrations/OmpHooksInstaller.js');
@@ -475,10 +532,13 @@ export async function runUninstallCommand(): Promise<void> {
     p.log.info(launcherRemovalOutcome.result.pathCleanupHint);
   }
 
+  const dataDirectory = preservedDataDirectoryHint();
   p.note(
     [
-      `Your data directory at ${styleText('cyan', '~/.claude-mem')} was preserved.`,
-      'To remove it manually: rm -rf ~/.claude-mem',
+      `Your data directory at ${styleText('cyan', dataDirectory.location)} was preserved.`,
+      dataDirectory.shell === 'PowerShell'
+        ? `To remove it manually, in PowerShell: ${dataDirectory.removeCommand}`
+        : `To remove it manually: ${dataDirectory.removeCommand}`,
     ].join('\n'),
     'Note',
   );

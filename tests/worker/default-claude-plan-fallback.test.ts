@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import type { ActiveSession } from '../../src/services/worker-types.js';
 import { logger } from '../../src/utils/logger.js';
 import { paths } from '../../src/shared/paths.js';
@@ -66,8 +67,6 @@ function pinGatewayPrimary(overrides: Record<string, string> = {}): void {
 let savedEnv: Record<string, string | undefined>;
 let previousClaudeReadiness: (() => boolean) | null;
 let spies: Array<ReturnType<typeof spyOn>>;
-let infoLines: string[];
-let warnLines: string[];
 
 function setUp(): void {
   savedEnv = {};
@@ -80,11 +79,9 @@ function setUp(): void {
   resetQuotaFallbackStateForTesting();
   // A Claude login exists unless a test says otherwise.
   previousClaudeReadiness = setClaudeFallbackReadinessForTesting(() => true);
-  infoLines = [];
-  warnLines = [];
   spies = [
-    spyOn(logger, 'info').mockImplementation((_c: string, message: string) => { infoLines.push(message); }),
-    spyOn(logger, 'warn').mockImplementation((_c: string, message: string) => { warnLines.push(message); }),
+    spyOn(logger, 'info').mockImplementation(() => {}),
+    spyOn(logger, 'warn').mockImplementation(() => {}),
     spyOn(logger, 'debug').mockImplementation(() => {}),
     spyOn(logger, 'error').mockImplementation(() => {}),
   ];
@@ -120,7 +117,6 @@ describe('default Anthropic-plan fallback: dispatch', () => {
     recordQuotaExhausted('openrouter', 'The observer is briefly over capacity.', 'rate_limit');
     expect(selectProviderForGenerator()).toEqual({ provider: 'claude', gatewayProbeClaimId: null, fallbackFrom: 'openrouter' });
     expect(getSelectedProvider()).toBe('claude');
-    expect(warnLines).toContain('Primary cannot serve right now; memory runs on the Anthropic plan (Claude) until it recovers');
   });
 
   it('moves gateway work to Claude while an outage / unusable-reply breaker holds', () => {
@@ -160,25 +156,20 @@ describe('default Anthropic-plan fallback: dispatch', () => {
     expect(selectProviderForGenerator()).toEqual({ provider: 'openrouter', gatewayProbeClaimId: null });
   });
 
-  it('tells the session start that memory is on the Anthropic plan', () => {
-    const state = {
-      quotaCooldown: {
-        active: true,
-        provider: 'openrouter',
-        armedAt: 0,
-        until: Date.now() + 60_000,
-        window: 'rate_limit',
-        message: 'over capacity',
-        servingProvider: 'claude',
-      },
-    } as unknown as ObserverHealthState;
-    expect(renderObserverQuotaCooldownNotice(state)).toContain('memory is running on your Anthropic plan (Claude)');
+  it('tells the session start which backup is saving memories and why', () => {
+    pinGatewayPrimary({ CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: '' });
+    recordQuotaExhausted('openrouter', 'over capacity', 'rate_limit');
+    const state = JSON.parse(readFileSync(join(paths.dataDir(), 'observer-health.json'), 'utf8')) as ObserverHealthState;
+    const notice = renderObserverQuotaCooldownNotice(state);
+    expect(notice).toContain("claude-mem is using your Claude plan to save memories because cmem.ai is busy (rate limited or over capacity).");
+    expect(notice).toContain('CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER=off');
   });
 });
 
 // ---------------------------------------------------------------------------
 // The generator lifecycle: a gateway failure moves the buffered work to Claude
-// at once, with no further hook event.
+// at once, with no further hook event. A quota or auth exit discards the work
+// instead; only a fresh captured event starts the next run.
 // ---------------------------------------------------------------------------
 
 function makeSession(): ActiveSession {
@@ -229,20 +220,22 @@ function buildRoutes(
   agents: { claude: (s: ActiveSession) => Promise<void>; openrouter: (s: ActiveSession) => Promise<void> },
 ) {
   let active: ActiveSession | undefined = session;
+  let pending = 1;
   const sessionManager = {
     getSession: () => active,
-    getMessageBuffer: () => ({ getPendingCount: () => 1, peekTypes: () => [] }),
+    getMessageBuffer: () => ({ getPendingCount: () => pending, peekTypes: () => [] }),
+    discardBufferedWork: () => { const discarded = pending; pending = 0; return discarded; },
     removeSessionImmediate: () => { active = undefined; },
     // The sweep's view: a paused session with buffered work and no generator,
     // filtered on the same automatically-retryable reasons SessionManager uses.
     getResumableSessionIds: () => (
-      active && !active.generatorPromise
-        && [null, undefined, 'quota', 'rate_limit', 'overflow', 'provider_switch', 'response_stall'].includes(active.pausedReason)
+      active && !active.generatorPromise && pending > 0
+        && [null, undefined, 'rate_limit', 'overflow', 'provider_switch', 'response_stall'].includes(active.pausedReason)
         ? [active.sessionDbId]
         : []
     ),
   };
-  return new SessionRoutes(
+  const routes = new SessionRoutes(
     sessionManager as any,
     {} as any,
     { startSession: agents.claude } as any,
@@ -252,6 +245,9 @@ function buildRoutes(
     {} as any,
     { finalizeSession: async () => {} } as any,
   );
+  /** A fresh captured event lands in the buffer. */
+  const capture = (): void => { pending = 1; };
+  return Object.assign(routes, { capture });
 }
 
 describe('default Anthropic-plan fallback: generator lifecycle', () => {
@@ -272,7 +268,7 @@ describe('default Anthropic-plan fallback: generator lifecycle', () => {
     await nextTick();
     await nextTick();
     clearTimeout(session.scheduledResumeTimer);
-    return { gatewayStarts: gatewayStarts.n, claudeStarts: () => claudeStarts, session };
+    return { gatewayStarts: gatewayStarts.n, claudeStarts: () => claudeStarts, session, routes };
   }
 
   const overCapacity = (): ClassifiedProviderError => new ClassifiedProviderError('The observer is briefly over capacity.', {
@@ -287,7 +283,6 @@ describe('default Anthropic-plan fallback: generator lifecycle', () => {
     const run = await runGatewayFailure(overCapacity(), 'rate_limit:rate_limit');
     expect(run.gatewayStarts).toBe(1);
     expect(run.claudeStarts()).toBe(1);
-    expect(infoLines).toContain('Generator auto-starting (provider-fallback) using Claude SDK');
     expect(getQuotaCooldown('openrouter')?.window).toBe('rate_limit');
   });
 
@@ -298,27 +293,7 @@ describe('default Anthropic-plan fallback: generator lifecycle', () => {
     expect(getQuotaCooldown('openrouter')?.window).toBe('unavailable');
   });
 
-  it('a gateway key refusal moves the work to Claude (the trial-expiry fallback)', async () => {
-    const settingsPath = paths.settings();
-    const original = existsSync(settingsPath) ? readFileSync(settingsPath, 'utf-8') : null;
-    try {
-      const settings = original ? JSON.parse(original) : {};
-      writeFileSync(settingsPath, JSON.stringify({ ...settings, CLAUDE_MEM_PRO_FALLBACK_AT: '' }));
-      pinGatewayPrimary();
-      delete process.env.CLAUDE_MEM_PRO_FALLBACK_AT; // the marker lives in the file
-      const refused = new ClassifiedProviderError('Your trial has ended.', {
-        kind: 'auth_invalid', code: 'subscription_inactive', cause: null,
-      });
-      const run = await runGatewayFailure(refused, 'auth:auth_invalid');
-      expect(run.claudeStarts()).toBe(1);
-      expect(selectProviderForGenerator().provider).toBe('claude');
-    } finally {
-      if (original === null) writeFileSync(settingsPath, '{}');
-      else writeFileSync(settingsPath, original);
-    }
-  });
-
-  it('a signed-out Claude fallback is taken out of rotation, and the work returns to the recovered primary', async () => {
+  it('a signed-out Claude fallback is taken out of rotation, its work is discarded, and fresh work returns to the recovered primary', async () => {
     pinGatewayPrimary();
     const session = makeSession();
     let gatewayStarts = 0;
@@ -349,17 +324,21 @@ describe('default Anthropic-plan fallback: generator lifecycle', () => {
     // start it again; the gateway is still held, so nothing starts.
     expect(getQuotaCooldown('claude')?.cause).toBe('auth');
     expect(selectProviderForGenerator().provider).toBe('openrouter');
+    routes.capture();
     await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
     await nextTick();
     expect(claudeStarts).toBe(1);
     expect(gatewayStarts).toBe(1);
 
-    // The session is not stranded as an auth pause: once the gateway recovers,
-    // the periodic sweep hands the work back to it.
-    expect(session.pausedReason).toBe('provider_switch');
+    // The refused fallback discarded its work, so the recovered gateway's
+    // sweep has nothing to resume; the next captured event starts it fresh.
     gatewayDown = false;
     clearQuotaCooldown('openrouter');
-    expect(routes.resumePendingSessions('periodic-resume')).toBe(1);
+    expect(routes.resumePendingSessions('periodic-resume')).toBe(0);
+    await nextTick();
+    expect(gatewayStarts).toBe(1);
+    routes.capture();
+    await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
     await nextTick();
     expect(gatewayStarts).toBe(2);
     expect(claudeStarts).toBe(1);

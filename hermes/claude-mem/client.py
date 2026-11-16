@@ -15,7 +15,11 @@ Hermes turn nothing.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import http.client
 import json
+import ntpath
 import os
 import re
 import threading
@@ -23,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 PLATFORM_SOURCE = "hermes"
 _PREFIXES = ("CLAUDE_MEM_",)
@@ -36,7 +40,37 @@ BREAKER_OPEN_S = 30.0
 # (<memory-context>), and agent-internal blocks. Matches the worker's own list.
 _TAGS = ("private", "memory-context", "claude-mem-context", "system_instruction",
          "system-instruction", "persisted-output", "system-reminder")
-_TAG = re.compile(r"<(/?)(%s)\b[^>]*>" % "|".join(re.escape(t) for t in _TAGS), re.IGNORECASE)
+# Only the opening of a tag; its end is found with `str.find` below. A
+# `<name\b[^>]*>` tail would rescan the rest of the text for every unfinished
+# `<name` candidate, which is quadratic on adversarial input (issue #5146).
+_TAG_START = re.compile(r"<(/?)(%s)\b" % "|".join(re.escape(t) for t in _TAGS), re.IGNORECASE)
+
+
+def _iter_tags(text: str) -> Iterator[Tuple[int, int, bool, str]]:
+    """Yields `(start, end, closing, name)` for each tag in `text`, in order.
+
+    A tag ends at the first ``>`` after its name, exactly the range the old
+    ``<name[^>]*>`` matched, but the tail is searched once per tag instead of
+    once per ``<name`` candidate. A missing ``>`` means none follows any later
+    candidate either, so the scan stops there."""
+    scan_from = 0
+    while True:
+        found = _TAG_START.search(text, scan_from)
+        if found is None:
+            return
+        end = text.find(">", found.end())
+        if end < 0:
+            return
+        end += 1
+        yield found.start(), end, found.group(1) == "/", found.group(2).lower()
+        scan_from = end
+
+
+def _has_tag(text: str) -> bool:
+    """Whether `text` holds a complete tag, checked with the linear scanner."""
+    for _ in _iter_tags(text):
+        return True
+    return False
 
 
 def _strip_text(text: str) -> str:
@@ -46,12 +80,11 @@ def _strip_text(text: str) -> str:
     out: List[str] = []
     position = 0
     open_tags: Dict[str, int] = {}
-    for tag in _TAG.finditer(text):
-        closing, name = tag.group(1), tag.group(2).lower()
+    for start, end, closing, name in _iter_tags(text):
         if not open_tags:
             if closing:
                 continue
-            out.append(text[position:tag.start()])
+            out.append(text[position:start])
             open_tags = {name: 1}
             continue
         if closing:
@@ -62,7 +95,7 @@ def _strip_text(text: str) -> str:
         else:
             open_tags[name] = open_tags.get(name, 0) + 1
         if not open_tags:
-            position = tag.end()
+            position = end
     if not open_tags:
         out.append(text[position:])
     return "".join(out)
@@ -72,7 +105,7 @@ def strip_tags(value: Any) -> Any:
     """The value with those sections removed from every string in it, at any
     depth; strings without one are returned unchanged."""
     if isinstance(value, str):
-        return _strip_text(value) if _TAG.search(value) else value
+        return _strip_text(value) if _has_tag(value) else value
     if isinstance(value, list):
         return [strip_tags(item) for item in value]
     if isinstance(value, dict):
@@ -150,19 +183,34 @@ def is_project_excluded(cwd: str, patterns: str) -> bool:
     return False
 
 
-_PROJECT_KEYS: Dict[str, str] = {}
+# Bounded cache lifetime for the derived checkout key. A checkout whose git
+# structure changes while keeping the same cwd path (a nested git init, or a
+# clone converted into a linked worktree) must not be served a stale project
+# key for the rest of the Hermes process lifetime.
+# Why 300 s: deriving the key costs one `git rev-parse` (measured 20 ms median,
+# 25 ms max over 50 runs on macOS in a linked worktree), paid at most once per cwd
+# per interval on the turn path. A changed git structure is accepted as stale for
+# up to five minutes, which is short enough for a rare event like a nested `git init`.
+_PROJECT_KEY_TTL_S = 300.0
+_PROJECT_KEYS: Dict[str, tuple[str, float]] = {}
 
 
 def checkout_project(cwd: str) -> str:
     """The project key the Claude Code hooks give this checkout in their
     default (path) mode: the git root's folder name, or `<repo>/<worktree>` for
     a linked worktree; the folder name outside git. Only hosted mode needs it:
-    the local worker resolves the key itself from the cwd."""
+    the local worker resolves the key itself from the cwd.
+
+    The derived key is cached per cwd for ``_PROJECT_KEY_TTL_S`` seconds; an
+    expired entry is recomputed so a changed git structure is picked up."""
     if not cwd:
         return ""
+    now = time.monotonic()
     cached = _PROJECT_KEYS.get(cwd)
     if cached is not None:
-        return cached
+        key, expires_at = cached
+        if expires_at > now:
+            return key
     key = os.path.basename(os.path.normpath(cwd))
     try:
         import subprocess
@@ -180,13 +228,21 @@ def checkout_project(cwd: str) -> str:
                 key = parent if key == parent else parent + "/" + key
     except Exception:  # noqa: BLE001 - no git (or no answer) means the folder name
         pass
-    _PROJECT_KEYS[cwd] = key
+    _PROJECT_KEYS[cwd] = (key, now + _PROJECT_KEY_TTL_S)
     return key
 
 
-def default_worker_port() -> str:
-    uid = os.getuid() if hasattr(os, "getuid") else 77
-    return str(37700 + uid % 100)
+def default_worker_port(data_directory: Optional[str] = None) -> str:
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid):
+        return str(37700 + getuid() % 100)
+    directory = os.path.expanduser(data_directory or data_dir())
+    if os.name == "nt" or ntpath.splitdrive(directory)[0]:
+        directory = ntpath.abspath(directory).lower()
+    else:
+        directory = os.path.abspath(directory)
+    offset = int.from_bytes(hashlib.sha256(directory.encode("utf-8")).digest()[:4], "big") % 100
+    return str(37700 + offset)
 
 
 class Config:
@@ -209,7 +265,7 @@ class Config:
     @classmethod
     def resolve(cls, environ: Optional[Dict[str, str]] = None) -> "Config":
         settings = load_settings(environ)
-        port = setting(settings, "CLAUDE_MEM_WORKER_PORT", default_worker_port(), environ)
+        port = setting(settings, "CLAUDE_MEM_WORKER_PORT", default_worker_port(data_dir(environ)), environ)
         host = setting(settings, "CLAUDE_MEM_WORKER_HOST", "127.0.0.1", environ)
         if ":" in host and not host.startswith("["):
             host = "[" + host + "]"
@@ -270,14 +326,22 @@ class Transport:
         if self.breaker.open():
             raise RequestFailed("breaker open")
         data = None if body is None else json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("content-type", "application/json")
-        for name, value in headers.items():
-            request.add_header(name, value)
         try:
+            request = urllib.request.Request(url, data=data, method=method)
+            request.add_header("content-type", "application/json")
+            for name, value in headers.items():
+                request.add_header(name, value)
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
-        except (urllib.error.URLError, OSError, ValueError) as error:
+        except urllib.error.HTTPError as error:
+            # A 4xx is a permanent client error: the same request fails the same
+            # way on every retry, so a burst of them must not silence the
+            # transport. Only a server-side or transport failure counts, which is
+            # what the breaker is for -- a 5xx may clear on its own.
+            if error.code >= 500:
+                self.breaker.fail()
+            raise RequestFailed(str(error)) from error
+        except (http.client.HTTPException, OSError, ValueError) as error:
             self.breaker.fail()
             raise RequestFailed(str(error)) from error
         self.breaker.ok()
@@ -317,12 +381,14 @@ def server_query(prompt: str, max_terms: int = 12) -> str:
     """The hosted server ANDs every word of a query, so a whole prompt would
     match almost nothing: keep its distinct longer words, joined with "or".
     Private blocks never leave the machine."""
-    words = re.findall(r"\w{4,}", _strip_text(prompt).lower())
-    distinct: List[str] = []
-    for word in words:
-        if word not in distinct:
-            distinct.append(word)
-    return " or ".join(distinct[:max_terms])
+    if max_terms <= 0:
+        return ""
+    distinct = {}
+    for match in re.finditer(r"\w{4,}", _strip_text(prompt).lower()):
+        distinct[match.group()] = None
+        if len(distinct) == max_terms:
+            break
+    return " or ".join(distinct)
 
 
 class Session:
@@ -350,6 +416,9 @@ class ClaudeMemClient:
         self.transport = transport or Transport(self.config)
         self._queue: "queue.Queue[Optional[Callable[[], None]]]" = queue.Queue(maxsize=queue_size)
         self._queue_full = queue.Full
+        self._queue_empty = queue.Empty
+        self._enqueue_lock = threading.Lock()
+        self._closed = False
         self._sessions: Dict[str, Session] = {}
         self._thread = threading.Thread(target=self._run, name="claude-mem-sender", daemon=True)
         self._thread.start()
@@ -369,10 +438,13 @@ class ClaudeMemClient:
                 self._queue.task_done()
 
     def _enqueue(self, job: Callable[[], None]) -> None:
-        try:
-            self._queue.put_nowait(job)
-        except self._queue_full:
-            pass  # a worker that is that far behind loses the newest writes, never the turn
+        with self._enqueue_lock:
+            if self._closed:
+                return
+            try:
+                self._queue.put_nowait(job)
+            except self._queue_full:
+                pass  # a worker that is that far behind loses the newest writes, never the turn
 
     def flush(self, timeout: float = 4.0) -> bool:
         """Wait up to ``timeout`` seconds for queued writes. True when drained."""
@@ -384,11 +456,20 @@ class ClaudeMemClient:
         return True
 
     def close(self, timeout: float = 4.0) -> None:
-        self.flush(timeout)
-        try:
-            self._queue.put_nowait(None)
-        except self._queue_full:
-            pass
+        with self._enqueue_lock:
+            if self._closed:
+                return
+            self._closed = True
+        if not self.flush(timeout):
+            # The shutdown budget expired. Retire unsent inputs rather than
+            # letting them run after shutdown, and reserve space for the stop.
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except self._queue_empty:
+                    break
+                self._queue.task_done()
+        self._queue.put_nowait(None)
 
     def _excluded(self, cwd: str) -> bool:
         # Checked here as well as by the worker, so nothing from an excluded
@@ -408,6 +489,13 @@ class ClaudeMemClient:
 
     def record_tool(self, session_id: str, cwd: str, tool_name: str, tool_input: Any,
                     tool_response: Any, tool_use_id: str = "") -> None:
+        try:
+            # The host may reuse its dictionaries as soon as this hook returns.
+            # Strip before capping, and retain our own snapshot for the sender.
+            tool_input = strip_tags(tool_input)
+            tool_response = strip_tags(text_of(tool_response))[:MAX_TOOL_RESPONSE]
+        except Exception:  # noqa: BLE001 - malformed capture must not break the host
+            return
         self._enqueue(lambda: self._record_tool(
             self._session(session_id), cwd, tool_name, tool_input, tool_response, tool_use_id))
 
@@ -416,6 +504,10 @@ class ClaudeMemClient:
 
     def save_note(self, session_id: str, cwd: str, text: str, title: str,
                   metadata: Dict[str, Any]) -> None:
+        try:
+            metadata = copy.deepcopy(metadata)
+        except Exception:  # noqa: BLE001 - keep the sender's fail-soft behavior
+            return
         self._enqueue(lambda: self._save_note(self._session(session_id), cwd, text, title, metadata))
 
     def _record_prompt(self, session: Session, cwd: str, prompt: str) -> None:
@@ -463,27 +555,25 @@ class ClaudeMemClient:
                 if reply.get("reason") == "project_excluded":
                     session.excluded = True
                     return
+                if reply.get("skipped") is True and reply.get("reason") != "duplicate":
+                    return
         except RequestFailed:
             return
         session.anchored = True
         session.last_prompt_recorded = True
 
     def _record_tool(self, session: Session, cwd: str, tool_name: str, tool_input: Any,
-                     tool_response: Any, tool_use_id: str) -> None:
+                     tool_response: str, tool_use_id: str) -> None:
         # A tool call belongs to the prompt before it: when the worker did not
         # record that prompt, the call is dropped rather than filed without one.
         if session.excluded or self._excluded(cwd) or (session.prompts_sent and not session.last_prompt_recorded):
             return
-        # Cut only after the tagged sections are gone: a cut through a section
-        # would leave its opening tag without the closing one.
-        response = strip_tags(text_of(tool_response))[:MAX_TOOL_RESPONSE]
-        tool_input = strip_tags(tool_input)
         try:
             if self.config.server:
                 if tool_name.lower() in self.config.skip_tools:
                     return
                 payload: Dict[str, Any] = {
-                    "tool_name": tool_name, "tool_input": tool_input, "tool_response": response,
+                    "tool_name": tool_name, "tool_input": tool_input, "tool_response": tool_response,
                     "cwd": cwd, "platformSource": PLATFORM_SOURCE,
                 }
                 if tool_use_id:
@@ -502,7 +592,7 @@ class ClaudeMemClient:
                     "contentSessionId": session.id,
                     "tool_name": tool_name,
                     "tool_input": tool_input,
-                    "tool_response": response,
+                    "tool_response": tool_response,
                     "platformSource": PLATFORM_SOURCE,
                     "cwd": cwd,
                 }
@@ -516,34 +606,47 @@ class ClaudeMemClient:
         self._sessions.pop(session.id, None)
         if not session.anchored or session.excluded or self._excluded(cwd):
             return
+        # Same gate as _record_tool: when the last prompt was wholly private the
+        # turn was never recorded, so its closing assistant message is dropped
+        # too — session.anchored is historical and does not cover the last turn.
+        # The session itself still ends: its earlier public turns were recorded.
+        last_turn_private = bool(session.prompts_sent and not session.last_prompt_recorded)
         try:
             if self.config.server:
-                reply = as_json(self.transport.server("POST", "/v1/sessions/start", {
-                    "projectId": self.config.project_id,
-                    "externalSessionId": session.id,
-                    "contentSessionId": session.id,
-                    "platformSource": PLATFORM_SOURCE,
-                }))
-                started = reply.get("session")
-                server_id = started.get("id") if isinstance(started, dict) else None
+                server_id = session.server_session_id
+                if not server_id:
+                    reply = as_json(self.transport.server("POST", "/v1/sessions/start", {
+                        "projectId": self.config.project_id,
+                        "externalSessionId": session.id,
+                        "contentSessionId": session.id,
+                        "platformSource": PLATFORM_SOURCE,
+                    }))
+                    started = reply.get("session")
+                    server_id = started.get("id") if isinstance(started, dict) else None
                 if not isinstance(server_id, str) or not server_id:
                     return
-                self.transport.server("POST", "/v1/events", {
-                    "projectId": self.config.project_id,
-                    "serverSessionId": server_id,
-                    "contentSessionId": session.id,
-                    "platformSource": PLATFORM_SOURCE,
-                    "sourceType": "hook",
-                    "eventType": "assistant_message",
-                    "occurredAtEpoch": int(time.time() * 1000),
-                    "payload": {"last_assistant_message": strip_tags(last_assistant_message),
-                                "platformSource": PLATFORM_SOURCE},
-                })
+                if not last_turn_private:
+                    try:
+                        self.transport.server("POST", "/v1/events", {
+                            "projectId": self.config.project_id,
+                            "serverSessionId": server_id,
+                            "contentSessionId": session.id,
+                            "platformSource": PLATFORM_SOURCE,
+                            "sourceType": "hook",
+                            "eventType": "assistant_message",
+                            "occurredAtEpoch": int(time.time() * 1000),
+                            "payload": {"last_assistant_message": strip_tags(last_assistant_message),
+                                        "platformSource": PLATFORM_SOURCE},
+                        })
+                    except RequestFailed:
+                        pass  # A failed summary should not prevent the session from ending.
                 self.transport.server("POST", "/v1/sessions/" + urllib.parse.quote(server_id, safe="") + "/end", {})
-            else:
+            elif not last_turn_private:
+                # The worker also skips summarize for a private last prompt;
+                # not sending the message at all keeps it off the wire.
                 self.transport.worker("POST", "/api/sessions/summarize", {
                     "contentSessionId": session.id,
-                    "last_assistant_message": last_assistant_message,
+                    "last_assistant_message": strip_tags(last_assistant_message),
                     "platformSource": PLATFORM_SOURCE,
                     "cwd": cwd,
                 })

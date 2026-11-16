@@ -18,12 +18,23 @@ import { ingestObservation, setIngestContext } from '../../src/services/worker/h
 
 const BASE64 = 'iVBORw0KGgoAAAANSUhEUg' + 'A'.repeat(300_000);
 
+// Structure of a real Claude Code Read image result: the MIME is `file.type`
+// (not `file.media_type`), with originalSize and dimensions beside the bytes.
+const realReadImageResult = (base64: string) => ({
+  type: 'image',
+  file: {
+    base64, type: 'image/png', originalSize: 225_016,
+    dimensions: { originalWidth: 1440, originalHeight: 900, displayWidth: 1440, displayHeight: 900 },
+  },
+});
+
 /** Post one observation through the HTTP ingest route and return what was queued. */
 async function ingest(toolName: string, toolInput: unknown, toolResponse: unknown) {
   let queued: any;
   setIngestContext({
     dbManager: { getSessionStore: () => ({ createSDKSession: () => 1, setSessionCwd: () => {},
-      getPromptNumberFromUserPrompts: () => 1, getUserPrompt: () => 'public fixture' }) } as any,
+      getPromptNumberFromUserPrompts: () => 1, getUserPrompt: () => 'public fixture',
+      isSessionDeleted: () => false, isBeforeSessionDeletion: () => false, hasCommittedToolUse: () => false }) } as any,
     sessionManager: { queueObservation: async (_id: number, observation: any) => { queued = observation; } } as any,
     eventBroadcaster: { broadcastObservationQueued: () => {} } as any,
     ensureGeneratorRunning: async () => {},
@@ -69,12 +80,17 @@ describe('observer image stripping on the real ingest path (#3606)', () => {
     // Claude Code returns an image file in this shape: `file.base64`, not
     // `source.data`, so the Anthropic branch of the stripper never matched it.
     const queued = await ingest('Read', { file_path: '/frames/0001.png' },
-      { type: 'image', file: { base64: BASE64, media_type: 'image/png' } });
+      realReadImageResult(BASE64));
     const { prompt, compressed } = await observe(queued);
 
     expect(compressed).toEqual([]);
     expect(prompt).not.toContain('iVBORw0KGgo');
     expect(/A{200,}/.test(prompt)).toBe(false);
+    // The text signal beside the bytes survives to the observer.
+    expect(prompt).toContain('image/png');
+    expect(prompt).toContain('originalWidth');
+    expect(prompt).not.toContain('reason="oversize"');
+    expect(prompt.length).toBeLessThan(4_000);
   });
 
   test('an Anthropic image block sends no base64 to the compressor or the prompt', async () => {
@@ -103,17 +119,6 @@ describe('observer image stripping on the real ingest path (#3606)', () => {
     expect(prompt).toContain('image/png');
   });
 
-  test('the observation still fits without being truncated', async () => {
-    // Stripping has to be what shrinks this, not the head/tail guard: an
-    // elided marker here would mean the image was still being measured.
-    const queued = await ingest('Read', { file_path: '/frames/0001.png' },
-      { type: 'image', file: { base64: BASE64 } });
-    const { prompt } = await observe(queued);
-
-    expect(prompt).not.toContain('reason="oversize"');
-    expect(prompt.length).toBeLessThan(4_000);
-  });
-
   test('oversized text still goes to the compressor — the condense pass is untouched', async () => {
     // Over the field cap, under the fallback window's condense ceiling.
     const wall = 'error: cannot open file\n'.repeat(8_000);
@@ -139,7 +144,7 @@ describe('observer image stripping on the real ingest path (#3606)', () => {
     // is the double-encoded string, so the prompt build has to be able to
     // strip it on its own.
     const queued = await ingest('Read', { file_path: '/frames/0001.png' },
-      { type: 'image', file: { base64: BASE64 } });
+      realReadImageResult(BASE64));
     const prompt = buildObservationPrompt({
       id: 0,
       tool_name: queued.tool_name,

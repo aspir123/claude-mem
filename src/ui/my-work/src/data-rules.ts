@@ -1,13 +1,14 @@
 // Sample data for the My Rules wireframe only (spec §14). The product shows real rule records or an empty state (§12).
 // Examples are neutral placeholders shaped like real standing preferences from instruction files and prompts.
+import type { WorkViewRule } from './live/work-view-api-types.ts'
 
-/** Scope hierarchy, in page order (§14): everywhere, then per product or project, then per situation. */
+/** Scope hierarchy, in page order (§14): everywhere, then per repo, then per situation. A repo is a tag on a rule, never a grouping of work. */
 export type RuleTier = 'everywhere' | 'project' | 'situation'
 export interface RuleScope { id: string; tier: RuleTier; name: string }
 
 export const RULE_TIERS: { tier: RuleTier; label: string }[] = [
   { tier: 'everywhere', label: 'Everywhere' },
-  { tier: 'project', label: 'In a product or project' },
+  { tier: 'project', label: 'In a repo' },
   { tier: 'situation', label: 'In a situation' },
 ]
 
@@ -24,7 +25,7 @@ export interface RuleQuote { at: string; quote: string; kind: 'directive' | 'cor
 /** The records a rule was built from: prompts, request-progress reviews, owner-goals runs, instruction files. */
 export interface RuleRecord { kind: 'Prompt' | 'Review' | 'Goals run' | 'Instructions'; label: string; at: string }
 
-export type RuleStatus = 'on' | 'off' | 'suggested' | 'replaced' | 'dismissed'
+export type RuleStatus = WorkViewRule['status']
 export interface OwnerRule {
   id: string
   scopeId: string
@@ -33,6 +34,7 @@ export interface OwnerRule {
   when: string
   then: string
   quotes: RuleQuote[]
+  quotesOmitted?: WorkViewRule['quotesOmitted']
   timesSeen: number
   latestAt: string
   /** For the strength sort: times seen × recency (§14). */

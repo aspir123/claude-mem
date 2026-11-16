@@ -142,6 +142,13 @@ export class LocalEmbedder implements Embedder {
     }
     const { last_hidden_state: hidden } = await model(inputs);
     const h = hidden.data as Float32Array;
+    const shape = hidden.dims as number[];
+    // Row offsets below use the configured embedding width. A different
+    // model output would silently pool values from another token or text.
+    if (rows !== texts.length || shape.length !== 3 || shape[0] !== rows
+      || shape[1] !== width || shape[2] !== this.dims || h.length !== rows * width * this.dims) {
+      throw new Error(`Unexpected embedding tensor shape [${shape}] for ${texts.length} texts; expected [${texts.length},${width},${this.dims}]`);
+    }
     // Mean over the real tokens (or the first token's vector), then unit
     // length, so cosine reduces to a dot product at query time.
     return texts.map((_, r) => {
@@ -161,6 +168,12 @@ export class LocalEmbedder implements Embedder {
       let norm = 0;
       for (let d = 0; d < this.dims; d++) norm += v[d] * v[d];
       norm = Math.sqrt(norm);
+      // A zero/invalid model result cannot be normalized or stored in pgvector.
+      // Reject here so callers use their existing keyword/no-vector fallback,
+      // before an unusable embedding can fail an observation transaction.
+      if (!Number.isFinite(norm) || norm === 0) {
+        throw new Error(`Invalid embedding norm for text ${r}: expected a positive finite value`);
+      }
       for (let d = 0; d < this.dims; d++) v[d] /= norm;
       return v;
     });

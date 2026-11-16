@@ -2,16 +2,17 @@ import { createHash, randomBytes } from 'crypto';
 import { existsSync, linkSync, mkdirSync, opendirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { writeJsonFileAtomic } from './atomic-json.js';
-import { resolveDataDir } from './paths.js';
+import { ensurePrivateDir, resolveDataDir } from './paths.js';
 import { normalizePlatformSource } from './platform-source.js';
 import { logger } from '../utils/logger.js';
 import type { AgentRole, InstructionState, WorkStateOutcome } from './work-state-telemetry.js';
 
 /**
- * Durable hand-off from short-lived write hooks to the worker.
+ * Durable metadata hand-off from short-lived hooks to the worker.
  *
- * A write hook (PostToolUse observation, file edit, Stop summarize + advisor
- * calls, SessionEnd) writes ONE file per event here and exits; it never waits
+ * Only metadata (advisor records, SessionEnd, deliverables, usage) is written
+ * here. Observation/edit/summary shapes remain readable for upgrade cleanup.
+ * Live observer inputs use the non-durable handoff instead. Metadata never waits
  * for the worker. The worker drains the directory in order (boot, a nudge from
  * the hook, an fs.watch of the directory, and a slow safety sweep).
  *
@@ -30,8 +31,10 @@ import type { AgentRole, InstructionState, WorkStateOutcome } from './work-state
  * each file all-or-nothing.
  */
 
-export const HOOK_SPOOL_KINDS = ['observation', 'file_edit', 'summarize', 'session_end', 'subagent_stop', 'advisor_calls', 'work_state_telemetry'] as const;
+export const HOOK_SPOOL_KINDS = ['observation', 'file_edit', 'summarize', 'session_end', 'subagent_stop', 'advisor_calls', 'deliverables', 'work_state_telemetry'] as const;
 export type HookSpoolKind = typeof HOOK_SPOOL_KINDS[number];
+/** Inference kinds are legacy read/wire shapes, not writable spool kinds. */
+export type DurableHookSpoolKind = Exclude<HookSpoolKind, 'observation' | 'file_edit' | 'summarize'>;
 
 export interface SpooledObservationPayload {
   contentSessionId: string;
@@ -39,12 +42,16 @@ export interface SpooledObservationPayload {
   /** Preserve missing host attribution separately from the legacy DB default. */
   telemetryPlatformSource?: string;
   toolName: string;
+  /** Exact host tool name before normalization, retained for configured exclusions. */
+  nativeToolName?: string;
   toolInput?: unknown;
   toolResponse?: unknown;
   cwd?: string;
   agentId?: string;
   agentType?: string;
   toolUseId?: string;
+  /** When the tool use happened at its source; see ObservationPayload.eventOccurredAtEpochMs. */
+  eventOccurredAtEpochMs?: number | null;
 }
 
 export interface SpooledSummarizePayload {
@@ -87,6 +94,46 @@ export interface SpooledAdvisorCallsPayload {
   calls: SpooledAdvisorCall[];
 }
 
+/** One file the Stop hook copied into the project's deliverables bucket (src/shared/deliverables.ts). */
+export interface SpooledDeliverable {
+  /** Where the agent made it; may be gone by the time anyone looks. */
+  sourcePath: string;
+  /** The bucket copy: ~/.claude-mem/deliverables/<project>/<stem>-<hash><ext>. */
+  bucketPath: string;
+  title: string;
+  /** work-product.mjs kind: deck, document, page, image, video, spreadsheet, or file. */
+  kind: string;
+  bytes: number;
+  sha256: string;
+  /** True when an agent attached it through a work-state field; false when the hook inferred it from a write. */
+  declared: boolean;
+  list?: string | null;
+  field?: string | null;
+  toolUseId?: string | null;
+  occurredAtEpoch: number;
+}
+
+/**
+ * Bound on `errors` in one deliverables event: the remote spool schema
+ * (hook-spool-remote.ts) admits this many, and the hook keeps to it
+ * (deliverables-capture.ts boundedErrors) so a turn with more failures than
+ * this never costs the records of the files that did copy.
+ */
+export const DELIVERABLE_ERRORS_PER_EVENT = 128;
+
+/** The Stop (or SubagentStop) hook's deliverables for one turn, already copied into the bucket. */
+export interface SpooledDeliverablesPayload {
+  contentSessionId: string;
+  platformSource: string;
+  cwd: string;
+  /** The checkout's primary project key, which names the bucket folder. */
+  project: string;
+  agentId?: string;
+  files: SpooledDeliverable[];
+  /** Files that could not be copied (missing, unreadable, over the limit): recorded in the worker log, never dropped silently. */
+  errors?: Array<{ sourcePath: string; error: string }>;
+}
+
 export interface HookSpoolPayloadByKind {
   observation: SpooledObservationPayload;
   file_edit: SpooledObservationPayload;
@@ -94,6 +141,7 @@ export interface HookSpoolPayloadByKind {
   session_end: SpooledSessionEndPayload;
   subagent_stop: SpooledSubagentStopPayload;
   advisor_calls: SpooledAdvisorCallsPayload;
+  deliverables: SpooledDeliverablesPayload;
   work_state_telemetry: {
     contentSessionId: string;
     platformSource: string;
@@ -149,6 +197,12 @@ export function remoteHookSpoolReceivedKey(receipt: string): string {
 const ENTRY_FILENAME = /^[a-z_]+-[A-Za-z0-9_-]+\.json$/;
 const FILENAME_SAFE_TOOL_USE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const CORRUPT_DIRNAME = 'corrupt';
+/**
+ * Spool entries carry captured prompts, tool inputs and file paths, so a new entry is written
+ * readable by its owner only; the directory that holds them gets the same treatment.
+ */
+const SPOOL_ENTRY_MODE = 0o600;
+
 const EXPIRED_DIRNAME = 'expired';
 
 /**
@@ -254,6 +308,9 @@ function parseHookSpoolEntry(raw: string): HookSpoolEntry | { corruptReason: str
   if (kind === 'advisor_calls' && (!Array.isArray(payload.calls) || payload.calls.length === 0)) {
     return { corruptReason: 'advisor_calls payload has no calls' };
   }
+  if (kind === 'deliverables' && (!Array.isArray(payload.files) || payload.files.length === 0 || !isNonEmptyString(payload.project))) {
+    return { corruptReason: 'deliverables payload has no files or no project' };
+  }
   if (kind === 'work_state_telemetry' && (
     !isNonEmptyString(payload.eventId)
     || !['main', 'subagent', 'unknown', undefined].includes(payload.agentRole as any)
@@ -300,7 +357,7 @@ export class HookSpool {
    * `requestedAtEpochMs` is for carrying an existing timestamp over (legacy
    * migration, tests); hooks omit it and get a per-process monotonic now.
    */
-  enqueue<K extends HookSpoolKind>(
+  enqueue<K extends DurableHookSpoolKind>(
     kind: K,
     payload: HookSpoolPayloadByKind[K],
     requestedAtEpochMs?: number,
@@ -325,7 +382,8 @@ export class HookSpool {
       }
     }
     const enqueuedAtEpochMs = this.existingEnqueuedAt(entryPath) ?? requestedAtEpochMs ?? monotonicNowEpochMs();
-    writeJsonFileAtomic(entryPath, { kind, payload: normalizedPayload, enqueuedAtEpochMs });
+    ensurePrivateDir(this.directory);
+    writeJsonFileAtomic(entryPath, { kind, payload: normalizedPayload, enqueuedAtEpochMs }, { mode: SPOOL_ENTRY_MODE });
     return entryPath;
   }
 
@@ -355,7 +413,8 @@ export class HookSpool {
     const receipt = remoteHookSpoolReceipt(entry);
     const receivedKey = remoteHookSpoolReceivedKey(receipt);
     if (!consumedMarkers.isConsumed(receipt) && !consumedMarkers.isConsumed(receivedKey)) {
-      writeJsonFileAtomic(join(this.directory, `${receipt}.json`), entry);
+      ensurePrivateDir(this.directory);
+      writeJsonFileAtomic(join(this.directory, `${receipt}.json`), entry, { mode: SPOOL_ENTRY_MODE });
       consumedMarkers.markConsumed(receivedKey, Date.now());
     }
     return receipt;

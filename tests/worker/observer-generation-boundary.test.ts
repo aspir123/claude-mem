@@ -28,7 +28,7 @@ const { ClassifiedProviderError } = await import('../../src/services/worker/prov
 const { handleGeneratorExit } = await import('../../src/services/worker/session/GeneratorExitHandler.js');
 const { logger } = await import('../../src/utils/logger.js');
 
-const RESTARTS = 1_000;
+const RESTARTS = 2;
 
 type FailureKind = 'quota_exhausted' | 'auth_invalid' | 'transient';
 type FailurePoint = 'init' | 'observation';
@@ -113,6 +113,8 @@ function makeSessionManager() {
     getMessageBuffer: () => ({ getPendingCount: () => 1 }),
     resetProcessingToPending: async () => 0,
     removeSessionImmediate: mock(() => {}),
+    clearPendingForSession: mock(async () => 1),
+    discardBufferedWork: mock(() => 1),
   };
 }
 
@@ -179,12 +181,15 @@ describe('every HTTP generator start opens a new generation (#3479)', () => {
         });
       }
 
-      // The session and its queue survived every pause...
+      // The session identity survives; quota/auth inputs are discarded.
       expect(finalizeSession).not.toHaveBeenCalled();
       expect(sessionManager.removeSessionImmediate).not.toHaveBeenCalled();
-      // ...and the history holds the last attempt only: one init prompt, not 1,000.
+      if (exitCategory === 'quota' || exitCategory === 'auth') {
+        expect(sessionManager.discardBufferedWork).toHaveBeenCalledTimes(RESTARTS);
+      }
+      // The history holds the last attempt only: one init prompt, not earlier attempts.
       expect(session.conversationHistory.map(message => message.role)).toEqual(EXPECTED_ROLES[failurePoint]);
       expect(session.conversationHistory.filter(message => message.content.includes('<user_request>'))).toHaveLength(1);
-    }, 30_000);
+    });
   }
 });

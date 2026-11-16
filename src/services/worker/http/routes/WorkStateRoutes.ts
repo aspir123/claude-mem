@@ -10,14 +10,19 @@ import { getProjectContext } from '../../../../utils/project-name.js';
 import { logger } from '../../../../utils/logger.js';
 import type { WorkStateFields } from '../../../sqlite/work-state.js';
 import { isMyRulesList } from '../../../work-view/my-rules.mjs';
+import { isForeignBrowserRead, isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
+import { isMyFocusList } from '../../../work-view/my-focus.mjs';
+import { GOAL_KINDS, isOwnerGoalsList } from '../../../work-view/owner-goals.mjs';
+import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from '../../../work-view/work-state-limits.mjs';
+import { isSharedWorkList } from '../../../work-view/shared-records.mjs';
+import { isClosedWorkStateStatus } from '../../../work-view/work-state-status.mjs';
 import {
   fitWorkStateLines,
   renderWorkStateLines,
   WORK_STATE_SECTION_CHARACTER_LIMIT,
 } from '../../../context/sections/WorkStateRenderer.js';
 
-/** One write is a few short fields; anything bigger would crowd the SessionStart section. */
-export const MAX_WORK_STATE_FIELDS_JSON_CHARS = 2_000;
+export { MAX_WORK_STATE_FIELDS_JSON_CHARS };
 
 // z.record intentionally drops __proto__; here every field is a primitive,
 // so validate own entries and copy with spread to keep literal data keys safely.
@@ -33,8 +38,8 @@ const workStateFieldsSchema = z.custom<WorkStateFields>(value =>
 ).transform(fields => ({ ...fields }));
 
 const workStateWriteSchema = z.object({
-  cwd: z.string().trim().min(1),
-  list: z.string().trim().min(1).max(200),
+  cwd: z.string().refine(cwd => cwd.trim().length > 0, 'cwd is required'),
+  list: z.string().trim().min(1).max(200).refine(list => !isSharedWorkList(list), 'This list is reserved for shared My Work records'),
   fields: workStateFieldsSchema
     .refine(fields => Object.keys(fields).length > 0, 'fields must set at least one key')
     .refine(
@@ -42,6 +47,17 @@ const workStateWriteSchema = z.object({
       `fields must be at most ${MAX_WORK_STATE_FIELDS_JSON_CHARS} characters as JSON`,
     ),
 });
+
+/** Why an owner-goals row cannot be saved, or null. List state rows and a row that only closes an item need no kind. */
+export function ownerGoalsRowRefusal(fields: WorkStateFields): string | null {
+  if (fields.task == null || fields.task === '') return null;
+  const onlyCloses = Object.keys(fields).every(key => key === 'task' || key === 'status') && isClosedWorkStateStatus(fields.status);
+  if (onlyCloses && !('goal_kind' in fields)) return null;
+  if (!(GOAL_KINDS as unknown[]).includes(fields.goal_kind)) {
+    return `an owner-goals item needs goal_kind ${GOAL_KINDS.map(kind => `"${kind}"`).join(' or ')}; got ${JSON.stringify(fields.goal_kind ?? null)}.`;
+  }
+  return null;
+}
 
 /**
  * Surface for `work_state_entries`, the agent's canonical to-do lists and
@@ -57,10 +73,18 @@ export class WorkStateRoutes extends BaseRouteHandler {
 
   setupRoutes(app: express.Application): void {
     app.post('/api/work-state/entries', validateBody(workStateWriteSchema), this.handleWrite.bind(this));
-    app.get('/api/work-state', this.handleRead.bind(this));
+    app.get('/api/work-state', this.handleRead());
+    app.get('/api/work-state/export', this.handleRead(true));
   }
 
   private handleWrite = this.wrapHandler((req: Request, res: Response): void => {
+    // These rows are the agent's canonical to-do lists, so other localhost pages
+    // may not write them. Origin-less callers (the work_state_write MCP tool,
+    // save_goals.py) keep the existing loopback-trust model.
+    if (isForeignLoopbackBrowserWrite(req)) {
+      res.status(403).json({ error: 'Work-state writes from a different localhost origin are not allowed' });
+      return;
+    }
     const { cwd, list, fields } = req.body as z.infer<typeof workStateWriteSchema>;
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
 
@@ -76,6 +100,18 @@ export class WorkStateRoutes extends BaseRouteHandler {
     if (isMyRulesList(list)) {
       res.status(403).send(`Not saved: "${list}" is written only from My Rules in the claude-mem viewer.`);
       return;
+    }
+    // My Focus rows are the owner's areas and placements; only the origin-checked /api/work-view/focus handler writes them.
+    if (isMyFocusList(list)) {
+      res.status(403).send(`Not saved: "${list}" is written only from My Focus in the claude-mem viewer.`);
+      return;
+    }
+
+    // Goals rows are validated, not blocked: save_goals.py writes them here. An item of a kind My Work cannot read
+    // would stop the whole view (the reader throws rather than guess), so it is refused at the door.
+    if (isOwnerGoalsList(list)) {
+      const refusal = ownerGoalsRowRefusal(fields);
+      if (refusal) { res.status(400).send(`Not saved: ${refusal}`); return; }
     }
 
     const checkout = getProjectContext(cwd);
@@ -93,9 +129,17 @@ export class WorkStateRoutes extends BaseRouteHandler {
       : `${saved} Nothing in it is open now.`);
   });
 
-  private handleRead = this.wrapHandler((req: Request, res: Response): void => {
-    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';
-    if (!cwd) {
+  private handleRead = (exportHistory = false) => this.wrapHandler((req: Request, res: Response): void => {
+    // The read still resolves the project from `cwd`, and that resolution runs
+    // `git` in it (findGitRepoRoot), so another browser page must not choose
+    // the directory, even with a no-cors fetch that sends no Origin. Hooks, the
+    // CLI and the MCP tool send no browser headers and keep working.
+    if (isForeignBrowserRead(req)) {
+      res.status(403).json({ error: 'Forbidden', message: 'Work-state reads from another browser page are not allowed' });
+      return;
+    }
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : '';
+    if (!cwd.trim()) {
       this.badRequest(res, 'cwd is required');
       return;
     }
@@ -104,6 +148,14 @@ export class WorkStateRoutes extends BaseRouteHandler {
 
     const checkout = getProjectContext(cwd);
     const entries = this.dbManager.getSessionStore().getWorkStateEntries(checkout.allProjects, list);
+    // Export the ordered patches, including closures and cleared fields, rather
+    // than the presentation text that an MCP client may have to shorten.
+    if (exportHistory) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Disposition', 'attachment; filename="work-state.json"');
+      res.json({ version: 1, project: checkout.primary, projects: checkout.allProjects, list: list ?? null, entries });
+      return;
+    }
     const lines = renderWorkStateLines(entries, Date.now(), includeClosed);
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { chmodSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -11,6 +11,7 @@ import {
 import {
   createInstallSummary,
   installerError,
+  clearLastInstallError,
   flushSummary,
   InstallAbortError,
 } from '../src/npx-cli/install/error-reporter';
@@ -22,28 +23,7 @@ import {
   runNpmStrict,
 } from '../src/npx-cli/install/npm-install-helper';
 
-const CANONICAL_IDES = [
-  'claude-code',
-  'opencode',
-  'openclaw',
-  'windsurf',
-  'codex-cli',
-  'cursor',
-  'grok-bot',
-  'copilot-cli',
-  'antigravity',
-  'goose',
-  'roo-code',
-  'warp',
-];
-
 describe('error taxonomy', () => {
-  it('exposes ErrorSeverity, ERROR_CATEGORIES, classifyError', () => {
-    expect(ErrorSeverity.ABORT).toBe('ABORT');
-    expect(Array.isArray(ERROR_CATEGORIES)).toBe(true);
-    expect(ERROR_CATEGORIES.length).toBeGreaterThanOrEqual(12);
-  });
-
   it('has no SILENT severity', () => {
     const severities = new Set(ERROR_CATEGORIES.map((c) => c.severity));
     expect(severities.has('SILENT' as ErrorSeverity)).toBe(false);
@@ -181,6 +161,46 @@ describe('installerError decision logic', () => {
     expect(record.details).toContain('While resolving');
   });
 
+  // The record describes an aborted run. Nothing removed it, so doctor kept
+  // showing an old error and its advice after later runs succeeded (#4858).
+  it('a finished run clears the record of an earlier abort', () => {
+    const recordPath = join(home, 'last-install-error.json');
+    expect(() => installerError(ErrorSeverity.ABORT, {
+      component: 'marketplace-npm-install',
+      phase: 'marketplace-deps',
+      cause: new Error('npm error code ERESOLVE'),
+    }, createInstallSummary())).toThrow(InstallAbortError);
+    expect(existsSync(recordPath)).toBe(true);
+
+    clearLastInstallError();
+    expect(existsSync(recordPath)).toBe(false);
+    // Nothing to clear is not an error.
+    expect(() => clearLastInstallError()).not.toThrow();
+  });
+
+  // Clearing runs after the install already finished, so a record that cannot
+  // be removed must not turn that success into a failed command; it warns.
+  it('a record that cannot be removed warns instead of failing the finished run', () => {
+    const recordPath = join(home, 'last-install-error.json');
+    // A directory at the record's path makes the non-recursive remove throw on every platform.
+    mkdirSync(join(recordPath, 'blocker'), { recursive: true });
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.join(' ')); };
+    try {
+      expect(() => clearLastInstallError()).not.toThrow();
+    } finally {
+      console.warn = originalWarn;
+    }
+    expect(warnings.join('\n')).toContain('last-install-error.json');
+  });
+
+  it('install and repair clear the record only after their run finishes', () => {
+    const source = readFileSync(join(import.meta.dir, '..', 'src', 'npx-cli', 'commands', 'install.ts'), 'utf-8');
+    expect(source).toMatch(/await runInstallCommandInner\(options, summary\);\r?\n\s*clearLastInstallError\(\);/);
+    expect(source).toMatch(/await runRepairCommandInner\(summary\);\r?\n\s*clearLastInstallError\(\);/);
+  });
+
   it('WARN_CONTINUE appends to summary and does not throw', () => {
     const summary = createInstallSummary();
     installerError(ErrorSeverity.WARN_CONTINUE, {
@@ -310,69 +330,7 @@ describe('npm install EALLOWSCRIPTS', () => {
   });
 });
 
-/**
- * Cross-IDE failure-mode matrix. We exercise the taxonomy/decision logic that
- * drives each install outcome for every IDE without spawning real npm/bun (the
- * directive: test the decision logic + summary rendering, not the network).
- *
- * For each IDE × scenario we assert: the install STATUS (Complete vs Partial vs
- * Aborted), whether an InstallAbortError is thrown, exit semantics (would-exit-1),
- * and that remediation text is present where expected.
- */
-type Scenario = 'happy' | 'eresolve' | 'missing-uv' | 'missing-bun';
-
-interface Outcome {
-  status: 'Complete' | 'Partial' | 'Aborted';
-  aborted: boolean;
-  remediation?: string;
-}
-
-/**
- * Pure model of the installer's decision path for one IDE + one failure mode.
- * Mirrors how install.ts routes each scenario through installerError.
- */
-function simulateInstall(_ide: string, scenario: Scenario): Outcome {
-  const summary = createInstallSummary();
-  try {
-    switch (scenario) {
-      case 'happy':
-        // no errors -> Complete
-        break;
-      case 'eresolve':
-        installerError(ErrorSeverity.ABORT, {
-          component: 'marketplace-npm-install',
-          phase: 'marketplace-deps',
-          cause: new Error('npm error code ERESOLVE\nWhile resolving: tree-sitter'),
-        }, summary);
-        break;
-      case 'missing-uv':
-        installerError(ErrorSeverity.ABORT, {
-          component: 'uv-install',
-          phase: 'setup-runtime',
-          cause: new Error('uv binary not found after auto-install attempt'),
-        }, summary);
-        break;
-      case 'missing-bun':
-        installerError(ErrorSeverity.ABORT, {
-          component: 'bun-install',
-          phase: 'setup-runtime',
-          cause: new Error('Bun executable not found after auto-install attempt'),
-        }, summary);
-        break;
-    }
-  } catch (e) {
-    if (e instanceof InstallAbortError) {
-      return { status: 'Aborted', aborted: true, remediation: e.remediation };
-    }
-    throw e;
-  }
-  const status = summary.failedIDEs.length > 0 ? 'Partial' : 'Complete';
-  return { status, aborted: false };
-}
-
-describe('cross-IDE failure matrix (11 IDEs x 4 scenarios)', () => {
-  const scenarios: Scenario[] = ['happy', 'eresolve', 'missing-uv', 'missing-bun'];
-
+describe('failure remediation', () => {
   let prevMatrixDataDir: string | undefined;
   beforeEach(() => {
     prevMatrixDataDir = process.env.CLAUDE_MEM_DATA_DIR;
@@ -389,34 +347,21 @@ describe('cross-IDE failure matrix (11 IDEs x 4 scenarios)', () => {
     else process.env.CLAUDE_MEM_DATA_DIR = prevMatrixDataDir;
   });
 
-  it('produces 48 cells (12 IDEs x 4 scenarios)', () => {
-    expect(CANONICAL_IDES.length * scenarios.length).toBe(48);
-  });
-
-  for (const ide of CANONICAL_IDES) {
-    for (const scenario of scenarios) {
-      it(`${ide} / ${scenario}`, () => {
-        const outcome = simulateInstall(ide, scenario);
-        if (scenario === 'happy') {
-          expect(outcome.status).toBe('Complete');
-          expect(outcome.aborted).toBe(false);
-        } else {
-          // Every failure mode must ABORT (exit 1) — never "Complete".
-          expect(outcome.status).toBe('Aborted');
-          expect(outcome.aborted).toBe(true);
-          expect(outcome.remediation && outcome.remediation.length).toBeGreaterThan(0);
-        }
-
-        if (scenario === 'missing-uv') {
-          expect(outcome.remediation).toContain('uv');
-        }
-        if (scenario === 'missing-bun') {
-          expect(outcome.remediation).toContain('Bun');
-        }
-        if (scenario === 'eresolve') {
-          expect(outcome.remediation).toContain('ERESOLVE');
-        }
-      });
+  it.each([
+    ['uv-install', 'setup-runtime', 'uv binary not found after auto-install attempt', 'uv'],
+    ['bun-install', 'setup-runtime', 'Bun executable not found after auto-install attempt', 'Bun'],
+    ['marketplace-npm-install', 'marketplace-deps', 'npm error code ERESOLVE\nWhile resolving: tree-sitter', 'ERESOLVE'],
+  ])('%s reports actionable remediation', (component, phase, message, expected) => {
+    try {
+      installerError(ErrorSeverity.ABORT, {
+        component,
+        phase,
+        cause: new Error(message),
+      }, createInstallSummary());
+      throw new Error('Expected InstallAbortError');
+    } catch (error) {
+      expect(error).toBeInstanceOf(InstallAbortError);
+      expect((error as InstallAbortError).remediation).toContain(expected);
     }
-  }
+  });
 });

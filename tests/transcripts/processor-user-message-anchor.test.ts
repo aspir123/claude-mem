@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { TranscriptSchema, WatchTarget } from '../../src/services/transcripts/types.js';
-import { TranscriptAnchorError, TranscriptEventProcessor } from '../../src/services/transcripts/processor.js';
+import { TranscriptEventProcessor } from '../../src/services/transcripts/processor.js';
 import { TranscriptWatcher } from '../../src/services/transcripts/watcher.js';
 import * as realSessionInit from '../../src/cli/handlers/session-init.js';
 import * as realWorkerUtils from '../../src/shared/worker-utils.js';
@@ -20,12 +20,13 @@ afterAll(() => {
 });
 
 const sessionInitCalls: Array<{ sessionId?: string; prompt?: string; platform?: string }> = [];
-// Set to make the next session-init call fail, as an unreachable worker does.
-let failNextSessionInit = false;
+// While set, session-init calls fail, as an unreachable worker's do. It stays
+// set until the test clears it: macOS can deliver a late fs.watch event for the
+// file's initial write, which retries the turn before the test restarts.
+let sessionInitFails = false;
 
 const fakeSessionInit = async (input: { sessionId?: string; prompt?: string; platform?: string }) => {
-  if (failNextSessionInit) {
-    failNextSessionInit = false;
+  if (sessionInitFails) {
     throw new Error('Unable to connect (ECONNREFUSED)');
   }
   sessionInitCalls.push(input);
@@ -93,6 +94,7 @@ describe('TranscriptEventProcessor user_message anchoring', () => {
   });
 
   afterEach(() => {
+    sessionInitFails = false;
     sessionInitCalls.length = 0;
   });
 
@@ -105,10 +107,11 @@ describe('TranscriptEventProcessor user_message anchoring', () => {
     expect(sessionInitCalls[0].platform).toBe('codex');
   });
 
-  it('reports a failed anchor as a TranscriptAnchorError', async () => {
-    failNextSessionInit = true;
+  it('skips a failed anchor without retaining a retry', async () => {
+    sessionInitFails = true;
     await expect(processor.processEntry(userMessagePayload('Fix the login bug'), watch, schema))
-      .rejects.toBeInstanceOf(TranscriptAnchorError);
+      .resolves.toBeUndefined();
+    expect(sessionInitCalls).toEqual([]);
   });
 });
 
@@ -121,32 +124,33 @@ describe('TranscriptWatcher with a failed anchor (#3653)', () => {
   });
 
   afterEach(() => {
-    failNextSessionInit = false;
+    sessionInitFails = false;
     rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  it('does not checkpoint past an unanchored turn, so a restarted watcher replays it', async () => {
+  it('checkpoints past an unanchored turn without replaying it after restart', async () => {
     const filePath = join(tmpRoot, 'rollout.jsonl');
     const statePath = join(tmpRoot, 'state.json');
     const fileWatch: WatchTarget = { name: 'codex-legacy', path: filePath, schema };
     writeFileSync(filePath, `${JSON.stringify(userMessagePayload('Ship the fix'))}\n`);
 
-    failNextSessionInit = true;
+    sessionInitFails = true;
     const watcher = new TranscriptWatcher({ version: 1, watches: [] }, statePath);
     await (watcher as any).addTailer(filePath, fileWatch, schema);
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await (watcher as any).tailers.get(filePath).readTask;
     watcher.stop();
+    sessionInitFails = false;
 
     expect(sessionInitCalls).toHaveLength(0);
-    // Checkpointed AT the failed turn's line (the first line here), not past it.
+    // The failed handoff is consumed; the transcript itself is preserved.
     const offsets = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')).offsets : {};
-    expect(offsets[filePath] ?? 0).toBe(0);
+    expect(offsets[filePath]).toBe(Buffer.byteLength(readFileSync(filePath)));
 
     const restarted = new TranscriptWatcher({ version: 1, watches: [] }, statePath);
     await (restarted as any).addTailer(filePath, fileWatch, schema);
-    await new Promise(resolve => setTimeout(resolve, 50));
+    await (restarted as any).tailers.get(filePath).readTask;
     restarted.stop();
 
-    expect(sessionInitCalls.map(call => call.prompt)).toEqual(['Ship the fix']);
+    expect(sessionInitCalls).toEqual([]);
   });
 });

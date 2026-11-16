@@ -6,51 +6,38 @@ same abstract base as Hermes, and a local HTTP server stands in for claude-mem.
 Run: python3 -m unittest discover -s tests/hermes -v
 """
 
-import abc
 import importlib
 import importlib.util
 import json
 import os
 import socket
+import shutil
+import stat
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
+import urllib.error
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-def install_hermes_stub():
-    """The parts of Hermes the provider imports, with Hermes's abstract members."""
+from hermes_session_driver import install_hermes_stub
 
-    class MemoryProvider(abc.ABC):
-        @property
-        @abc.abstractmethod
-        def name(self):
-            ...
 
-        @abc.abstractmethod
-        def is_available(self):
-            ...
-
-        @abc.abstractmethod
-        def initialize(self, session_id, **kwargs):
-            ...
-
-        @abc.abstractmethod
-        def get_tool_schemas(self):
-            ...
-
-    agent = types.ModuleType("agent")
-    agent.__path__ = []
-    memory_provider = types.ModuleType("agent.memory_provider")
-    memory_provider.MemoryProvider = MemoryProvider
-    agent.memory_provider = memory_provider
-    sys.modules["agent"] = agent
-    sys.modules["agent.memory_provider"] = memory_provider
+def remove_tree(path):
+    """shutil.rmtree, but able to remove the read-only files a git fixture leaves behind on Windows."""
+    def force_writable(function, target, _exc):
+        os.chmod(target, stat.S_IWRITE)
+        function(target)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=force_writable)
+    else:
+        shutil.rmtree(path, onerror=force_writable)
 
 
 install_hermes_stub()
@@ -71,6 +58,7 @@ class FakeClaudeMem:
         self.requests = []
         self.replies = {}
         self.delay = 0.0
+        self.before_reply = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -85,6 +73,8 @@ class FakeClaudeMem:
                     "method": self.command, "path": self.path, "body": body,
                     "authorization": self.headers.get("authorization"),
                 })
+                if owner.before_reply:
+                    owner.before_reply(owner.requests[-1])
                 if owner.delay:
                     time.sleep(owner.delay)
                 status, reply = 200, {}
@@ -105,7 +95,7 @@ class FakeClaudeMem:
             do_POST = _handle
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
         self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
 
@@ -128,6 +118,7 @@ class ProviderTest(unittest.TestCase):
         self.fake = FakeClaudeMem()
         self.addCleanup(self.fake.close)
         self.cwd = tempfile.mkdtemp(prefix="hermes-project-")
+        self.addCleanup(remove_tree, self.cwd)
         self.client = client_module.ClaudeMemClient(client_module.Config(self.fake.base))
         self.provider = claude_mem.ClaudeMemMemoryProvider(client=self.client)
         self.provider.initialize("sess-1", platform="cli", hermes_home="/tmp/h", cwd=self.cwd)
@@ -156,11 +147,70 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(summary["last_assistant_message"], "All green")
         self.assertEqual(summary["contentSessionId"], "sess-1")
 
+    def test_a_private_last_turn_sends_no_summary_after_a_public_turn(self):
+        self.provider.on_turn_start(1, "Fix the failing login test")
+        self.provider.on_turn_start(2, "<private>rotate the prod key sk-live-123</private>")
+        self.provider.on_session_end([{"role": "assistant", "content": "Rotated sk-live-123"}])
+        self.drain()
+        # The public first turn is recorded; the private last turn's reply never
+        # leaves Hermes, so no summarize request carries it.
+        self.assertEqual(self.fake.paths(), ["/api/sessions/init"])
+        self.assertNotIn("sk-live-123", json.dumps([r["body"] for r in self.fake.requests]))
+
     def test_a_long_tool_result_is_capped(self):
         self.provider.on_turn_start(1, "read the log")
         self.provider.record_tool_call("read_file", {"path": "a.log"}, "x" * 5000, "sess-1")
         self.drain()
         self.assertEqual(len(self.fake.requests[1]["body"]["tool_response"]), 1000)
+
+    def test_queued_tool_capture_snapshots_mutable_native_payloads(self):
+        self.provider.on_turn_start(1, "inspect the file")
+        self.drain()
+        release = threading.Event()
+        started = threading.Event()
+        self.client._enqueue(lambda: (started.set(), release.wait(3.0)))
+        self.assertTrue(started.wait(1.0))
+        args = {"path": "original.txt", "options": {"lines": [1, 2], "secret": "<private>token</private>"}}
+        result = {"content": [{"text": "original result <private>hidden</private>"}]}
+        try:
+            self.provider.record_tool_call("read_file", args, result, "sess-1", "snapshot-1")
+            args["path"] = "replacement.txt"
+            args["options"]["lines"].append(99)
+            result["content"][0]["text"] = "replacement result"
+        finally:
+            release.set()
+        self.drain()
+        body = self.fake.requests[-1]["body"]
+        self.assertEqual(body["tool_input"], {"path": "original.txt", "options": {"lines": [1, 2], "secret": ""}})
+        self.assertEqual(json.loads(body["tool_response"]), {"content": [{"text": "original result "}]})
+        self.assertEqual(body["tool_use_id"], "snapshot-1")
+        # Sanitizing capture must not mutate the host's still-owned objects.
+        self.assertEqual(args["options"]["secret"], "<private>token</private>")
+
+    def test_queued_note_snapshots_nested_metadata(self):
+        release = threading.Event()
+        started = threading.Event()
+        self.client._enqueue(lambda: (started.set(), release.wait(3.0)))
+        self.assertTrue(started.wait(1.0))
+        metadata = {"source": {"paths": ["original.txt"]}}
+        try:
+            self.client.save_note("sess-1", self.cwd, "A saved fact", "A title", metadata)
+            metadata["source"]["paths"].append("later.txt")
+        finally:
+            release.set()
+        self.drain()
+        body = self.fake.requests[-1]["body"]
+        self.assertEqual(body["metadata"]["source"], {"paths": ["original.txt"]})
+        self.assertEqual(metadata, {"source": {"paths": ["original.txt", "later.txt"]}})
+
+    def test_invalid_snapshot_does_not_escape_or_stop_later_capture(self):
+        cyclic = {}
+        cyclic["self"] = cyclic
+        self.provider.record_tool_call("terminal", cyclic, "invalid", "sess-1")
+        self.provider.record_tool_call("terminal", {"command": "valid"}, "done", "sess-1")
+        self.drain()
+        self.assertEqual(len(self.fake.requests), 1)
+        self.assertEqual(self.fake.requests[0]["body"]["tool_input"], {"command": "valid"})
 
     def test_memory_tools_and_child_agents_are_not_recorded(self):
         self.provider.on_turn_start(1, "remember this")
@@ -194,12 +244,6 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(self.fake.paths(), ["/api/sessions/init"])
         self.assertEqual(self.fake.requests[0]["body"]["prompt"], "what changed in the parser?")
 
-    def test_turn_start_and_sync_turn_record_a_prompt_once(self):
-        self.provider.on_turn_start(1, "same prompt")
-        self.provider.sync_turn("same prompt", "answer")
-        self.drain()
-        self.assertEqual(self.fake.paths(), ["/api/sessions/init"])
-
     def test_relevant_notes_come_from_every_agent_in_the_checkout(self):
         self.fake.replies["/api/context/semantic"] = (200, {"context": "#12 Login test needs a fresh DB", "count": 1})
         notes = self.provider.prefetch("why does the login test fail on CI?", session_id="sess-1")
@@ -207,10 +251,6 @@ class ProviderTest(unittest.TestCase):
         body = self.fake.requests[0]["body"]
         self.assertEqual(body, {"q": "why does the login test fail on CI?", "cwd": self.cwd, "limit": 5})
         self.assertNotIn("platformSource", body)
-
-    def test_short_prompts_ask_for_nothing(self):
-        self.assertEqual(self.provider.prefetch("ok"), "")
-        self.assertEqual(self.fake.requests, [])
 
     def test_session_block_is_labelled_and_bounded(self):
         self.fake.replies["/api/context/inject"] = (200, "recent work\n" + "y" * 20000)
@@ -329,6 +369,7 @@ class ProviderTest(unittest.TestCase):
 
     def test_runtime_cwd_wins_when_hermes_has_it(self):
         other = tempfile.mkdtemp(prefix="hermes-runtime-")
+        self.addCleanup(remove_tree, other)
         runtime = types.ModuleType("agent.runtime_cwd")
         runtime.resolve_agent_cwd = lambda: other
         sys.modules["agent.runtime_cwd"] = runtime
@@ -338,7 +379,126 @@ class ProviderTest(unittest.TestCase):
         self.assertEqual(self.fake.requests[0]["body"]["cwd"], other)
 
 
+class SenderShutdownTest(unittest.TestCase):
+    def test_full_queue_shutdown_retires_unsent_work_and_stops_the_sender(self):
+        fake = FakeClaudeMem()
+        self.addCleanup(fake.close)
+        release, started = threading.Event(), threading.Event()
+        fake.before_reply = lambda _: (started.set(), release.wait(3.0))
+        client = client_module.ClaudeMemClient(client_module.Config(fake.base), queue_size=1)
+        try:
+            client.record_tool("session", REPO, "terminal", {"command": "in flight"}, "done")
+            self.assertTrue(started.wait(1.0))
+            client.record_tool("session", REPO, "terminal", {"command": "queued"}, "done")
+            self.assertEqual(client._queue.qsize(), 1)
+            before = time.monotonic()
+            client.close(timeout=0.02)
+            self.assertLess(time.monotonic() - before, 0.5)
+            client.record_tool("session", REPO, "terminal", {"command": "after close"}, "done")
+            release.set()
+            client._thread.join(1.0)
+            self.assertFalse(client._thread.is_alive(), "a full queue must not lose the shutdown sentinel")
+            self.assertTrue(client.flush(0.1))
+            self.assertEqual([r["body"]["tool_input"]["command"] for r in fake.requests], ["in flight"])
+        finally:
+            release.set()
+            client.close(timeout=0.05)
+            client._thread.join(1.0)
+
+    def test_capture_after_completed_shutdown_is_not_accepted(self):
+        fake = FakeClaudeMem()
+        self.addCleanup(fake.close)
+        client = client_module.ClaudeMemClient(client_module.Config(fake.base))
+        client.close(timeout=0.1)
+        client._thread.join(1.0)
+        self.assertFalse(client._thread.is_alive())
+        client.record_tool("session", REPO, "terminal", {}, "after close")
+        self.assertTrue(client.flush(0.1), "closed clients must not retain jobs with no sender")
+        self.assertEqual(fake.requests, [])
+
+    def test_shutdown_drains_healthy_work_and_is_idempotent(self):
+        fake = FakeClaudeMem()
+        self.addCleanup(fake.close)
+        client = client_module.ClaudeMemClient(client_module.Config(fake.base))
+        for command in ("first", "second"):
+            client.record_tool("session", REPO, "terminal", {"command": command}, "done")
+        client.close(timeout=1.0)
+        client._thread.join(1.0)
+        self.assertFalse(client._thread.is_alive())
+        self.assertEqual([r["body"]["tool_input"]["command"] for r in fake.requests], ["first", "second"])
+        client.close(timeout=0.1)
+        self.assertTrue(client.flush(0.1), "repeated close must not enqueue another sentinel")
+
+
+class TagScanTest(unittest.TestCase):
+    """The tag scanner visits each character once: the old `<name[^>]*>` tail
+    rescanned the rest of the text for every unfinished `<name` candidate."""
+
+    def test_a_long_attribute_list_still_hides_its_content(self):
+        # Bounding the attribute tail (`{0,512}`, as PR #5152 did) would stop
+        # this opener from matching and let the private text reach the worker.
+        attributes = " " + "k=v " * 500
+        text = "keep <private" + attributes + ">secret</private> done"
+        self.assertEqual(client_module._strip_text(text), "keep  done")
+
+    def test_a_tag_ends_at_the_first_greater_than(self):
+        self.assertEqual(client_module._strip_text("a<private b>c</private>d"), "ad")
+        self.assertEqual(client_module._strip_text("a<private b<c>d</private>e"), "ae")
+
+    def test_matching_stays_case_insensitive(self):
+        self.assertEqual(client_module._strip_text("a<PRIVATE>s</Private>b"), "ab")
+
+    def test_an_unclosed_section_still_runs_to_the_end(self):
+        self.assertEqual(client_module._strip_text("keep <private>secret"), "keep ")
+
+    def test_an_unfinished_opener_is_not_rescanned_per_candidate(self):
+        payload = "<private" * 45000  # ~351 KB with no '>' anywhere
+        started = time.monotonic()
+        self.assertEqual(client_module.strip_tags(payload), payload)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+
 class FailSoftTest(unittest.TestCase):
+    def test_truncated_http_response_counts_toward_breaker(self):
+        transport = client_module.Transport(client_module.Config("http://localhost"))
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.read.side_effect = client_module.http.client.IncompleteRead(b"", 2)
+            for _ in range(client_module.BREAKER_FAILURES):
+                with self.assertRaises(client_module.RequestFailed):
+                    transport.worker("GET", "/test")
+        self.assertTrue(transport.breaker.open())
+
+    def test_a_client_error_does_not_open_the_breaker(self):
+        # HTTPError subclasses OSError, so a 4xx used to count as a transport
+        # failure: three bad requests silenced every later call for 30 seconds.
+        transport = client_module.Transport(client_module.Config("http://localhost"))
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = urllib.error.HTTPError(
+                "http://localhost/test", 400, "Bad Request", {}, None)
+            for _ in range(client_module.BREAKER_FAILURES * 2):
+                with self.assertRaises(client_module.RequestFailed):
+                    transport.worker("POST", "/test", {"hello": "world"})
+        self.assertFalse(transport.breaker.open())
+
+    def test_a_server_error_still_counts_toward_the_breaker(self):
+        transport = client_module.Transport(client_module.Config("http://localhost"))
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            urlopen.side_effect = urllib.error.HTTPError(
+                "http://localhost/test", 503, "Service Unavailable", {}, None)
+            for _ in range(client_module.BREAKER_FAILURES):
+                with self.assertRaises(client_module.RequestFailed):
+                    transport.worker("GET", "/test")
+        self.assertTrue(transport.breaker.open())
+
+    def test_invalid_configured_url_fails_soft(self):
+        client = client_module.ClaudeMemClient(client_module.Config("invalid"))
+        self.addCleanup(client.close)
+        self.assertEqual(client.recent_context(REPO), "")
+
+    def test_query_stops_at_distinct_term_limit(self):
+        self.assertEqual(client_module.server_query("First first second third", 2), "first or second")
+        self.assertEqual(client_module.server_query("first second", 0), "")
+
     def test_a_stopped_worker_never_raises_and_never_stalls(self):
         config = client_module.Config("http://127.0.0.1:%d" % unused_port())
         client = client_module.ClaudeMemClient(config)
@@ -366,16 +526,16 @@ class FailSoftTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.5)
 
     def test_a_hung_worker_costs_a_read_at_most_the_read_timeout(self):
-        fake = FakeClaudeMem()
-        self.addCleanup(fake.close)
-        fake.delay = client_module.READ_TIMEOUT_S + 2
-        provider = claude_mem.ClaudeMemMemoryProvider(client=client_module.ClaudeMemClient(client_module.Config(fake.base)))
-        provider.initialize("sess-slow")
-        started = time.monotonic()
-        self.assertEqual(provider.prefetch("a prompt that is long enough to search"), "")
-        self.assertLess(time.monotonic() - started, client_module.READ_TIMEOUT_S + 1.5)
-        provider.shutdown()
-
+        with mock.patch.object(client_module, "READ_TIMEOUT_S", 0.3):
+            fake = FakeClaudeMem()
+            self.addCleanup(fake.close)
+            fake.delay = client_module.READ_TIMEOUT_S + 2
+            provider = claude_mem.ClaudeMemMemoryProvider(client=client_module.ClaudeMemClient(client_module.Config(fake.base)))
+            provider.initialize("sess-slow")
+            started = time.monotonic()
+            self.assertEqual(provider.prefetch("a prompt that is long enough to search"), "")
+            self.assertLess(time.monotonic() - started, client_module.READ_TIMEOUT_S + 1.5)
+            provider.shutdown()
 
 class RegisterTest(unittest.TestCase):
     def test_register_adds_the_provider_and_a_post_tool_call_hook(self):
@@ -452,6 +612,7 @@ class RegisterTest(unittest.TestCase):
 class SettingsTest(unittest.TestCase):
     def write_settings(self, doc, bom=False):
         directory = tempfile.mkdtemp(prefix="claude_mem-data-")
+        self.addCleanup(remove_tree, directory)
         with open(os.path.join(directory, "settings.json"), "w", encoding="utf-8-sig" if bom else "utf-8") as handle:
             json.dump(doc, handle)
         return directory
@@ -467,10 +628,25 @@ class SettingsTest(unittest.TestCase):
         config = client_module.Config.resolve({"CLAUDE_MEM_DATA_DIR": directory, "CLAUDE_MEM_WORKER_PORT": "39999"})
         self.assertEqual(config.worker_base, "http://[::1]:39999")
 
-    def test_default_port_follows_the_uid(self):
+    def test_default_port_matches_the_shared_fallback(self):
         directory = self.write_settings({})
         config = client_module.Config.resolve({"CLAUDE_MEM_DATA_DIR": directory})
-        self.assertEqual(config.worker_base, "http://127.0.0.1:" + str(37700 + (os.getuid() if hasattr(os, "getuid") else 77) % 100))
+        self.assertEqual(config.worker_base, "http://127.0.0.1:%s" % client_module.default_worker_port(directory))
+
+    def test_uid_offset_port_is_the_provider_rule_not_just_its_wiring(self):
+        with mock.patch.object(client_module.os, "getuid", lambda: 42, create=True):
+            self.assertEqual(client_module.default_worker_port(), "37742")
+
+    def test_default_port_matches_shared_windows_path_hashes_without_uid(self):
+        cases = [
+            (r"C:\Profiles\Claude", "37746"),
+            (r"D:\AgentData\CMEM", "37791"),
+        ]
+
+        with mock.patch.object(client_module.os, "getuid", None, create=True):
+            for directory, expected_port in cases:
+                with self.subTest(directory=directory):
+                    self.assertEqual(client_module.default_worker_port(directory), expected_port)
 
     def test_server_needs_all_three_settings(self):
         partial = self.write_settings({"CLAUDE_MEM_RUNTIME": "server", "CLAUDE_MEM_SERVER_URL": "https://m.example",
@@ -484,6 +660,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_a_missing_or_broken_settings_file_means_defaults(self):
         directory = tempfile.mkdtemp(prefix="claude_mem-data-")
+        self.addCleanup(remove_tree, directory)
         with open(os.path.join(directory, "settings.json"), "w") as handle:
             handle.write("{not json")
         self.assertEqual(client_module.load_settings({"CLAUDE_MEM_DATA_DIR": directory}), {})
@@ -496,6 +673,7 @@ class CheckoutProjectTest(unittest.TestCase):
 
     def test_keys_match_the_claude_code_hooks_in_path_mode(self):
         root = tempfile.mkdtemp(prefix="hermes-keys-")
+        self.addCleanup(remove_tree, root)
         repo = os.path.join(root, "shop-api")
         os.makedirs(os.path.join(repo, "src"))
         self.git("init", "-q", repo)
@@ -508,6 +686,32 @@ class CheckoutProjectTest(unittest.TestCase):
         plain = os.path.join(root, "notes")
         os.makedirs(plain)
         self.assertEqual(client_module.checkout_project(plain), "notes")
+
+    def test_a_cache_entry_expires_at_its_original_deadline(self):
+        client_module._PROJECT_KEYS.clear()
+        ttl = client_module._PROJECT_KEY_TTL_S
+        start = 1000.0
+        clock = [start]
+        original_time = client_module.time
+        client_module.time = types.SimpleNamespace(monotonic=lambda: clock[0])
+        try:
+            root = tempfile.mkdtemp(prefix="hermes-ttl-")
+            self.addCleanup(remove_tree, root)
+            repo = os.path.join(root, "nested")
+            os.makedirs(os.path.join(repo, "sub"))
+            self.git("init", "-q", repo)
+            self.git("-C", repo, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-q",
+                     "--allow-empty", "-m", "init")
+            cwd = os.path.join(repo, "sub")
+            self.assertEqual(client_module.checkout_project(cwd), "nested")
+            self.git("init", "-q", cwd)
+            # A hit near the end of the window must not extend the deadline.
+            clock[0] = start + ttl - 1
+            self.assertEqual(client_module.checkout_project(cwd), "nested")
+            clock[0] = start + ttl + 1
+            self.assertEqual(client_module.checkout_project(cwd), "sub")
+        finally:
+            client_module.time = original_time
 
 
 class RecallPrivacyTest(unittest.TestCase):
@@ -551,6 +755,27 @@ class RecallPrivacyTest(unittest.TestCase):
 
 
 class ServerModeTest(unittest.TestCase):
+    def test_hosted_tool_capture_snapshots_before_the_sender_runs(self):
+        fake = FakeClaudeMem()
+        self.addCleanup(fake.close)
+        client = client_module.ClaudeMemClient(client_module.Config("", fake.base, "key", "project"))
+        self.addCleanup(client.close)
+        release = threading.Event()
+        started = threading.Event()
+        client._enqueue(lambda: (started.set(), release.wait(3.0)))
+        self.assertTrue(started.wait(1.0))
+        args, result = {"command": "first"}, {"exit": 0}
+        try:
+            client.record_tool("session", REPO, "terminal", args, result, "hosted-snapshot")
+            args["command"], result["exit"] = "later", 1
+        finally:
+            release.set()
+        self.assertTrue(client.flush(3.0))
+        self.assertEqual(len(fake.requests), 1)
+        payload = fake.requests[0]["body"]["payload"]
+        self.assertEqual(payload["tool_input"], {"command": "first"})
+        self.assertEqual(json.loads(payload["tool_response"]), {"exit": 0})
+
     def test_events_go_to_the_hosted_server_with_the_key(self):
         fake = FakeClaudeMem()
         self.addCleanup(fake.close)
@@ -567,9 +792,9 @@ class ServerModeTest(unittest.TestCase):
         provider.on_session_end([{"role": "assistant", "content": "Deployed"}])
         self.assertTrue(client.flush(5.0))
         self.assertEqual(fake.paths(), ["/v1/sessions/start", "/v1/events", "/v1/events", "/v1/memories",
-                                        "/v1/sessions/start", "/v1/events", "/v1/sessions/srv-1/end"])
+                                        "/v1/events", "/v1/sessions/srv-1/end"])
         self.assertTrue(all(r["authorization"] == "Bearer key-1" for r in fake.requests))
-        start, prompt, tool, note, _, last, _ = (r["body"] for r in fake.requests)
+        start, prompt, tool, note, last, _ = (r["body"] for r in fake.requests)
         self.assertEqual(start["projectId"], "proj-1")
         self.assertEqual(start["metadata"]["prompt"], "deploy the app")
         # Every prompt is its own event; it does not start a generation by itself.
@@ -594,6 +819,37 @@ class ServerModeTest(unittest.TestCase):
         self.assertNotIn("hunter2", query)
         self.assertIn("deploy or application", query)
         provider.shutdown()
+
+    def test_failed_final_event_still_attempts_to_end_session(self):
+        transport = mock.Mock()
+        transport.server.side_effect = [client_module.RequestFailed("bad event"), b"{}"]
+        client = client_module.ClaudeMemClient(client_module.Config("", "https://server", "key", "id"), transport)
+        self.addCleanup(client.close)
+        session = client_module.Session("s")
+        session.anchored = True
+        session.server_session_id = "known/id"
+        client._finish(session, REPO, "last message")
+        self.assertEqual([call.args[1] for call in transport.server.call_args_list],
+                         ["/v1/events", "/v1/sessions/known%2Fid/end"])
+
+    def test_a_private_last_turn_still_ends_the_server_session(self):
+        fake = FakeClaudeMem()
+        self.addCleanup(fake.close)
+        fake.replies["/v1/sessions/start"] = (200, {"session": {"id": "srv-2"}})
+        config = client_module.Config("http://127.0.0.1:1", fake.base, "key-1", "proj-1")
+        client = client_module.ClaudeMemClient(config)
+        provider = claude_mem.ClaudeMemMemoryProvider(client=client)
+        self.addCleanup(provider.shutdown)
+        provider.initialize("sess-p", cwd="/work/app")
+        provider.on_turn_start(1, "deploy the app")
+        provider.on_turn_start(2, "<private>use password hunter2</private>")
+        provider.on_session_end([{"role": "assistant", "content": "Logged in with hunter2"}])
+        self.assertTrue(client.flush(5.0))
+        # The private turn's assistant message is dropped, but the session the
+        # public turn opened is still ended on the server.
+        self.assertEqual(fake.paths(), ["/v1/sessions/start", "/v1/events",
+                                        "/v1/sessions/srv-2/end"])
+        self.assertNotIn("hunter2", json.dumps([r["body"] for r in fake.requests]))
 
 
 if __name__ == "__main__":

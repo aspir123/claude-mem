@@ -10,7 +10,6 @@ import { SessionStore } from '../../../../src/services/sqlite/SessionStore.js';
 import { FormattingService } from '../../../../src/services/worker/FormattingService.js';
 import { ModeManager } from '../../../../src/services/domain/ModeManager.js';
 import { TimelineService } from '../../../../src/services/worker/TimelineService.js';
-import { resolveDateBound } from '../../../../src/shared/date-bounds.js';
 
 type Handler = (req: Request, res: Response) => void;
 
@@ -27,12 +26,14 @@ beforeEach(() => {
   modes.loadMode('code');
   store = new SessionStore(':memory:');
   const search = new SessionSearch(store.db);
-  const sessionDbId = store.createSDKSession('content-date', 'date-project', 'prompt');
-  store.ensureMemorySessionIdRegistered(sessionDbId, 'mem-date');
-  store.storeObservation('mem-date', 'date-project', {
-    type: 'discovery', title: 'zebrafish', subtitle: null, facts: [], narrative: 'zebrafish narrative',
-    concepts: [], files_read: [], files_modified: [],
-  }, 1);
+  for (const n of [1, 2, 3, 4]) {
+    const sessionDbId = store.createSDKSession(`content-${n}`, 'page-project', 'prompt');
+    store.ensureMemorySessionIdRegistered(sessionDbId, `mem-${n}`);
+    store.storeObservation(`mem-${n}`, 'page-project', {
+      type: 'discovery', title: `zebrafish-${n}`, subtitle: null, facts: [], narrative: `zebrafish narrative ${n}`,
+      concepts: [], files_read: [], files_modified: [],
+    }, 1);
+  }
   const formatter = new FormattingService();
   const manager = new SearchManager(search, store, null as any, formatter, new TimelineService());
   handlers = new Map();
@@ -95,10 +96,59 @@ describe('invalid date bounds on the search routes', () => {
     expect(textOf(body)).toContain('zebrafish');
   });
 
-  it('resolveDateBound itself throws a 400 AppError for a non-date', () => {
-    for (const value of ['nope', '', 'tomorrow-ish']) {
-      expect(() => resolveDateBound(value, 'start')).toThrow(/Invalid date/);
+  // HTTP and MCP deliver every query value as a string, and the mem-search
+  // skill documents dateStart/dateEnd as "YYYY-MM-DD or epoch ms".
+  it('accepts epoch ms bounds that arrive as strings', async () => {
+    const now = Date.now();
+    const inRange = await request('/api/search', {
+      query: 'zebrafish', dateStart: String(now - 86_400_000), dateEnd: String(now + 86_400_000),
+    });
+    expect(inRange.status).toBe(200);
+    expect(textOf(inRange.body)).toContain('zebrafish');
+
+    const outOfRange = await request('/api/search', {
+      query: 'zebrafish', dateStart: String(now + 86_400_000),
+    });
+    expect(outOfRange.status).toBe(200);
+    expect(textOf(outOfRange.body)).not.toContain('zebrafish narrative');
+  });
+
+  it('rejects a digit-string bound that overflows to Infinity', async () => {
+    const { status, body } = await request('/api/search', { query: 'zebrafish', dateEnd: '9'.repeat(309) });
+    expect(status).toBe(400);
+    expect(body.code).toBe('INVALID_DATE');
+  });
+
+});
+
+const hits = (body: any): number => ((body?.content?.[0]?.text ?? '') as string).match(/zebrafish-\d/g)?.length ?? 0;
+
+describe('limit and offset on the search routes', () => {
+  for (const [key, value] of [
+    ['limit', '-1'], ['limit', 'abc'], ['limit', '0'], ['limit', '1.5'], ['limit', '1e2'], ['limit', ['1', '2']],
+    ['offset', '-1'], ['offset', 'abc'], ['offset', '1.5'],
+  ] as const) {
+    it(`${key}=${JSON.stringify(value)} is a 400 INVALID_PAGINATION`, async () => {
+      const { status, body } = await request('/api/search', { query: 'zebrafish', [key]: value });
+      expect(status).toBe(400);
+      expect(body.code).toBe('INVALID_PAGINATION');
+    });
+  }
+
+  it('is rejected on /api/timeline and /api/search/observations too', async () => {
+    for (const path of ['/api/timeline', '/api/search/observations']) {
+      const { status, body } = await request(path, { query: 'zebrafish', limit: '-1' });
+      expect(status).toBe(400);
+      expect(body.code).toBe('INVALID_PAGINATION');
     }
-    expect(() => resolveDateBound(Number.NaN, 'end')).toThrow(/Invalid date/);
+  });
+
+  it('still honors a valid limit and offset, and treats empty values as absent', async () => {
+    expect(hits((await request('/api/search', { query: 'zebrafish' })).body)).toBe(4);
+    expect(hits((await request('/api/search', { query: 'zebrafish', limit: '2' })).body)).toBe(2);
+    expect(hits((await request('/api/search', { query: 'zebrafish', limit: '2', offset: '3' })).body)).toBe(1);
+    const empty = await request('/api/search', { query: 'zebrafish', limit: '', offset: '' });
+    expect(empty.status).toBe(200);
+    expect(hits(empty.body)).toBe(4);
   });
 });

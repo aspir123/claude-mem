@@ -3,6 +3,7 @@ import { logger } from '../../../utils/logger.js';
 import type { ObservationSearchResult } from '../../sqlite/types.js';
 import type { SessionStore } from '../../sqlite/SessionStore.js';
 import type { SearchOrchestrator } from '../search/SearchOrchestrator.js';
+import { parseStringListField } from '../../sync/string-list-field.js';
 import { CorpusRenderer } from './CorpusRenderer.js';
 import { CorpusStore } from './CorpusStore.js';
 import type { CorpusFile, CorpusFilter, CorpusObservation, CorpusStats } from './types.js';
@@ -64,10 +65,11 @@ export class CorpusBuilder {
 
     logger.debug('WORKER', `Search returned ${observationIds.length} observation IDs`);
 
-    const hydrateOptions: { orderBy?: 'date_asc' | 'date_desc'; limit?: number; project?: string; type?: string | string[] } = {
+    const hydrateOptions: { orderBy?: 'date_asc' | 'date_desc'; limit?: number; projects?: string[]; type?: string | string[] } = {
       orderBy: 'date_asc',
     };
-    if (filter.project) hydrateOptions.project = filter.project;
+    // Hydration must retain the same adopted-project scope as selection.
+    if (filter.project) hydrateOptions.projects = this.sessionStore.getProjectReadKeys([filter.project]);
     if (filter.types && filter.types.length > 0) hydrateOptions.type = filter.types;
     if (filter.limit) hydrateOptions.limit = filter.limit;
 
@@ -115,9 +117,9 @@ export class CorpusBuilder {
       type: row.type,
       title: row.title || '',
       subtitle: row.subtitle || null,
-      narrative: row.narrative || null,
-      facts: safeParseJsonArray(row.facts),
-      concepts: safeParseJsonArray(row.concepts),
+      narrative: row.narrative || row.text || null,
+      facts: parseStringListField(row.facts, 'facts', row.id),
+      concepts: parseStringListField(row.concepts, 'concepts', row.id),
       files_read: safeParseJsonArray(row.files_read),
       files_modified: safeParseJsonArray(row.files_modified),
       project: row.project,
@@ -127,7 +129,7 @@ export class CorpusBuilder {
   }
 
   private calculateStats(observations: CorpusObservation[]): CorpusStats {
-    const typeBreakdown: Record<string, number> = {};
+    const typeBreakdown: Record<string, number> = Object.create(null);
     let earliestEpoch = Infinity;
     let latestEpoch = -Infinity;
 

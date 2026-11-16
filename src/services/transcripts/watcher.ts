@@ -7,14 +7,12 @@ import { expandHomePath } from './config.js';
 import { loadWatchState, saveWatchState, type TranscriptWatchState } from './state.js';
 import type { TranscriptWatchConfig, TranscriptSchema, WatchTarget } from './types.js';
 import {
-  TranscriptAnchorError,
   TranscriptEventProcessor,
-  TranscriptObservationError,
-  TranscriptSpoolError,
   type TranscriptFileContext,
   type TranscriptObservationTransport,
 } from './processor.js';
-import { decompressZstdFrame, decompressZstdFrameBytes, isZstdSupported, scanZstdFramesInFile, type ZstdScanResult } from './zstd-frames.js';
+import { recordTimeEpochMs } from './field-utils.js';
+import { decompressZstdFrameBytes, isZstdSupported, scanZstdFramesInFile, type ZstdScanResult } from './zstd-frames.js';
 
 interface TailState {
   /**
@@ -112,42 +110,42 @@ async function zstdResumeOffset(filePath: string, size: number): Promise<number>
 const FIRST_LINE_MAX_BYTES = 1024 * 1024;
 
 /**
- * A transcript's first line: of a JSONL file, or of the text in a zstd file's
- * first frame. Only the first `limit` bytes count; null when the line (or the
- * frame) does not end within them.
+ * A transcript's first line, including a JSONL header split across zstd
+ * frames. Only the first `limit` file bytes count; null when the line (or
+ * its final frame) does not end within them.
  */
 async function readFirstLine(filePath: string, isZstd: boolean, limit: number): Promise<string | null> {
-  let text: string;
   if (isZstd) {
-    const { frames } = scanZstdFramesInFile(filePath, 0, Math.min(limit, FIRST_LINE_MAX_BYTES), 1);
-    if (frames.length === 0) return null;
-    text = decompressZstdFrame(await readByteRange(filePath, 0, frames[0].end), frames[0]);
-  } else {
-    text = (await readByteRange(filePath, 0, Math.min(limit, FIRST_LINE_MAX_BYTES))).toString('utf8');
+    const parts: Buffer[] = [];
+    const end = Math.min(limit, FIRST_LINE_MAX_BYTES);
+    for (let offset = 0; offset < end;) {
+      const { frames } = scanZstdFramesInFile(filePath, offset, end, 1);
+      if (frames.length === 0) return null;
+      const frame = frames[0];
+      const compressed = await readByteRange(filePath, frame.start, frame.end - frame.start);
+      const bytes = decompressZstdFrameBytes(compressed, { start: 0, end: compressed.length });
+      const newline = bytes.indexOf(0x0a);
+      parts.push(newline < 0 ? bytes : bytes.subarray(0, newline));
+      // Decode only after the line is complete: a frame can also split UTF-8.
+      if (newline >= 0) return Buffer.concat(parts).toString('utf8');
+      offset = frame.end;
+    }
+    return null;
   }
+  const text = (await readByteRange(filePath, 0, Math.min(limit, FIRST_LINE_MAX_BYTES))).toString('utf8');
   const newline = text.indexOf('\n');
   return newline < 0 ? null : text.slice(0, newline);
 }
 
 /**
- * When a transcript's first record says it was written: a top-level
- * `timestamp` (Codex, Claude Code), `time` or `createdAt` (DeepSeek Harness),
- * as an ISO string or epoch seconds/milliseconds. Null when the first record
- * carries none or cannot be read.
+ * When a transcript's first record says it was written (recordTimeEpochMs).
+ * Null when the first record carries none or cannot be read.
  */
 async function firstRecordTimeMs(filePath: string, isZstd: boolean, size: number): Promise<number | null> {
   try {
     const line = await readFirstLine(filePath, isZstd, size);
     if (line === null) return null;
-    const record = JSON.parse(line) as Record<string, unknown> | null;
-    for (const key of ['timestamp', 'time', 'createdAt']) {
-      const value = record?.[key];
-      const ms = typeof value === 'number' ? (value < 1e12 ? value * 1000 : value)
-        : typeof value === 'string' ? Date.parse(value)
-          : Number.NaN;
-      if (Number.isFinite(ms) && ms > 0) return ms;
-    }
-    return null;
+    return recordTimeEpochMs(JSON.parse(line));
   } catch {
     return null;
   }
@@ -228,10 +226,11 @@ class FileTailer {
   private closed = false;
   private readonly isZstd: boolean;
   /** JSONL only: the bytes of the unterminated record between `offset` and `readOffset`. */
-  private pendingRecord: Buffer = Buffer.alloc(0);
+  private pendingRecordParts: Buffer[] = [];
+  private pendingRecordBytes = 0;
   /**
    * zstd only: how many lines of the frame at `offset` were dispatched before
-   * a turn in it failed, so the retry resumes at the failed line. Persisted
+   * reading stopped, so a restart resumes at the next unread line. Persisted
    * with the checkpoint.
    */
   private frameLinesDone: number;
@@ -241,7 +240,6 @@ class FileTailer {
   private fileIdentity?: string;
   /** sha256 of the up-to-4 KiB before the checkpoint (fingerprintBeforeOffset). Persisted. */
   private checkpointFingerprint?: string;
-
   constructor(
     private filePath: string,
     initialOffset: number,
@@ -341,7 +339,8 @@ class FileTailer {
       if (keepsCheckpointBytes(this.filePath, identity, size, this.tailState.offset, this.checkpointFingerprint)) {
         // An unterminated record past the checkpoint is read again, from the new file.
         this.tailState.readOffset = this.tailState.offset;
-        this.pendingRecord = Buffer.alloc(0);
+        this.pendingRecordParts = [];
+        this.pendingRecordBytes = 0;
       } else {
         replaced = true;
       }
@@ -355,7 +354,8 @@ class FileTailer {
       this.tailState.readOffset = 0;
       this.tailState.partial = '';
       this.zstdPartialBytes = undefined;
-      this.pendingRecord = Buffer.alloc(0);
+      this.pendingRecordParts = [];
+      this.pendingRecordBytes = 0;
       this.frameLinesDone = 0;
     }
 
@@ -389,9 +389,7 @@ class FileTailer {
    * that went through, byte-exact, so a restart resumes at the first record
    * not yet dispatched, never inside the unterminated one still being written.
    *
-   * A turn that fails (the worker did not record its prompt) ends the pass
-   * with the checkpoint AT that line: the retry resends it and everything
-   * after it, and nothing before it.
+   * Failed live handoffs are consumed too: a later read must not replay them.
    */
   private async readNewJsonl(size: number): Promise<void> {
     const readFrom = this.tailState.readOffset;
@@ -405,37 +403,41 @@ class FileTailer {
     if (chunk.length === 0) return;
     this.tailState.readOffset = readFrom + chunk.length;
 
-    // buffer[0] is the byte at the checkpoint.
-    const buffer = this.pendingRecord.length > 0 ? Buffer.concat([this.pendingRecord, chunk]) : chunk;
-    const base = this.tailState.offset;
     let lineStart = 0;
     let dispatched = 0;
-    for (let newline = buffer.indexOf(0x0a); newline !== -1; newline = buffer.indexOf(0x0a, lineStart)) {
+    for (let newline = chunk.indexOf(0x0a); newline !== -1; newline = chunk.indexOf(0x0a, lineStart)) {
       if (this.closed) {
-        this.checkpoint(base + lineStart);
+        this.checkpoint(this.tailState.offset);
         return;
       }
-      const line = buffer.toString('utf8', lineStart, newline).trim();
+      const tail = chunk.subarray(lineStart, newline);
+      const bytes = this.pendingRecordParts.length
+        ? Buffer.concat([...this.pendingRecordParts, tail], this.pendingRecordBytes + tail.length)
+        : tail;
+      this.pendingRecordParts = [];
+      this.pendingRecordBytes = 0;
+      const line = bytes.toString('utf8').trim();
       if (line) {
         try {
           await this.onLine(line);
         } catch {
-          this.pendingRecord = Buffer.alloc(0);
-          this.tailState.readOffset = base + lineStart;
-          this.checkpoint(base + lineStart);
-          return;
+          // Failed live handoffs do not park the source cursor.
         }
       }
       lineStart = newline + 1;
-      this.tailState.offset = base + lineStart;
+      this.tailState.offset = readFrom + lineStart;
       if (line && ++dispatched % YIELD_EVERY_N_LINES === 0) {
         this.checkpoint(this.tailState.offset);
         await yieldToEventLoop();
       }
     }
 
-    this.pendingRecord = Buffer.from(buffer.subarray(lineStart));
-    this.checkpoint(base + lineStart);
+    if (lineStart < chunk.length) {
+      const tail = lineStart === 0 ? chunk : Buffer.from(chunk.subarray(lineStart));
+      this.pendingRecordParts.push(tail);
+      this.pendingRecordBytes += tail.length;
+    }
+    this.checkpoint(this.tailState.offset);
     if (this.tailState.readOffset < size) this.readPending = true;
   }
 
@@ -447,10 +449,8 @@ class FileTailer {
    * change event. A frame that fails to decode stops the pass without
    * advancing past it, so it is retried rather than skipped.
    *
-   * The checkpoint moves past a frame once its lines are dispatched. A turn
-   * that fails keeps the checkpoint at its frame, with the partial record that
-   * frame began with, and the retry resumes at the failed line: frames before
-   * it are never sent twice.
+   * The checkpoint moves past a frame once its lines are consumed, including
+   * failed live handoffs. Decode failures still wait for a readable frame.
    */
   private async readNewZstdFrames(size: number): Promise<void> {
     const start = this.tailState.offset;
@@ -504,10 +504,7 @@ class FileTailer {
         try {
           await this.onLine(line);
         } catch {
-          this.frameLinesDone = index;
-          this.tailState.readOffset = frame.start;
-          this.checkpoint(frame.start, partialBefore, partialBytesBefore);
-          return;
+          // Failed live handoffs do not park the source cursor.
         }
         if (++dispatched % YIELD_EVERY_N_LINES === 0) await yieldToEventLoop();
       }
@@ -1053,25 +1050,28 @@ export class TranscriptWatcher {
         }
       },
       (newOffset: number, partial: string, frameLinesDone: number, fileIdentity?: string, checkpointFingerprint?: string, partialBytes?: string) => {
-        if (fileIdentity !== undefined) (this.state.fileIdentities ??= {})[filePath] = fileIdentity;
-        if (checkpointFingerprint !== undefined) {
-          (this.state.checkpointFingerprints ??= {})[filePath] = checkpointFingerprint;
-        } else if (this.state.checkpointFingerprints) {
-          delete this.state.checkpointFingerprints[filePath];
-        }
-        this.state.offsets[filePath] = newOffset;
-        if (partial) {
-          (this.state.partials ??= {})[filePath] = partial;
-        } else if (this.state.partials) {
-          delete this.state.partials[filePath];
-        }
-        if (partialBytes) (this.state.partialBytes ??= {})[filePath] = partialBytes;
-        else if (this.state.partialBytes) delete this.state.partialBytes[filePath];
-        if (frameLinesDone > 0) {
-          (this.state.frameLines ??= {})[filePath] = frameLinesDone;
-        } else if (this.state.frameLines) {
-          delete this.state.frameLines[filePath];
-        }
+        const apply = () => {
+          if (fileIdentity !== undefined) (this.state.fileIdentities ??= {})[filePath] = fileIdentity;
+          if (checkpointFingerprint !== undefined) {
+            (this.state.checkpointFingerprints ??= {})[filePath] = checkpointFingerprint;
+          } else if (this.state.checkpointFingerprints) {
+            delete this.state.checkpointFingerprints[filePath];
+          }
+          this.state.offsets[filePath] = newOffset;
+          if (partial) {
+            (this.state.partials ??= {})[filePath] = partial;
+          } else if (this.state.partials) {
+            delete this.state.partials[filePath];
+          }
+          if (partialBytes) (this.state.partialBytes ??= {})[filePath] = partialBytes;
+          else if (this.state.partialBytes) delete this.state.partialBytes[filePath];
+          if (frameLinesDone > 0) {
+            (this.state.frameLines ??= {})[filePath] = frameLinesDone;
+          } else if (this.state.frameLines) {
+            delete this.state.frameLines[filePath];
+          }
+        };
+        apply();
         saveWatchState(this.statePath, this.state);
       },
       this.state.partials?.[filePath] ?? '',
@@ -1136,17 +1136,6 @@ export class TranscriptWatcher {
       const entry = JSON.parse(line);
       await this.processor.processEntry(entry, watch, schema, sessionIdOverride ?? undefined, fileContext);
     } catch (error: unknown) {
-      // A turn whose prompt the worker did not record, or an event it did not
-      // accept, stops the pass with the checkpoint at its line (or frame), so
-      // it is retried, not misfiled or lost.
-      if (error instanceof TranscriptAnchorError || error instanceof TranscriptObservationError || error instanceof TranscriptSpoolError) {
-        logger.warn('TRANSCRIPT', 'Transcript event not accepted; it is retried from its own line', {
-          watch: watch.name,
-          file: basename(filePath),
-          error: error.message,
-        });
-        throw error;
-      }
       if (error instanceof Error) {
         logger.debug('TRANSCRIPT', 'Failed to parse transcript line', {
           watch: watch.name,

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { parseArgs } from 'util';
 import { Server, type RouteHandler } from '../../services/server/Server.js';
 import { paths } from '../../shared/paths.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../../shared/bun-auto-install.js';
 import { logger } from '../../utils/logger.js';
 import {
   captureProcessStartToken,
@@ -18,6 +19,7 @@ import {
 } from '../../supervisor/process-registry.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { killProcessTree } from '../../shared/kill-process-tree.js';
+import { getDefaultServerPort } from '../../shared/install-port.js';
 import { ServerV1PostgresRoutes } from '../routes/v1/ServerV1PostgresRoutes.js';
 import { SessionsObservationsAdapter } from '../compat/SessionsObservationsAdapter.js';
 import { SessionsSummarizeAdapter } from '../compat/SessionsSummarizeAdapter.js';
@@ -31,7 +33,6 @@ import type { ServerServiceGraph, ServerQueueLaneMetric } from './types.js';
 // back-compat. Plan §1d will handle the literal migration.
 const SERVER_RUNTIME = 'server-beta';
 const DEFAULT_SERVER_HOST = '127.0.0.1';
-const DEFAULT_SERVER_PORT = 37877;
 
 // `server stop` waits at least this long for the daemon to exit. Must exceed
 // runShutdownCascade's own budget (5s SIGTERM grace + 1s SIGKILL grace) so a
@@ -213,12 +214,14 @@ export class ServerService {
       authMode: compatAuthMode,
     }));
 
-    // #2552 — mount the Viewer UI static handler so the viewer loads on the
-    // server runtime. Registered AFTER the /v1 and compat API routes so the
-    // viewer's own API calls resolve against those; express.static only
-    // matches existing files and the `/` GET only matches the root, so this
-    // never shadows an API route.
-    server.registerRoutes(new ServerViewerRoutes());
+    // #2552 — mount the Viewer UI and the worker-shaped read endpoints it
+    // calls. Registered AFTER the /v1 and compat API routes; express.static
+    // only matches existing files and the viewer's own paths do not overlap
+    // /v1 or /api/sessions/*, so this never shadows an API route.
+    server.registerRoutes(new ServerViewerRoutes({
+      pool: this.graph.postgres.pool,
+      authMode: compatAuthMode,
+    }));
 
     server.finalizeRoutes();
 
@@ -249,12 +252,19 @@ export class ServerService {
         }
         this.server = null;
       }
-      await Promise.all([
-        this.graph.queueManager.close(),
-        this.graph.generationWorkerManager.close(),
-        this.graph.stopBackgroundWork?.(),
+      // Each owner must finish releasing its database work before the pool
+      // closes, even if a sibling close fails. Keep the original failure for
+      // the caller, but do not let it skip remaining resource cleanup.
+      const boundaries = await Promise.allSettled([
+        () => this.graph.queueManager.close(),
+        () => this.graph.generationWorkerManager.close(),
+        () => this.graph.stopBackgroundWork?.(),
+      ].map(close => Promise.resolve().then(close)));
+      const pool = await Promise.allSettled([
+        Promise.resolve().then(() => this.graph.postgres.pool.end()),
       ]);
-      await this.graph.postgres.pool.end();
+      const failure = [...boundaries, ...pool].find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
     } finally {
       if (this.persistRuntimeState) {
         removeServerState();
@@ -534,9 +544,12 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
 
   const { getSharedPostgresPool } = await import('../../storage/postgres/index.js');
   const { PostgresAuthRepository } = await import('../../storage/postgres/auth.js');
-  const { createHash, randomBytes } = await import('crypto');
+  const { ensureApiKeySchema } = await import('../../storage/postgres/schema.js');
+  const { hashApiKey, apiKeyPrefix } = await import('../auth/api-key-hash.js');
+  const { randomBytes } = await import('crypto');
   const pool = getSharedPostgresPool({ requireDatabaseUrl: true });
   const repo = new PostgresAuthRepository(pool);
+  await ensureApiKeySchema(pool);
 
   try {
     if (sub === 'create') {
@@ -558,9 +571,10 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
         projectId = result.projectId;
       }
       const rawKey = `cmem_${randomBytes(24).toString('hex')}`;
-      const keyHash = createHash('sha256').update(rawKey).digest('hex');
+      const keyHash = hashApiKey(rawKey);
       const created = await repo.createApiKey({
         keyHash,
+        keyPrefix: apiKeyPrefix(rawKey),
         teamId,
         projectId,
         scopes,
@@ -857,10 +871,7 @@ function getServerPort(): number {
   if (Number.isInteger(parsed) && parsed > 0) {
     return parsed;
   }
-  // UID-derived default for multi-account isolation: two users on the same
-  // host get distinct ports without explicit configuration. Containerized
-  // deployments always pass CLAUDE_MEM_SERVER_PORT so this branch is local-only.
-  return DEFAULT_SERVER_PORT + ((process.getuid?.() ?? 77) % 100);
+  return getDefaultServerPort(paths.dataDir());
 }
 
 function spawnServerDaemon(port: number): number | undefined {
@@ -869,7 +880,8 @@ function spawnServerDaemon(port: number): number | undefined {
   // DATA_DIR without creating it — so create it rather than depend on some earlier
   // caller having done so. Idempotent.
   mkdirSync(paths.dataDir(), { recursive: true });
-  const child = spawn(process.execPath, [scriptPath, '--daemon'], {
+  // The server's embedder loads sharp; never let Bun auto-install it (#5601).
+  const child = spawn(process.execPath, [BUN_NO_AUTO_INSTALL_FLAG, scriptPath, '--daemon'], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,

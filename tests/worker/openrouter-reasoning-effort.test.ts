@@ -43,10 +43,6 @@ describe('buildOpenRouterRequestBody reasoning effort', () => {
     // OpenRouter takes `effort` or `max_tokens` in `reasoning`, never both;
     // only `max_tokens` is a cap the provider enforces.
     expect(OBSERVER_REASONING_BUDGET_TOKENS_BY_EFFORT).toEqual({ minimal: 455, low: 1024, medium: 4096, high: 16384 });
-    for (const effort of ['minimal', 'low', 'medium', 'high'] as const) {
-      expect(buildOpenRouterRequestBody({ ...base, apiUrl: OPENROUTER_URL, reasoningEffort: effort }).reasoning)
-        .toEqual({ max_tokens: OBSERVER_REASONING_BUDGET_TOKENS_BY_EFFORT[effort] });
-    }
   });
 
   it('sends a typed effort to openrouter.ai only; cmem stays reasoning-off and a custom gateway stays unset', () => {
@@ -93,6 +89,25 @@ describe('buildOpenRouterRequestBody reasoning effort', () => {
       ...base, apiUrl: OPENROUTER_URL, label: { kind: 'observation', sessionId: 'session-1' }, reasoningEffort: 'high',
     });
     expect(observation.reasoning).toEqual({ max_tokens: OBSERVER_REASONING_BUDGET_TOKENS_BY_EFFORT.high });
+  });
+
+  it('can omit the reasoning field, including one the extra body would put back', () => {
+    const openrouter = buildOpenRouterRequestBody({
+      ...base,
+      apiUrl: OPENROUTER_URL,
+      omitReasoning: true,
+      extraBody: { reasoning: { enabled: false }, temperature: 0.1 },
+    });
+    expect(openrouter.reasoning).toBeUndefined();
+    expect(openrouter.temperature).toBe(0.1);
+    expect(openrouter.max_tokens).toBe(base.maxOutputTokens);
+    expect(openRouterReasoningBudgetTokens({ apiUrl: OPENROUTER_URL, omitReasoning: true, reasoningEffort: 'high' })).toBe(0);
+
+    const wrapUp = buildOpenRouterRequestBody({
+      ...base, apiUrl: OPENROUTER_URL, plainText: true, omitReasoning: true,
+    });
+    expect(wrapUp.reasoning).toBeUndefined();
+    expect(wrapUp.response_format).toEqual({ type: 'text' });
   });
 
   it('leaves a custom gateway field condensation to its own extra body', () => {

@@ -189,7 +189,8 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     expect(session.abortController.signal.aborted).toBe(false);
   });
 
-  it('confirms the <skip_summary /> sentinel at once: a skip is an answer', async () => {
+  it.each(['<skip_summary reason="noise" />', "<skip_summary reason = 'noise' />"])(
+    'confirms %s at once: a skip is an answer', async (skip) => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(14, 'do the thing', 1);
     session.memorySessionId = 'mem-14';
@@ -199,7 +200,7 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     const resetSpy = spyOn(sm, 'resetProcessingToPending');
 
     await processAgentResponse(
-      '<skip_summary reason="noise" />', session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
+      skip, session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent',
     );
 
     expect(confirmSpy).toHaveBeenCalledWith(14);
@@ -295,95 +296,15 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     expect(storeObservations).not.toHaveBeenCalled();
     expect(sm.getMessageBuffer().getPendingCount(7)).toBe(1);
     expect(session.claimedMessageIds).toEqual([]);
-    expect(session.earliestPendingTimestamp).not.toBeNull();
+    // A released claim is unsent again and may expire; the next claim recomputes it.
+    expect(session.earliestPendingTimestamp).toBeNull();
     expect(session.abortReason).toBe('auth:observer_text');
     expect(session.abortController.signal.aborted).toBe(true);
     expect(worker.broadcastProcessingStatus).toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalled();
   });
 
-  it('pauses on a bare unauthorized status and preserves the claimed batch', async () => {
-    const storeObservations = mock(() => ({ observationIds: [], summaryId: null, createdAtEpoch: 0 }));
-    const sm = new SessionManager(makeDbManager(storeObservations));
-    const session = sm.initializeSession(9, 'do the thing', 1);
-    session.memorySessionId = 'mem-9';
-    await queueAndClaimOne(sm, 9);
-
-    const confirmSpy = spyOn(sm, 'confirmClaimedMessages');
-    const resetSpy = spyOn(sm, 'resetProcessingToPending');
-
-    await processAgentResponse(
-      '401 Unauthorized',
-      session,
-      makeDbManager(storeObservations),
-      sm,
-      makeWorker(),
-      0,
-      null,
-      'TestAgent',
-    );
-
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(resetSpy).toHaveBeenCalledWith(9);
-    expect(storeObservations).not.toHaveBeenCalled();
-    expect(sm.getMessageBuffer().getPendingCount(9)).toBe(1);
-    expect(session.abortReason).toBe('auth:observer_text');
-    expect(session.abortController.signal.aborted).toBe(true);
-  });
-
-  it('treats unrelated login instructions as ordinary prose, not an auth pause', async () => {
-    const sm = new SessionManager(makeDbManager());
-    const session = sm.initializeSession(10, 'do the thing', 1);
-    session.memorySessionId = 'mem-10';
-    await queueAndClaimOne(sm, 10);
-
-    const confirmSpy = spyOn(sm, 'confirmClaimedMessages');
-    const resetSpy = spyOn(sm, 'resetProcessingToPending');
-
-    await processAgentResponse(
-      'Please run /login in the observed project instructions.',
-      session,
-      makeDbManager(),
-      sm,
-      makeWorker(),
-      0,
-      null,
-      'TestAgent',
-    );
-
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(resetSpy).toHaveBeenCalledWith(10);
-    expect(sm.getMessageBuffer().getPendingCount(10)).toBe(1);
-    expect(session.abortReason).toBe('output_retry:prose');
-  });
-
-  it('treats project auth-guide prose as ordinary prose, not an auth pause', async () => {
-    const sm = new SessionManager(makeDbManager());
-    const session = sm.initializeSession(11, 'do the thing', 1);
-    session.memorySessionId = 'mem-11';
-    await queueAndClaimOne(sm, 11);
-
-    const confirmSpy = spyOn(sm, 'confirmClaimedMessages');
-    const resetSpy = spyOn(sm, 'resetProcessingToPending');
-
-    await processAgentResponse(
-      'The project authentication guide says to run /login before testing.',
-      session,
-      makeDbManager(),
-      sm,
-      makeWorker(),
-      0,
-      null,
-      'TestAgent',
-    );
-
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(resetSpy).toHaveBeenCalledWith(11);
-    expect(sm.getMessageBuffer().getPendingCount(11)).toBe(1);
-    expect(session.abortReason).toBe('output_retry:prose');
-  });
-
-  it('auth generator exit keeps the active session and in-memory buffer', async () => {
+  it('auth generator exit keeps the active session but discards its buffered work, keeping dedup', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(8, 'do the thing', 1);
     session.memorySessionId = 'mem-8';
@@ -413,10 +334,14 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     expect(finalizeSession).not.toHaveBeenCalled();
     expect(removeSpy).not.toHaveBeenCalled();
     expect(sm.getSession(8)).toBe(session);
-    expect(sm.getMessageBuffer().getPendingCount(8)).toBe(1);
+    expect(sm.getMessageBuffer().getPendingCount(8)).toBe(0);
+    expect(session.pausedReason).toBe('auth');
+    // The discarded input stays deduplicated; fresh work is still accepted.
+    expect(sm.queueObservation(8, { tool_name: 'Read', tool_input: {}, tool_response: {}, prompt_number: 1, toolUseId: 'tu-8' })).toBe(0);
+    expect(sm.queueObservation(8, { tool_name: 'Read', tool_input: {}, tool_response: {}, prompt_number: 1, toolUseId: 'tu-8-fresh' })).toBeGreaterThan(0);
   });
 
-  it('quota generator exit keeps the active session and in-memory buffer', async () => {
+  it('quota generator exit keeps the active session but discards its buffered work', async () => {
     const sm = new SessionManager(makeDbManager());
     const session = sm.initializeSession(6, 'do the thing', 1);
     session.memorySessionId = 'mem-6';
@@ -446,46 +371,50 @@ describe('observer invalid-output handling (Phase 3 recovery)', () => {
     expect(finalizeSession).not.toHaveBeenCalled();
     expect(removeSpy).not.toHaveBeenCalled();
     expect(sm.getSession(6)).toBe(session);
-    expect(sm.getMessageBuffer().getPendingCount(6)).toBe(1);
+    expect(sm.getMessageBuffer().getPendingCount(6)).toBe(0);
+    expect(session.pausedReason).toBe('quota');
     expect(session.generatorPromise).toBeNull();
     expect(session.currentProvider).toBeNull();
   });
 
-  it('confirms a skip but preserves the same queue shape for a quota pause', async () => {
-    const skipSm = new SessionManager(makeDbManager());
-    const skipSession = skipSm.initializeSession(4, 'do the thing', 1);
-    skipSession.memorySessionId = 'mem-4';
-    await queueAndClaimOne(skipSm, 4);
+  it('keeps a queued batch the Claude CLI answered with its 429 reply text, however often it repeats (#5428)', async () => {
+    // The exact reply from the report. It used to classify as prose: the first
+    // reply earned one retry and the second confirmed the batch away.
+    const reported429Reply =
+      'API Error: Request rejected (429) · The request was rate limited. Its source could not be identified. Retry after the indicated delay.';
+    const sm = new SessionManager(makeDbManager());
+    const session = sm.initializeSession(17, 'do the thing', 1);
+    session.memorySessionId = 'mem-17';
+    session.currentProvider = 'claude';
+    await queueAndClaimOne(sm, 17);
+    const confirmSpy = spyOn(sm, 'confirmClaimedMessages');
 
-    await processAgentResponse(
-      '<skip_summary reason="noise" />',
-      skipSession,
-      makeDbManager(),
-      skipSm,
-      makeWorker(),
-      0,
-      null,
-      'TestAgent',
-    );
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) {
+        restartGeneration(session);
+        await claimAgain(sm, 17);
+      }
+      await processAgentResponse(reported429Reply, session, makeDbManager(), sm, makeWorker(), 0, null, 'TestAgent');
 
-    const quotaSm = new SessionManager(makeDbManager());
-    const quotaSession = quotaSm.initializeSession(5, 'do the thing', 1);
-    quotaSession.memorySessionId = 'mem-5';
-    await queueAndClaimOne(quotaSm, 5);
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(sm.getMessageBuffer().getPendingCount(17)).toBe(1);
+      expect(session.abortReason).toBe('rate_limit:observer_text');
+      expect(session.abortController.signal.aborted).toBe(true);
+    }
+    // A rate-limit reply is not a conversational turn: it stays out of the
+    // next request.
+    expect(session.conversationHistory.some(turn => turn.content === reported429Reply)).toBe(false);
 
-    await processAgentResponse(
-      'Your subscription weekly quota has been exhausted and resets later.',
-      quotaSession,
-      makeDbManager(),
-      quotaSm,
-      makeWorker(),
-      0,
-      null,
-      'TestAgent',
-    );
+    const finalizeSession = mock(() => Promise.resolve());
+    await handleGeneratorExit(session, session.abortReason, {
+      sessionManager: sm,
+      completionHandler: { finalizeSession } as any,
+    });
 
-    expect(skipSm.getMessageBuffer().getPendingCount(4)).toBe(0);
-    expect(quotaSm.getMessageBuffer().getPendingCount(5)).toBe(1);
+    expect(finalizeSession).not.toHaveBeenCalled();
+    expect(sm.getSession(17)).toBe(session);
+    expect(sm.getMessageBuffer().getPendingCount(17)).toBe(1);
+    expect(session.pausedReason).toBe('rate_limit');
   });
 });
 

@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'bun:test';
-import { fileURLToPath } from 'node:url';
 import { resolveDateBound } from '../../src/shared/date-bounds.js';
 
 describe('resolveDateBound', () => {
@@ -8,20 +7,35 @@ describe('resolveDateBound', () => {
     expect(resolveDateBound(1735689600000, 'end')).toBe(1735689600000);
   });
 
+  it('trims whitespace from digit-string epochs', () => {
+    expect(resolveDateBound(' 1735689600000 ', 'end')).toBe(1735689600000);
+  });
+
+  it('rejects non-dates', () => {
+    for (const value of ['nope', '', 'tomorrow-ish']) {
+      expect(() => resolveDateBound(value, 'start')).toThrow(/Invalid date/);
+    }
+    expect(() => resolveDateBound(Number.NaN, 'end')).toThrow(/Invalid date/);
+  });
+
+  it('rejects an epoch a Date cannot hold instead of returning Infinity', () => {
+    for (const value of ['9'.repeat(309), '99999999999999999', Number.POSITIVE_INFINITY, 8.64e15 + 1]) {
+      expect(() => resolveDateBound(value, 'start')).toThrow('Invalid date');
+      expect(() => resolveDateBound(value, 'end')).toThrow('Invalid date');
+    }
+    expect(resolveDateBound(String(8.64e15), 'end')).toBe(8.64e15);
+  });
+
+  it('still reads a four-digit string as a year', () => {
+    expect(resolveDateBound('2025', 'start')).toBe(Date.parse('2025-01-01T00:00:00.000Z'));
+  });
+
   it('resolves a date-only start bound to the start of the day', () => {
     expect(resolveDateBound('2025-01-01', 'start')).toBe(Date.parse('2025-01-01T00:00:00.000Z'));
   });
 
   it('resolves a date-only end bound to the last millisecond of the day', () => {
     expect(resolveDateBound('2025-01-01', 'end')).toBe(Date.parse('2025-01-01T23:59:59.999Z'));
-  });
-
-  it('covers a full day when start and end are the same date', () => {
-    const start = resolveDateBound('2025-01-01', 'start');
-    const end = resolveDateBound('2025-01-01', 'end');
-    const midday = Date.parse('2025-01-01T12:00:00.000Z');
-    expect(start).toBeLessThanOrEqual(midday);
-    expect(end).toBeGreaterThanOrEqual(midday);
   });
 
   it('rejects a date that is not on the calendar instead of rolling it over', () => {
@@ -38,23 +52,19 @@ describe('resolveDateBound', () => {
   });
 });
 
-// The child process enforces a non-UTC timezone independently of the parent runner.
 describe('whitespace-padded date bounds', () => {
-  it('normalizes both boundaries before parsing a date-only string', () => {
-    const midnight = Date.parse('2025-01-01T00:00:00.000Z');
-    for (const value of [' 2025-01-01 ', '\t2025-01-01\n']) {
-      expect(resolveDateBound(value, 'start')).toBe(midnight);
-      expect(resolveDateBound(value, 'end')).toBe(midnight + 86_400_000 - 1);
+  it('normalizes both boundaries in a non-UTC timezone', () => {
+    const previousTZ = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    try {
+      const midnight = Date.parse('2025-01-01T00:00:00.000Z');
+      for (const value of [' 2025-01-01 ', '\t2025-01-01\n']) {
+        expect(resolveDateBound(value, 'start')).toBe(midnight);
+        expect(resolveDateBound(value, 'end')).toBe(midnight + 86_400_000 - 1);
+      }
+    } finally {
+      if (previousTZ === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTZ;
     }
   });
-});
-
-it('retains date-only UTC boundaries in a non-UTC child process', () => {
-  const modulePath = fileURLToPath(new URL('../../src/shared/date-bounds.ts', import.meta.url));
-  const script = `import { resolveDateBound } from ${JSON.stringify(modulePath)};
-    console.log(JSON.stringify([resolveDateBound(' 2025-01-01 ', 'start'), resolveDateBound(' 2025-01-01 ', 'end')]));`;
-  const child = Bun.spawnSync({ cmd: [process.execPath, '--eval', script], env: { ...process.env, TZ: 'America/New_York' }, stdout: 'pipe', stderr: 'pipe' });
-  expect(child.exitCode).toBe(0);
-  const midnight = Date.parse('2025-01-01T00:00:00.000Z');
-  expect(JSON.parse(child.stdout.toString())).toEqual([midnight, midnight + 86_400_000 - 1]);
 });

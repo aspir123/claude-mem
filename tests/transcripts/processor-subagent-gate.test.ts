@@ -40,6 +40,7 @@ mock.module('../../src/cli/handlers/session-init.js', () => ({
 }));
 
 mock.module('../../src/services/worker/http/shared.js', () => ({
+  ingestSummarize: async () => ({ status: 'accepted' }),
   ingestObservation: async (payload: { contentSessionId: string }) => {
     observationSessionIds.push(payload.contentSessionId);
     return { ok: true };
@@ -150,25 +151,13 @@ describe('TranscriptEventProcessor subagent gating', () => {
     expect(observationSessionIds).toEqual(['s1']);
   });
 
-  it('does not take the old string "thread_spawn" for a subagent marker', async () => {
+  it.each([
+    ['the old string "thread_spawn"', 'thread_spawn'],
+    ['a top-level session', 'cli'],
+    ['a session whose source is missing', undefined],
+  ])('suppresses %s under a subagent-only watch', async (_name, source) => {
     const watch = makeWatch({ subagentOnly: true, subagentSource });
-    await replay(processor, watch, 'thread_spawn');
-
-    expect(sessionInitIds).toEqual([]);
-    expect(observationSessionIds).toEqual([]);
-  });
-
-  it('suppresses a top-level session under a subagent-only watch', async () => {
-    const watch = makeWatch({ subagentOnly: true, subagentSource });
-    await replay(processor, watch, 'cli');
-
-    expect(sessionInitIds).toEqual([]);
-    expect(observationSessionIds).toEqual([]);
-  });
-
-  it('suppresses a session whose source is missing under a subagent-only watch', async () => {
-    const watch = makeWatch({ subagentOnly: true, subagentSource });
-    await replay(processor, watch, undefined);
+    await replay(processor, watch, source);
 
     expect(sessionInitIds).toEqual([]);
     expect(observationSessionIds).toEqual([]);

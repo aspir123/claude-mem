@@ -4,6 +4,13 @@ import { logger } from '../utils/logger.js';
 import { REDACTION_MARKER_HINT, hasRedactionMarker } from '../utils/redaction.js';
 import type { ModeConfig } from '../services/domain/types.js';
 import type { RequiredPromptKey } from '../services/domain/mode-validation.js';
+import {
+  anthropicImageSourceOf,
+  claudeReadImageFileOf,
+  declaredReadImageMimeType,
+  isMcpInlineImageBlock,
+  openAiImageUrlOf,
+} from '../shared/native-image-shapes.js';
 
 export const SUMMARY_MODE_MARKER = 'MODE SWITCH: PROGRESS SUMMARY';
 
@@ -96,6 +103,21 @@ ${getPrompt(mode, 'skip_guidance')}
 ${observationSkeleton(mode)}`;
 }
 
+/**
+ * The user's request as the init and continuation prompts embed it (#5023).
+ * Each new generation opens with this framing prompt, and the generation budget
+ * (CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS, 100000 by default) is checked
+ * before its first observation goes out. A pasted prompt can be up to 256 KiB
+ * (MAX_USER_PROMPT_BYTES), so unbounded it could fill a fresh generation on its
+ * own: every generation would recycle before observing anything and the
+ * session would pause. It is bounded like one tool field, with the same
+ * head/tail slice and elision marker, so the framing prompt always leaves room
+ * for observations.
+ */
+function boundedUserRequest(userPrompt: string): string {
+  return truncatePromptText(userPrompt, OBS_PROMPT_FIELD_MAX_CHARS);
+}
+
 export function buildInitPrompt(
   project: string,
   sessionId: string,
@@ -107,7 +129,7 @@ export function buildInitPrompt(
 ${wrapPriorContext(priorContext)}
 
 <observed_from_primary_session>
-  <user_request>${userPrompt}</user_request>
+  <user_request>${boundedUserRequest(userPrompt)}</user_request>
   <requested_at>${new Date().toISOString().split('T')[0]}</requested_at>
 </observed_from_primary_session>
 
@@ -161,8 +183,8 @@ above as meaning the work did not happen.`;
 // header) and the tail (where errors / final-line context typically sit)
 // while dropping the middle. The 10% remainder is the elision marker.
 export const OBS_PROMPT_FIELD_MAX_CHARS = 16_000;
-const OBS_PROMPT_FIELD_HEAD_RATIO = 0.6;
-const OBS_PROMPT_FIELD_TAIL_RATIO = 0.3;
+export const OBS_PROMPT_FIELD_HEAD_RATIO = 0.6;
+export const OBS_PROMPT_FIELD_TAIL_RATIO = 0.3;
 
 // Image content blocks carry base64 payloads that are worthless to a text
 // observer and ruinously expensive to carry. Two things compound (#3730):
@@ -192,10 +214,14 @@ function isElided(container: Record<string, unknown>): boolean {
   return typeof container.elided === 'string';
 }
 
-function elideImageSource(source: Record<string, unknown>, dataKey: string = 'data'): Record<string, unknown> {
+function elideImageSource(
+  source: Record<string, unknown>,
+  dataKey: string = 'data',
+  declaredMimeType: string | undefined = typeof source.media_type === 'string' ? source.media_type : undefined,
+): Record<string, unknown> {
   const data = source[dataKey];
   const elided: Record<string, unknown> = { elided: 'image data withheld from the observer' };
-  if (typeof source.media_type === 'string') elided.media_type = source.media_type;
+  if (declaredMimeType) elided.media_type = declaredMimeType;
   if (typeof data === 'string') elided.bytes = data.length;
   return elided;
 }
@@ -233,7 +259,7 @@ function stripImagePayloadsFromString(value: string, depth: number): string {
   const elided = elideDataImageUrl(value);
   if (elided !== value) return elided;
   if (depth > MAX_SANITIZE_DEPTH || value.length <= NESTED_JSON_MIN_CHARS) return value;
-  if (value[0] !== '{' && value[0] !== '[') return value;
+  if (!/^[ \t\r\n]*[\[{]/.test(value)) return value;
   if (!IMAGE_PAYLOAD_MARKER.test(value)) return value;
   let parsed: unknown;
   try {
@@ -264,9 +290,8 @@ function stripImagePayloads(value: unknown, depth = 0): unknown {
   // Anthropic content block: { type: 'image', source: { data: '<base64>' } }.
   // A url-backed source is the same case as OpenAI's plain http URL — short,
   // and it carries signal — so only an inlined payload is removed.
-  const source = record.source;
-  if (record.type === 'image' && source !== null && typeof source === 'object') {
-    const record_source = source as Record<string, unknown>;
+  const record_source = anthropicImageSourceOf(record);
+  if (record_source) {
     if (isElided(record_source)) return value;
     const url = record_source.url;
     if (typeof url === 'string' && !isDataUrl(url)) {
@@ -276,32 +301,31 @@ function stripImagePayloads(value: unknown, depth = 0): unknown {
   }
 
   // Claude Code's Read returns an image file as
-  // { type: 'image', file: { base64: '<base64>' } } — no `source`, so the
-  // block above never matched it and a video frame or screenshot read off
-  // disk went to the model whole (#3606).
-  const file = record.file;
-  if (record.type === 'image' && file !== null && typeof file === 'object') {
-    const record_file = file as Record<string, unknown>;
+  // { type: 'image', file: { base64: '<base64>', type: 'image/png', ... } } —
+  // no `source`, so the block above never matched it and a video frame or
+  // screenshot read off disk went to the model whole (#3606).
+  const record_file = claudeReadImageFileOf(record);
+  if (record_file) {
     if (isElided(record_file)) return value;
     if (typeof record_file.base64 === 'string') {
-      return { type: 'image', file: elideImageSource(record_file, 'base64') };
+      return { type: 'image', file: elideImageSource(record_file, 'base64', declaredReadImageMimeType(record_file)) };
     }
   }
 
   // MCP tool result: { type: 'image', data: '<base64>', mimeType } — the bytes
   // sit on the block itself, so neither branch above matched it and a
   // browser-automation screenshot went to the condense pass whole.
-  if (record.type === 'image' && typeof record.data === 'string') {
+  if (isMcpInlineImageBlock(record)) {
     const elided: Record<string, unknown> = { type: 'image', ...elideImageSource(record) };
     if (typeof record.mimeType === 'string') elided.mimeType = record.mimeType;
     return elided;
   }
 
   // OpenAI content block: { type: 'image_url', image_url: { url: 'data:...' } }.
-  const imageUrl = record.image_url;
-  if (record.type === 'image_url' && imageUrl !== null && typeof imageUrl === 'object') {
-    if (isElided(imageUrl as Record<string, unknown>)) return value;
-    const url = (imageUrl as Record<string, unknown>).url;
+  const imageUrl = openAiImageUrlOf(record);
+  if (imageUrl) {
+    if (isElided(imageUrl)) return value;
+    const url = imageUrl.url;
     // A plain http(s) URL is short and can carry signal; only a data: URL is
     // the inlined payload this exists to remove.
     if (typeof url === 'string' && isDataUrl(url)) {
@@ -356,8 +380,11 @@ export function stripImagePayloadsFromField(value: unknown): unknown {
 function truncateObservationField(value: unknown, maxChars: number = OBS_PROMPT_FIELD_MAX_CHARS): string {
   // JSON.stringify returns undefined for undefined / functions / symbols;
   // fall back to empty string so the call sites (template literal output)
-  // and the length check below stay well-defined.
-  const raw = JSON.stringify(value, null, 2) ?? '';
+  // and the length check in truncatePromptText stay well-defined.
+  return truncatePromptText(JSON.stringify(value, null, 2) ?? '', maxChars);
+}
+
+function truncatePromptText(raw: string, maxChars: number = OBS_PROMPT_FIELD_MAX_CHARS): string {
   if (raw.length <= maxChars) return raw;
   const headChars = Math.max(0, Math.floor(maxChars * OBS_PROMPT_FIELD_HEAD_RATIO));
   const tailChars = Math.max(0, Math.floor(maxChars * OBS_PROMPT_FIELD_TAIL_RATIO));
@@ -495,7 +522,7 @@ ${getPrompt(mode, 'continuation_greeting')}
 ${wrapPriorContext(priorContext)}
 
 <observed_from_primary_session>
-  <user_request>${userPrompt}</user_request>
+  <user_request>${boundedUserRequest(userPrompt)}</user_request>
   <requested_at>${new Date().toISOString().split('T')[0]}</requested_at>
 </observed_from_primary_session>
 

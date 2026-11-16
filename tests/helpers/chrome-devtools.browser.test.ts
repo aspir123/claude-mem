@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { join } from 'node:path';
-import { REPOSITORY_ROOT, chromeExecutablePath, failOnCiWithoutChrome } from './chrome-devtools';
+import { REPOSITORY_ROOT, chromeExecutablePath, connectToPage, failOnCiWithoutChrome, launchChrome } from './chrome-devtools';
 
 failOnCiWithoutChrome('CI requires Chrome for the Chrome teardown test');
 
@@ -31,4 +31,16 @@ const MAX_EXIT_DELAY_AFTER_CLOSE_MS = 2000;
   const exitCode = await child.exited;
   expect(exitCode).toBe(0);
   expect(Date.now() - closedAt).toBeLessThan(MAX_EXIT_DELAY_AFTER_CLOSE_MS);
+}, 20000);
+
+(chromeExecutablePath ? it : it.skip)('evaluate rejects with the error from the page', async () => {
+  const browser = launchChrome('about:blank', { remoteDebugging: true });
+  let page: Awaited<ReturnType<typeof connectToPage>> | undefined;
+  try {
+    page = await connectToPage(browser, 'about:blank');
+    await expect(page.evaluate("(() => { throw new Error('x') })()")).rejects.toThrow('x');
+  } finally {
+    page?.close();
+    await browser.close();
+  }
 }, 20000);

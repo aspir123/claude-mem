@@ -9,9 +9,10 @@ import {
   type MemoryIngestReport,
   type MemoryObservationToStore,
 } from '../../../memory/ingest.js';
-import { computeObservationContentHash } from '../../../sqlite/observations/store.js';
+import { computeObservationContentHash, computeLegacyObservationContentHash, computeObservationDetailsHash, type ObservationDetails } from '../../../sqlite/observations/store.js';
 import { logger } from '../../../../utils/logger.js';
 import { logChromaWriteFailure } from '../../search/errors.js';
+import { isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
 
 /**
  * Auto-memory ingest route. Stores Claude Code memory files DIRECTLY as
@@ -50,13 +51,23 @@ export class MemoryIngestRoutes extends BaseRouteHandler {
           metadata: JSON.stringify(obs.metadata),
         };
 
-        // Re-running an import must not touch rows it already stored: an exact
-        // content_hash match is reported as deduped without calling the store
-        // (whose Tier-0 merge would count it as a repeat).
+        // Exact replays bypass the mutating store/index path. Match the same
+        // structured content as storage, including retained details variants.
         const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
-        const existing = sessionStore.db
-          .prepare('SELECT id FROM observations WHERE memory_session_id = ? AND content_hash = ? LIMIT 1')
-          .get(memorySessionId, contentHash) as { id: number } | undefined;
+        const legacyHash = computeLegacyObservationContentHash(memorySessionId, observation.title, observation.narrative);
+        const detailsHash = computeObservationDetailsHash(contentHash, observation);
+        const legacyDetailsHash = computeObservationDetailsHash(legacyHash, observation);
+        // Title and narrative are pinned in SQL because a legacy hash of a
+        // null-containing tuple is ambiguous; with them fixed, comparing the
+        // details hash against contentHash checks type/subtitle/facts/concepts.
+        const existing = (sessionStore.db
+          .prepare(`SELECT id, type, subtitle, facts, concepts FROM observations
+            WHERE memory_session_id = ? AND content_hash IN (?, ?, ?, ?)
+              AND title IS ? AND COALESCE(narrative, '') = ?
+            ORDER BY content_hash IN (?, ?) DESC`)
+          .all(memorySessionId, contentHash, detailsHash, legacyHash, legacyDetailsHash,
+            observation.title, observation.narrative ?? '', detailsHash, legacyDetailsHash) as Array<ObservationDetails & { id: number }>)
+          .find(row => computeObservationDetailsHash(contentHash, row) === detailsHash);
         if (existing) return { id: existing.id, deduped: true };
 
         // Backdate to the file mtime. Native notes are already distilled:
@@ -89,6 +100,13 @@ export class MemoryIngestRoutes extends BaseRouteHandler {
   }
 
   private async handleIngest(req: Request, res: Response): Promise<void> {
+    // A full-tree ingest stores observations and nudges Chroma, so other
+    // localhost pages may not trigger it — same policy as /api/memory/save.
+    // Origin-less clients (the npx CLI, curl) keep the loopback-trust model.
+    if (isForeignLoopbackBrowserWrite(req)) {
+      res.status(403).json({ error: 'Memory ingests from a different localhost origin are not allowed' });
+      return;
+    }
     const body = (req.body ?? {}) as { source?: unknown; all?: unknown; requireCwd?: unknown };
     const source = typeof body.source === 'string' ? body.source.trim() : '';
     const all = body.all === true;

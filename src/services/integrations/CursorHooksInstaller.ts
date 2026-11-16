@@ -1,9 +1,10 @@
 
 import path from 'path';
 import { homedir } from 'os';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, unlinkSync, mkdirSync } from 'fs';
 import { logger } from '../../utils/logger.js';
-import { parseJsonWithBom } from '../../shared/atomic-json.js';
+import { readJsonSafe } from '../../utils/json-utils.js';
+import { parseJsonWithBom, writeJsonFileAtomic, writeTextFileAtomic } from '../../shared/atomic-json.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { workerHttpRequest } from '../../shared/worker-utils.js';
 import { DATA_DIR } from '../../shared/paths.js';
@@ -13,6 +14,7 @@ import {
   unregisterCursorProject as unregisterCursorProjectInFile,
   configureCursorMcp as configureCursorMcpFile,
   writeContextFile,
+  type CursorMcpConfig,
   type CursorProjectRegistry
 } from '../../utils/cursor-utils.js';
 import type { CursorInstallTarget, CursorHooksJson } from './types.js';
@@ -162,6 +164,24 @@ export async function installCursorHooks(target: CursorInstallTarget): Promise<n
       afterFileEdit: [
         { command: makeHookCommand('file-edit') }
       ],
+      // afterFileEdit records writes only. Cursor's generic postToolUse event is
+      // the one that fires for reads, searches and subagent runs, so it is
+      // matched narrowly here: shell, MCP and file-edit calls keep their own
+      // hooks above and are never recorded twice.
+      postToolUse: [
+        { matcher: 'Read|Grep|Task', command: makeHookCommand('observation') }
+      ],
+      // Denied, failed and timed-out calls. Their payload carries error_message
+      // instead of a result; the adapter turns that into an is_error response,
+      // so the worker does not read the attempted paths as completed work.
+      // Matched to the tools postToolUse and afterFileEdit cover (Cursor's
+      // file-edit tool is `Write`). Shell and MCP calls stay on
+      // afterShellExecution / afterMCPExecution: Cursor's hooks reference does
+      // not say whether those fire for failed calls, so an unmatched
+      // postToolUseFailure could record one call twice.
+      postToolUseFailure: [
+        { matcher: 'Read|Grep|Task|Write', command: makeHookCommand('observation') }
+      ],
       stop: [
         { command: makeHookCommand('summarize') }
       ]
@@ -307,7 +327,7 @@ async function writeHooksJsonAndSetupProject(
   workspaceRoot: string,
 ): Promise<void> {
   const merged = mergeCursorHooksJson(readExistingCursorHooksJson(hooksJsonPath), hooksJson);
-  writeFileSync(hooksJsonPath, JSON.stringify(merged, null, 2));
+  writeJsonFileAtomic(hooksJsonPath, merged);
   console.log(`  Wrote hooks.json (unified CLI mode, existing hooks preserved)`);
   console.log(`  Worker service: ${workerServicePath}`);
 
@@ -364,7 +384,7 @@ description: "Claude-mem context from past sessions (auto-updated)"
 
 Use claude-mem's MCP search tools for manual memory queries.
 `;
-    writeFileSync(rulesFile, placeholderContent);
+    writeTextFileAtomic(rulesFile, placeholderContent);
     console.log(`  Created placeholder context file (will populate after first session)`);
   }
 
@@ -391,6 +411,20 @@ async function fetchInitialContextFromWorker(
     return true;
   }
   return false;
+}
+
+/**
+ * Whether claude-mem's Cursor integration is set up at `target`: one of its
+ * `hook cursor` entries in hooks.json, or its server in mcp.json. The legacy
+ * script names don't count, as the user's own hooks can have them too.
+ */
+export function hasCursorIntegration(target: CursorInstallTarget): boolean {
+  const targetDir = getTargetDir(target);
+  if (!targetDir) return false;
+  const hooksJson = readExistingCursorHooksJson(path.join(targetDir, 'hooks.json'));
+  if (hooksJson && allCursorHookEntries(hooksJson).some(isUnifiedClaudeMemCursorHook)) return true;
+  const mcpConfig = readJsonSafe<Partial<CursorMcpConfig> | null>(path.join(targetDir, 'mcp.json'), null);
+  return Boolean(mcpConfig?.mcpServers?.['claude-mem']);
 }
 
 export function uninstallCursorHooks(target: CursorInstallTarget): number {
@@ -440,7 +474,7 @@ function removeCursorHooksFiles(
         unlinkSync(hooksJsonPath);
         console.log(`  Removed hooks.json (no hooks remaining)`);
       } else {
-        writeFileSync(hooksJsonPath, JSON.stringify(remaining, null, 2));
+        writeJsonFileAtomic(hooksJsonPath, remaining);
         console.log(`  Removed claude-mem entries from hooks.json (other hooks preserved)`);
       }
     }
@@ -466,6 +500,17 @@ function removeCursorHooksFiles(
     const projectName = getProjectContext(process.cwd()).primary;
     unregisterCursorProject(projectName);
     console.log(`  Unregistered from auto-context updates`);
+  }
+
+  // The MCP server configureCursorMcp() registered. Removed last, so an
+  // mcp.json that does not parse (readJsonSafe throws and the file is left as
+  // it is) cannot keep the hooks above in place.
+  const mcpJsonPath = path.join(targetDir, 'mcp.json');
+  const mcpConfig = readJsonSafe<Partial<CursorMcpConfig> | null>(mcpJsonPath, null);
+  if (mcpConfig?.mcpServers?.['claude-mem']) {
+    delete mcpConfig.mcpServers['claude-mem'];
+    writeJsonFileAtomic(mcpJsonPath, mcpConfig);
+    console.log(`  Removed claude-mem from mcp.json (other servers preserved)`);
   }
 
   console.log(`\nUninstallation complete!\n`);

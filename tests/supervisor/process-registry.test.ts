@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'bun:test';
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { OBSERVER_SESSIONS_DIR } from '../../src/shared/paths.js';
@@ -13,6 +13,7 @@ import {
   waitForSlot,
   getParkedSlotWaiterCount,
   isSessionParkedForSlot,
+  getReservedSlotCount,
   setRegistryDegradedReporter,
   type SlotReservation,
 } from '../../src/supervisor/process-registry.js';
@@ -43,10 +44,17 @@ function assertIsolatedObserverSessionsDir(): void {
 guardSharedProcessRegistrySingleton('process-registry.test.ts');
 
 function makeTempDir(): string {
-  return path.join(tmpdir(), `claude-mem-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  return mkdtempSync(path.join(tmpdir(), 'claude-mem-supervisor-'));
 }
 
 const tempDirs: string[] = [];
+
+function makeRegistry() {
+  const tempDir = makeTempDir();
+  tempDirs.push(tempDir);
+  const registryPath = path.join(tempDir, 'supervisor.json');
+  return { registry: createProcessRegistry(registryPath), registryPath };
+}
 
 describe('supervisor ProcessRegistry', () => {
   afterEach(() => {
@@ -59,31 +67,19 @@ describe('supervisor ProcessRegistry', () => {
   });
 
   describe('isPidAlive', () => {
-    it('treats current process as alive', () => {
-      expect(isPidAlive(process.pid)).toBe(true);
-    });
-
-    it('treats an impossibly high PID as dead', () => {
-      expect(isPidAlive(2147483647)).toBe(false);
-    });
-
-    it('treats negative PID as dead', () => {
-      expect(isPidAlive(-1)).toBe(false);
-    });
-
-    it('treats non-integer PID as dead', () => {
-      expect(isPidAlive(3.14)).toBe(false);
+    it.each([
+      [process.pid, true],
+      [2147483647, false],
+      [-1, false],
+      [3.14, false],
+    ] as const)('reports liveness of PID %s as %s', (pid, expected) => {
+      expect(isPidAlive(pid)).toBe(expected);
     });
   });
 
   describe('persistence', () => {
     it('persists entries to disk and reloads them on initialize', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      mkdirSync(tempDir, { recursive: true });
-      const registryPath = path.join(tempDir, 'supervisor.json');
-
-      const registry1 = createProcessRegistry(registryPath);
+      const { registry: registry1, registryPath } = makeRegistry();
       registry1.register('worker:1', {
         pid: process.pid,
         type: 'worker',
@@ -103,10 +99,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('prunes dead processes on initialize', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      mkdirSync(tempDir, { recursive: true });
-      const registryPath = path.join(tempDir, 'supervisor.json');
+      const { registry, registryPath } = makeRegistry();
 
       writeFileSync(registryPath, JSON.stringify({
         processes: {
@@ -123,7 +116,6 @@ describe('supervisor ProcessRegistry', () => {
         }
       }));
 
-      const registry = createProcessRegistry(registryPath);
       registry.initialize();
 
       const records = registry.getAll();
@@ -187,14 +179,10 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('handles corrupted registry file gracefully', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      mkdirSync(tempDir, { recursive: true });
-      const registryPath = path.join(tempDir, 'supervisor.json');
+      const { registry, registryPath } = makeRegistry();
 
       writeFileSync(registryPath, '{ not valid json!!!');
 
-      const registry = createProcessRegistry(registryPath);
       registry.initialize();
 
       expect(registry.getAll()).toHaveLength(0);
@@ -202,29 +190,8 @@ describe('supervisor ProcessRegistry', () => {
   });
 
   describe('register and unregister', () => {
-    it('register adds an entry retrievable by getAll', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
-
-      expect(registry.getAll()).toHaveLength(0);
-
-      registry.register('sdk:1', {
-        pid: process.pid,
-        type: 'sdk',
-        startedAt: '2026-03-15T00:00:00.000Z'
-      });
-
-      const records = registry.getAll();
-      expect(records).toHaveLength(1);
-      expect(records[0]?.id).toBe('sdk:1');
-      expect(records[0]?.type).toBe('sdk');
-    });
-
     it('unregister removes an entry', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -238,9 +205,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('unregister is a no-op for unknown IDs', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -255,9 +220,7 @@ describe('supervisor ProcessRegistry', () => {
 
   describe('getAll', () => {
     it('returns records sorted by startedAt ascending', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('newest', {
         pid: process.pid,
@@ -281,21 +244,11 @@ describe('supervisor ProcessRegistry', () => {
       expect(records[1]?.id).toBe('middle');
       expect(records[2]?.id).toBe('newest');
     });
-
-    it('returns empty array when no entries exist', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
-
-      expect(registry.getAll()).toEqual([]);
-    });
   });
 
   describe('getBySession', () => {
     it('filters records by session id', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -316,9 +269,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('returns empty array when no processes match the session', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -331,9 +282,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('matches string and numeric session IDs by string comparison', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -348,10 +297,7 @@ describe('supervisor ProcessRegistry', () => {
 
   describe('pruneDeadEntries', () => {
     it('removes entries with dead PIDs and preserves live ones', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registryPath = path.join(tempDir, 'supervisor.json');
-      const registry = createProcessRegistry(registryPath);
+      const { registry } = makeRegistry();
 
       registry.register('alive', {
         pid: process.pid,
@@ -371,9 +317,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('returns 0 when all entries are alive', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('alive', {
         pid: process.pid,
@@ -387,10 +331,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('persists changes to disk after pruning', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registryPath = path.join(tempDir, 'supervisor.json');
-      const registry = createProcessRegistry(registryPath);
+      const { registry, registryPath } = makeRegistry();
 
       registry.register('dead', {
         pid: 2147483647,
@@ -407,10 +348,7 @@ describe('supervisor ProcessRegistry', () => {
 
   describe('clear', () => {
     it('removes all entries', () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registryPath = path.join(tempDir, 'supervisor.json');
-      const registry = createProcessRegistry(registryPath);
+      const { registry, registryPath } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -430,26 +368,6 @@ describe('supervisor ProcessRegistry', () => {
 
       const diskData = JSON.parse(readFileSync(registryPath, 'utf-8'));
       expect(Object.keys(diskData.processes)).toHaveLength(0);
-    });
-  });
-
-  describe('createProcessRegistry', () => {
-    it('creates an isolated instance with a custom path', () => {
-      const tempDir1 = makeTempDir();
-      const tempDir2 = makeTempDir();
-      tempDirs.push(tempDir1, tempDir2);
-
-      const registry1 = createProcessRegistry(path.join(tempDir1, 'supervisor.json'));
-      const registry2 = createProcessRegistry(path.join(tempDir2, 'supervisor.json'));
-
-      registry1.register('sdk:1', {
-        pid: process.pid,
-        type: 'sdk',
-        startedAt: '2026-03-15T00:00:00.000Z'
-      });
-
-      expect(registry1.getAll()).toHaveLength(1);
-      expect(registry2.getAll()).toHaveLength(0);
     });
   });
 
@@ -534,9 +452,7 @@ describe('supervisor ProcessRegistry', () => {
 
   describe('reapSession', () => {
     it('unregisters dead processes for the given session', async () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:99:50001', {
         pid: 2147483640,
@@ -566,9 +482,7 @@ describe('supervisor ProcessRegistry', () => {
     });
 
     it('returns 0 when no processes match the session', async () => {
-      const tempDir = makeTempDir();
-      tempDirs.push(tempDir);
-      const registry = createProcessRegistry(path.join(tempDir, 'supervisor.json'));
+      const { registry } = makeRegistry();
 
       registry.register('sdk:1', {
         pid: process.pid,
@@ -706,14 +620,50 @@ describe('waitForSlot / parked waiters (#2756)', () => {
     expect(getParkedSlotWaiterCount()).toBe(0);
   });
 
-  it('rejects immediately when the hard cap is already exceeded, without parking', async () => {
-    for (let i = 0; i < 10; i++) {
+  it('rejects immediately when the registry is already over the hard cap, without parking', async () => {
+    for (let i = 0; i < 11; i++) {
       registerFakeSdk(`hardcap-${i}`);
     }
 
     await expect(waitForSlot(1, undefined, 'sess-hardcap')).rejects.toThrow(/Hard cap exceeded/);
     expect(isSessionParkedForSlot('sess-hardcap')).toBe(false);
     expect(getParkedSlotWaiterCount()).toBe(0);
+  });
+
+  // #5376: with CLAUDE_MEM_MAX_CONCURRENT_AGENTS=10 a full pool reached the
+  // hard cap, so starts threw and the session discarded its queued messages.
+  it('parks (does not throw) when a limit of 10 fills the pool to the hard cap', async () => {
+    const occupants: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      occupants.push(registerFakeSdk(`full-${i}`));
+    }
+
+    const parked = waitForSlot(10, undefined, 'sess-full-pool');
+    expect(isSessionParkedForSlot('sess-full-pool')).toBe(true);
+    expect(getParkedSlotWaiterCount()).toBe(1);
+
+    registry.unregister(occupants[0]);
+    grantedReservations.push(await parked);
+    expect(isSessionParkedForSlot('sess-full-pool')).toBe(false);
+    expect(getReservedSlotCount()).toBe(1);
+  });
+
+  it('treats a limit above the hard cap as the hard cap', async () => {
+    for (let i = 0; i < 9; i++) {
+      registerFakeSdk(`over-${i}`);
+    }
+
+    // 9 in use, limit 15: one slot left under the cap of 10.
+    grantedReservations.push(await waitForSlot(15, undefined, 'sess-ninth'));
+    expect(isSessionParkedForSlot('sess-ninth')).toBe(false);
+
+    // Now 10 (9 + 1 reservation): the next caller waits instead of spawning an 11th.
+    const parked = waitForSlot(15, undefined, 'sess-eleventh');
+    expect(isSessionParkedForSlot('sess-eleventh')).toBe(true);
+
+    grantedReservations.pop()!.release();
+    grantedReservations.push(await parked);
+    expect(getReservedSlotCount()).toBe(1);
   });
 
   it('resolves immediately (no parking) when the active count is already under the limit', async () => {

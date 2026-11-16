@@ -8,11 +8,12 @@ import {
 import { resolve } from 'path';
 import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
 import { expandHome } from '../../shared/expand-home.js';
+import { cliFlagValue } from '../../shared/cli-flag-value.js';
 
-function getArgValue(args: string[], name: string): string | null {
-  const index = args.indexOf(name);
-  if (index === -1) return null;
-  return args[index + 1] ?? null;
+function getArgValue(args: string[], name: string): string | undefined {
+  const value = cliFlagValue(args, name);
+  if (value === null) throw new Error(`${name} requires a value`);
+  return value;
 }
 
 function hasFlag(args: string[], name: string): boolean {
@@ -33,10 +34,11 @@ const USAGE =
  * fallback for a direct invocation. A relative --source is relative to it too.
  */
 function resolveSource(args: string[]): { source: string; all: boolean } {
+  const explicit = getArgValue(args, '--source');
+  const cwd = getArgValue(args, '--cwd');
   const all = hasFlag(args, '--all');
   if (all) return { source: claudeProjectsDir(), all: true };
-  const callerCwd = resolve(getArgValue(args, '--cwd') ?? process.cwd());
-  const explicit = getArgValue(args, '--source');
+  const callerCwd = resolve(cwd ?? process.cwd());
   if (explicit) return { source: resolve(callerCwd, expandHome(explicit)), all: false };
   return { source: memoryDirForCwd(callerCwd), all: false };
 }
@@ -44,7 +46,14 @@ function resolveSource(args: string[]): { source: string; all: boolean } {
 export async function runMemoryCommand(subcommand: string | undefined, args: string[]): Promise<number> {
   switch (subcommand) {
     case 'ingest': {
-      const { source, all } = resolveSource(args);
+      let resolved: ReturnType<typeof resolveSource>;
+      try {
+        resolved = resolveSource(args);
+      } catch (error) {
+        console.error(error instanceof Error ? error.message : String(error));
+        return 1;
+      }
+      const { source, all } = resolved;
 
       // Dry-run is pure parse + count — no worker, no spend — so run it here.
       if (hasFlag(args, '--dry-run')) {

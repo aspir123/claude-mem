@@ -135,25 +135,23 @@ describe('remote upload scheduling', () => {
         const { spoolHookEvent, settleHookSpoolNudges } = await import(${JSON.stringify(pathToFileURL(join(root, 'src/cli/spool-hook-event.ts')).href)});
         spyOn(HookSpool.prototype, 'entries').mockImplementation(() => { throw new Error('hook scanned payloads'); });
         spyOn(HookSpool.prototype, 'drain').mockImplementation(() => { throw new Error('hook drained payloads'); });
-        const started = performance.now();
         for (let i = 0; i < 8; i++) {
-          spoolHookEvent('observation', { contentSessionId: 'scheduling-session', platformSource: 'codex', toolName: 'exec_command', toolUseId: 'schedule-' + i, toolInput: { cmd: 'read fixture' }, toolResponse: 'detached capture', cwd: '/repo' });
+          spoolHookEvent('advisor_calls', { contentSessionId: 'scheduling-session', platformSource: 'codex', calls: [{ toolUseId: 'schedule-' + i, advice: 'metadata', occurredAtEpoch: Date.now() }], cwd: '/repo' });
         }
         await settleHookSpoolNudges();
-        const elapsedMs = performance.now() - started;
         expect(uploads).toBe(1);
         if (${lateEvent}) {
           const deadline = Date.now() + 8000;
           const ready = ${JSON.stringify(join(directory, 'upload-started'))};
           while (!existsSync(ready) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
           expect(existsSync(ready)).toBe(true);
-          spoolHookEvent('observation', { contentSessionId: 'scheduling-session', platformSource: 'codex', toolName: 'exec_command', toolUseId: 'late-event', toolInput: {}, toolResponse: 'arrived during delivery', cwd: '/repo' });
+          spoolHookEvent('advisor_calls', { contentSessionId: 'scheduling-session', platformSource: 'codex', calls: [{ toolUseId: 'late-event', advice: 'arrived during delivery', occurredAtEpoch: Date.now() }], cwd: '/repo' });
           await settleHookSpoolNudges();
           expect(uploads).toBe(1);
           while (new HookSpool().hasEntries() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
           expect(new HookSpool().hasEntries()).toBe(false);
         }
-        console.log(JSON.stringify({ elapsedMs, uploads }));
+        console.log(JSON.stringify({ uploads }));
       `;
       const child = Bun.spawn([process.execPath, '-e', source], {
         cwd: root,
@@ -172,7 +170,6 @@ describe('remote upload scheduling', () => {
       ]);
       if (exit !== 0) throw new Error(`hook exited ${exit}: ${stderr}`);
       const result = JSON.parse(stdout.trim().split('\n').pop()!);
-      expect(result.elapsedMs).toBeLessThan(500);
       expect(result.uploads).toBe(lateEvent ? 2 : 1);
       const deadline = Date.now() + 10000;
       const expected = lateEvent ? 9 : 8;

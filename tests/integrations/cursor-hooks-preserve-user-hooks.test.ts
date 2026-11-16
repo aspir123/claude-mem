@@ -9,6 +9,7 @@ describe('Cursor hooks.json install/uninstall preserves user hooks', () => {
   let tmp: string;
   let home: string;
   let hooksJsonPath: string;
+  let mcpJsonPath: string;
   let originalCwd: string;
   const saved: Record<string, string | undefined> = {};
 
@@ -21,7 +22,9 @@ describe('Cursor hooks.json install/uninstall preserves user hooks', () => {
     mkdirSync(path.join(home, '.cursor'), { recursive: true });
     mkdirSync(path.join(pluginRoot, 'scripts'), { recursive: true });
     writeFileSync(path.join(pluginRoot, 'scripts', 'worker-service.cjs'), '');
+    writeFileSync(path.join(pluginRoot, 'scripts', 'mcp-server.cjs'), '');
     hooksJsonPath = path.join(home, '.cursor', 'hooks.json');
+    mcpJsonPath = path.join(home, '.cursor', 'mcp.json');
     for (const key of ['CLAUDE_PLUGIN_ROOT']) saved[key] = process.env[key];
     process.env.CLAUDE_PLUGIN_ROOT = pluginRoot;
     // Use the 'project' target (.cursor under cwd): never touches the real ~/.cursor.
@@ -65,6 +68,21 @@ describe('Cursor hooks.json install/uninstall preserves user hooks', () => {
     expect(config.hooks.beforeSubmitPrompt.filter(isOurs)).toHaveLength(2);
   });
 
+  it('install wires the postToolUse events that record reads, searches and failures', async () => {
+    const { installCursorHooks } = await installer();
+    expect(await installCursorHooks('project')).toBe(0);
+
+    const config = read();
+    const postToolUse = config.hooks.postToolUse.filter(isOurs);
+    expect(postToolUse).toHaveLength(1);
+    expect(postToolUse[0].matcher).toBe('Read|Grep|Task');
+    expect(postToolUse[0].command).toContain('hook cursor observation');
+    const postToolUseFailure = config.hooks.postToolUseFailure.filter(isOurs);
+    expect(postToolUseFailure).toHaveLength(1);
+    expect(postToolUseFailure[0].matcher).toBe('Read|Grep|Task|Write');
+    expect(postToolUseFailure[0].command).toContain('hook cursor observation');
+  });
+
   it('install refuses to overwrite an unparseable hooks.json', async () => {
     writeFileSync(hooksJsonPath, '{ not json');
     const { installCursorHooks } = await installer();
@@ -99,6 +117,42 @@ describe('Cursor hooks.json install/uninstall preserves user hooks', () => {
 
     expect(uninstallCursorHooks('project')).toBe(0);
     expect(readFileSync(hooksJsonPath, 'utf-8')).toBe('{ not json');
+  });
+
+  // `npx claude-mem install --ide cursor` also registers claude-mem's MCP server
+  // in mcp.json, next to hooks.json.
+  const userMcpServers = { github: { command: 'gh-mcp' } };
+
+  it('uninstall removes the MCP server claude-mem added to mcp.json and keeps the user\'s', async () => {
+    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: userMcpServers }));
+    const { installCursorHooks, configureCursorMcp, uninstallCursorHooks } = await installer();
+    expect(await installCursorHooks('project')).toBe(0);
+    expect(configureCursorMcp('project')).toBe(0);
+
+    expect(uninstallCursorHooks('project')).toBe(0);
+
+    expect(JSON.parse(readFileSync(mcpJsonPath, 'utf-8'))).toEqual({ mcpServers: userMcpServers });
+  });
+
+  it('uninstall leaves an mcp.json without claude-mem untouched', async () => {
+    const original = JSON.stringify({ mcpServers: userMcpServers });
+    writeFileSync(mcpJsonPath, original);
+    const { uninstallCursorHooks } = await installer();
+
+    expect(uninstallCursorHooks('project')).toBe(0);
+    expect(readFileSync(mcpJsonPath, 'utf-8')).toBe(original);
+  });
+
+  it('uninstall still removes the hooks when mcp.json is unparseable, and fails without touching it', async () => {
+    writeFileSync(mcpJsonPath, '{ not json');
+    const { installCursorHooks, uninstallCursorHooks } = await installer();
+    expect(await installCursorHooks('project')).toBe(0);
+
+    expect(uninstallCursorHooks('project')).toBe(1);
+
+    expect(readFileSync(mcpJsonPath, 'utf-8')).toBe('{ not json');
+    expect(existsSync(hooksJsonPath)).toBe(false);
+    expect(existsSync(path.join(home, '.cursor', 'rules', 'claude-mem-context.mdc'))).toBe(false);
   });
 
   // Older installers pointed hooks.json at scripts copied into .cursor/hooks/.

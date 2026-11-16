@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, mock, spyOn } from 'bun:test';
-import codeMode from '../../plugin/modes/code.json';
+import { installScriptedClaudeSdk, createScriptedSession, settle, withTimeout } from '../fixtures/worker/scripted-claude-sdk.js';
 import type { ActiveSession } from '../../src/services/worker-types.js';
 import * as observerHealth from '../../src/shared/observer-health.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'fs';
@@ -22,179 +22,10 @@ import { join } from 'path';
 // finalized away. A non-transient error and a throw from response processing
 // are left to the runner, which books them in observer health.
 
-const actualAgentSdk = { ...(await import('@anthropic-ai/claude-agent-sdk')) };
-const actualFindClaude = { ...(await import('../../src/shared/find-claude-executable.js')) };
-const actualEnvManager = { ...(await import('../../src/shared/EnvManager.js')) };
-const actualProcessRegistry = { ...(await import('../../src/supervisor/process-registry.js')) };
-const actualModeManager = { ...(await import('../../src/services/domain/ModeManager.js')) };
-const actualContextGenerator = { ...(await import('../../src/services/context-generator.js')) };
-
-class FakeSdk {
-  readonly prompts: string[] = [];
-  private outbox: unknown[] = [];
-  private ended = false;
-  private failure: Error | null = null;
-  private inputDone = false;
-  private wakeStream: (() => void) | null = null;
-  private progressWaiters: Array<() => void> = [];
-
-  constructor(prompt: AsyncIterable<any>, signal: AbortSignal | undefined) {
-    signal?.addEventListener('abort', () => this.end(), { once: true });
-    void this.pump(prompt);
-  }
-
-  /** Pull the next prompt the moment the previous one has been taken, as the real SDK does. */
-  private async pump(prompt: AsyncIterable<any>): Promise<void> {
-    const iterator = prompt[Symbol.asyncIterator]();
-    while (true) {
-      const next = await iterator.next();
-      if (next.done) {
-        this.inputDone = true;
-        this.notify();
-        return;
-      }
-      this.prompts.push(String(next.value.message.content));
-      this.notify();
-    }
-  }
-
-  get inputFinished(): boolean {
-    return this.inputDone;
-  }
-
-  /** One complete turn: a text frame and the success result that closes it. */
-  answer(text: string): void {
-    this.textFrame(text);
-    this.result();
-  }
-
-  /** A text frame on its own: the turn is still open until a result arrives. */
-  textFrame(text: string): void {
-    this.push({ type: 'assistant', message: { content: [{ type: 'text', text }], usage: { input_tokens: 10, output_tokens: 2 } } });
-  }
-
-  result(): void {
-    this.push({ type: 'result', subtype: 'success', is_error: false, usage: { input_tokens: 10, output_tokens: 2 } });
-  }
-
-  /** A turn that failed before emitting any text. */
-  failTurn(): void {
-    this.push({ type: 'result', subtype: 'error_during_execution', is_error: true });
-  }
-
-  /** Any other SDK frame (system init, rate_limit_event). */
-  frame(message: Record<string, unknown>): void {
-    this.push(message);
-  }
-
-  /** The output iterator throws: the child died, the socket closed. */
-  fail(error: Error): void {
-    this.failure = error;
-    this.wakeStream?.();
-  }
-
-  /** The output iterator ends cleanly. */
-  end(): void {
-    this.ended = true;
-    this.wakeStream?.();
-    this.notify();
-  }
-
-  private push(message: unknown): void {
-    this.outbox.push(message);
-    this.wakeStream?.();
-  }
-
-  async *stream(): AsyncGenerator<unknown> {
-    while (true) {
-      while (this.outbox.length > 0) yield this.outbox.shift();
-      if (this.failure) throw this.failure;
-      if (this.ended) return;
-      await new Promise<void>(resolve => { this.wakeStream = resolve; });
-      this.wakeStream = null;
-    }
-  }
-
-  private notify(): void {
-    const waiters = this.progressWaiters;
-    this.progressWaiters = [];
-    for (const waiter of waiters) waiter();
-  }
-
-  /** Resolve once `predicate` holds, failing the probe instead of hanging bun. */
-  async until(predicate: () => boolean, label: string, timeoutMs = 2_000): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (!predicate()) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(`timed out waiting for: ${label}`);
-      await Promise.race([
-        new Promise<void>(resolve => this.progressWaiters.push(resolve)),
-        new Promise<void>(resolve => setTimeout(resolve, Math.min(remaining, 20))),
-      ]);
-    }
-  }
-}
-
-let currentSdk: FakeSdk | null = null;
-/** Credentials the mocked spawn env carries; none = the CLI runs on its own stored login. */
-let spawnCredentials: Record<string, string> = {};
-
-mock.module('@anthropic-ai/claude-agent-sdk', () => ({
-  ...actualAgentSdk,
-  query: ({ prompt, options }: { prompt: AsyncIterable<any>; options?: { abortController?: AbortController } }) => {
-    currentSdk = new FakeSdk(prompt, options?.abortController?.signal);
-    return currentSdk.stream();
-  },
-}));
-
-mock.module('../../src/shared/find-claude-executable.js', () => ({
-  ...actualFindClaude,
-  findClaudeExecutable: () => '/mock/claude',
-}));
-
-mock.module('../../src/shared/EnvManager.js', () => ({
-  ...actualEnvManager,
-  buildIsolatedEnvWithFreshOAuth: async () => ({ PATH: process.env.PATH ?? '', ...spawnCredentials }),
-  // Not an API key: the subscription quota guard applies.
-  getAuthMethodDescription: () => 'test-auth',
-}));
-
-mock.module('../../src/supervisor/process-registry.js', () => ({
-  ...actualProcessRegistry,
-  waitForSlot: async () => ({ release: () => {} }),
-  createSdkSpawnFactory: () => () => {
-    throw new Error('spawn factory must not run in this test');
-  },
-  getSdkProcessForSession: () => undefined,
-  ensureSdkProcessExit: async () => {},
-}));
-
-mock.module('../../src/services/domain/ModeManager.js', () => ({
-  ...actualModeManager,
-  ModeManager: {
-    getInstance: () => ({
-      getActiveMode: () => ({
-        name: 'code',
-        prompts: codeMode.prompts,
-        observation_types: [{ id: 'discovery' }],
-        observation_concepts: [],
-      }),
-    }),
-  },
-}));
-
-mock.module('../../src/services/context-generator.js', () => ({
-  ...actualContextGenerator,
-  generateContext: async () => '',
-}));
-
+const sdkFixture = installScriptedClaudeSdk({ eager: true, endOnInputDone: false, startTimeoutMs: 5_000 });
+const { sdk, sdkStarted } = sdkFixture;
 afterAll(() => {
-  mock.module('@anthropic-ai/claude-agent-sdk', () => actualAgentSdk);
-  mock.module('../../src/shared/find-claude-executable.js', () => actualFindClaude);
-  mock.module('../../src/shared/EnvManager.js', () => actualEnvManager);
-  mock.module('../../src/supervisor/process-registry.js', () => actualProcessRegistry);
-  mock.module('../../src/services/domain/ModeManager.js', () => actualModeManager);
-  mock.module('../../src/services/context-generator.js', () => actualContextGenerator);
+  sdkFixture.restore();
   resetQuotaCooldownsForTesting();
 });
 
@@ -213,28 +44,9 @@ const SESSION_ID = 6106;
 const SKIP_REPLY = '<skip_summary reason="noise" />';
 
 function createSession(sessionDbId = SESSION_ID): ActiveSession {
-  return {
-    sessionDbId,
-    contentSessionId: `content-${sessionDbId}`,
-    memorySessionId: null,
-    project: 'observer-project',
-    platformSource: 'claude',
-    userPrompt: 'work through the backlog',
-    abortController: new AbortController(),
-    generatorPromise: null,
-    lastPromptNumber: 2,
-    startTime: Date.now(),
-    cumulativeInputTokens: 0,
-    cumulativeOutputTokens: 0,
-    earliestPendingTimestamp: null,
-    claimedMessageIds: [],
-    conversationHistory: [],
-    currentProvider: 'claude',
-    consecutiveRestarts: 0,
-    consecutiveInvalidOutputs: 0,
-    consecutiveContextOverflows: 0,
-    lastGeneratorActivity: Date.now(),
-  } as ActiveSession;
+  return createScriptedSession(sessionDbId, {
+    userPrompt: 'work through the backlog', currentProvider: 'claude', consecutiveContextOverflows: 0,
+  });
 }
 
 function createHarness(backlog: number) {
@@ -245,6 +57,7 @@ function createHarness(backlog: number) {
       updateMemorySessionId: () => {},
       storeObservations: () => ({ observationIds: [1], summaryId: null, createdAtEpoch: Date.now() }),
       linkToolUsesToObservation: () => 0,
+      markCommittedToolUses: () => {},
     }),
     getChromaSync: () => null,
     getCloudSync: () => null,
@@ -283,32 +96,6 @@ function createHarness(backlog: number) {
   };
 }
 
-function sdk(): FakeSdk {
-  if (!currentSdk) throw new Error('query() was never called');
-  return currentSdk;
-}
-
-async function sdkStarted(timeoutMs = 5_000): Promise<FakeSdk> {
-  const deadline = Date.now() + timeoutMs;
-  while (!currentSdk) {
-    if (Date.now() > deadline) throw new Error('query() was never called');
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  return currentSdk;
-}
-
-/** Give an unpaced feed every chance to run ahead before asserting it did not. */
-function settle(ms = 30): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function withTimeout<T>(promise: Promise<T>, label: string, ms = 2_000): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`timed out: ${label}`)), ms)),
-  ]);
-}
-
 /** Drive a generation through its init turn and the claim of the first observation. */
 async function claimFirstObservation(h: ReturnType<typeof createHarness>) {
   const run = h.provider.startSession(h.session);
@@ -326,7 +113,7 @@ let liveSessions: ActiveSession[] = [];
 let previousObserveBarePrompts: string | undefined;
 
 beforeEach(() => {
-  currentSdk = null;
+  sdkFixture.currentSdk = null;
   liveSessions = [];
   resetQuotaCooldownsForTesting();
   resetDependencyStatusesForTesting();
@@ -464,7 +251,7 @@ describe('work preservation — the SDK stream ends or breaks', () => {
     });
   }
 
-  it('a spent API key thrown mid-batch pauses on quota and preserves the batch', async () => {
+  it('a spent API key discards the batch when the generator exits', async () => {
     const h = createHarness(1);
     liveSessions.push(h.session);
     const { run } = await claimFirstObservation(h);
@@ -480,7 +267,7 @@ describe('work preservation — the SDK stream ends or breaks', () => {
     expect(h.pending()).toBe(1);
     expect(h.session.claimedMessageIds).toEqual([]);
     const outcome = await h.exit();
-    expect(outcome).toEqual({ finalized: 0, sessionKept: true, pending: 1 });
+    expect(outcome).toEqual({ finalized: 0, sessionKept: true, pending: 0 });
   });
 
   it('books observer health once when the stream keeps exiting without answering', async () => {
@@ -580,8 +367,7 @@ describe('work preservation — ordering and durable state', () => {
     await withTimeout(run, 'startSession after abort');
   });
 
-
-  it('carries the actual quota-guard window out of the stream and keeps the claimed batch', async () => {
+  it('carries the quota-guard window and skips the batch on exit', async () => {
     const h = createHarness(1);
     liveSessions.push(h.session);
     const { run, claimedId } = await claimFirstObservation(h);
@@ -595,17 +381,62 @@ describe('work preservation — ordering and durable state', () => {
       expect(h.session.abortController.signal.aborted).toBe(true);
       expect(h.pending()).toBe(1);
       const outcome = await h.exit();
-      expect(outcome).toEqual({ finalized: 0, sessionKept: true, pending: 1 });
+      expect(outcome).toEqual({ finalized: 0, sessionKept: true, pending: 0 });
 
-      // The next generation re-yields the message the guard interrupted.
-      h.session.abortController = new AbortController();
-      const next = h.sessionManager.getMessageIterator(SESSION_ID);
-      const reclaimed = await withTimeout(next.next(), 'reclaim after quota guard');
-      expect(reclaimed.value?._persistentId).toBe(claimedId);
-      h.session.abortController.abort();
-      await next.return?.(undefined);
+      expect(h.sessionManager.getMessageBuffer().peekTypes(SESSION_ID)).toEqual([]);
     } finally {
       globalRateLimitStore.set({ rateLimitType: 'seven_day', utilization: 0, status: 'allowed' });
+    }
+  });
+
+  // #5182: an account without extra usage (or with the overage-included bucket
+  // spent) gets a rejected overage bucket on responses the provider serves. The
+  // CLI emits that rate_limit_event after the turn's text frame.
+  it('keeps capturing when a rejected overage bucket arrives with a served response (#5182)', async () => {
+    const h = createHarness(2);
+    liveSessions.push(h.session);
+    const { run } = await claimFirstObservation(h);
+
+    try {
+      sdk().textFrame(SKIP_REPLY);
+      sdk().frame({
+        type: 'rate_limit_event',
+        rate_limit_info: { rateLimitType: 'overage', status: 'rejected', overageStatus: 'rejected', isUsingOverage: false },
+      });
+      sdk().frame({
+        type: 'rate_limit_event',
+        rate_limit_info: { rateLimitType: 'seven_day_overage_included', status: 'rejected', resetsAt: Date.now() + 86_400_000 },
+      });
+      sdk().result();
+      await sdk().until(() => sdk().prompts.length >= 3, 'next observation after a served turn');
+
+      expect(h.session.abortReason ?? null).toBeNull();
+      expect(h.session.abortController.signal.aborted).toBe(false);
+
+      h.session.abortController.abort();
+      await withTimeout(run, 'startSession after abort');
+    } finally {
+      globalRateLimitStore.set({ rateLimitType: 'overage', status: 'allowed', overageStatus: 'allowed' });
+      globalRateLimitStore.set({ rateLimitType: 'seven_day_overage_included', status: 'allowed' });
+    }
+  });
+
+  it('still pauses on a rejected overage bucket when the request went unanswered (#5182)', async () => {
+    const h = createHarness(1);
+    liveSessions.push(h.session);
+    const { run } = await claimFirstObservation(h);
+
+    try {
+      sdk().frame({
+        type: 'rate_limit_event',
+        rate_limit_info: { rateLimitType: 'overage', status: 'rejected', overageStatus: 'rejected', isUsingOverage: false },
+      });
+      await withTimeout(run, 'startSession after quota guard');
+
+      expect(h.session.abortReason).toBe('quota:overage:quota_exhausted');
+      expect(h.pending()).toBe(1);
+    } finally {
+      globalRateLimitStore.set({ rateLimitType: 'overage', status: 'allowed', overageStatus: 'allowed' });
     }
   });
 
@@ -732,6 +563,7 @@ describe('work preservation — a generator that throws, seen from the runner', 
         updateMemorySessionId: () => {},
         storeObservations: () => ({ observationIds: [1], summaryId: null, createdAtEpoch: Date.now() }),
         linkToolUsesToObservation: () => 0,
+        markCommittedToolUses: () => {},
       }),
       getChromaSync: () => null,
       getCloudSync: () => null,
@@ -801,6 +633,87 @@ describe('work preservation — a generator that throws, seen from the runner', 
     }
   });
 
+  it('a model refusal is booked as a model outage, not dropped as prose (#5315)', async () => {
+    const booked: unknown[][] = [];
+    const { routes, session } = await buildRoutesWithRealProvider(6191);
+    liveSessions.push(session);
+    const recordFailure = spyOn(observerHealth, 'recordObserverFailure').mockImplementation((...args: unknown[]) => {
+      booked.push(args);
+    });
+    const healthDir = mkdtempSync(join(tmpdir(), 'claude-mem-model-refusal-'));
+    try {
+      await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
+      await sdkStarted();
+      await sdk().until(() => sdk().prompts.length >= 1, 'init prompt');
+      sdk().answer(SKIP_REPLY);
+      await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
+
+      // The frame Claude Code 2.1.318 sends for ANTHROPIC_DEFAULT_HAIKU_MODEL=auto.
+      sdk().frame({
+        type: 'assistant',
+        error: 'model_not_found',
+        message: {
+          model: '<synthetic>',
+          content: [{ type: 'text', text: "There's an issue with the selected model (auto). It may not exist or you may not have access to it. Run --model to pick a different model." }],
+          usage: {},
+        },
+      });
+      await withTimeout(session.generatorPromise ?? Promise.resolve(), 'generator chain after model refusal');
+      await settle(5);
+
+      expect(booked).toHaveLength(1);
+      expect(booked[0][0]).toBe('claude');
+      const detail = booked[0][1] as { kind: string; code: string; action: string; message: string };
+      expect(detail.kind).toBe('unrecoverable');
+      expect(detail.code).toBe('model_unavailable');
+      expect(detail.message).not.toContain('prose');
+
+      recordFailure.mockRestore();
+      const healthPath = join(healthDir, 'observer-health.json');
+      observerHealth.recordObserverFailure('claude', detail, healthPath);
+      const warning = observerHealth.renderObserverHealthWarning(observerHealth.readObserverHealth(healthPath)!);
+      expect(warning).toContain('Latest error: There\'s an issue with the selected model (auto)');
+      expect(warning).toContain('What to do: Set CLAUDE_MEM_MODEL in ~/.claude-mem/settings.json');
+      expect(warning).toContain('Restarting will NOT help here');
+      expect(warning).not.toContain('Click to restart');
+    } finally {
+      recordFailure.mockRestore();
+      rmSync(healthDir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips a queued batch and records the Anthropic verification remedy (#5251)', async () => {
+    const cleanUp = useCredentialFallback('api-key');
+    const booked: unknown[][] = [];
+    const { routes, session, sessionManager, finalizeCalls } = await buildRoutesWithRealProvider(6110);
+    liveSessions.push(session);
+    const recordFailure = spyOn(observerHealth, 'recordObserverFailure').mockImplementation((...args: unknown[]) => {
+      booked.push(args);
+    });
+    try {
+      await startAndClaim(routes, session);
+      const claimedId = session.claimedMessageIds[0];
+      expect(claimedId).toBeDefined();
+
+      sdk().answer("API Error: Your account can't receive replies from Claude right now. You can find the next step in the Anthropic Verification Portal: https://portal.anthropic.com/verify?org=private-org-id");
+      await withTimeout(session.generatorPromise ?? Promise.resolve(), 'generator after verification hold');
+      await settle(5);
+
+      expect(sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId)).toBe(0);
+      expect(sessionManager.getSession(session.sessionDbId)).toBe(session);
+      expect(finalizeCalls()).toBe(0);
+      expect(session.abortReason).toBeNull();
+      expect(booked).toHaveLength(1);
+      expect(booked[0][0]).toBe('claude');
+      expect(booked[0][1]).toMatchObject({ kind: 'auth_invalid' });
+      expect(booked[0][1]).toMatchObject({ action: expect.stringContaining('Verification Portal') });
+      expect(JSON.stringify(booked)).not.toContain('private-org-id');
+    } finally {
+      recordFailure.mockRestore();
+      cleanUp();
+    }
+  });
+
   /**
    * CLAUDE_MEM_QUOTA_FALLBACK_AUTH_METHOD set to `target`, with both a Claude
    * Code login (a temp profile's .credentials.json) and a fallback API key (a
@@ -822,7 +735,7 @@ describe('work preservation — a generator that throws, seen from the runner', 
       CLAUDE_MEM_TIER_ROUTING_ENABLED: 'false',
     });
     return () => {
-      spawnCredentials = {};
+      sdkFixture.credentials = {};
       for (const key of keys) {
         if (saved[key] === undefined) delete process.env[key];
         else process.env[key] = saved[key];
@@ -841,11 +754,11 @@ describe('work preservation — a generator that throws, seen from the runner', 
     await sdk().until(() => sdk().prompts.length >= 2, 'first observation');
   }
 
-  it('a spent API key thrown mid-batch arms the breaker for the key, and the next run goes on the subscription login', async () => {
+  it('a spent API key thrown mid-batch arms the breaker for the key, and fresh work uses the subscription login', async () => {
     const cleanUp = useCredentialFallback('subscription');
     const recordFailure = spyOn(observerHealth, 'recordObserverFailure').mockImplementation(() => {});
     try {
-      spawnCredentials = { ANTHROPIC_API_KEY: 'sk-ant-spent' };
+      sdkFixture.credentials = { ANTHROPIC_API_KEY: 'sk-ant-spent' };
       const { routes, session, sessionManager } = await buildRoutesWithRealProvider(6120);
       liveSessions.push(session);
       await startAndClaim(routes, session);
@@ -858,9 +771,9 @@ describe('work preservation — a generator that throws, seen from the runner', 
 
       expect(getQuotaCooldown('claude')?.auth).toBe('api-key');
       expect(sessionManager.getSession(session.sessionDbId)).toBe(session);
-      expect(sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId)).toBe(1);
-
-      currentSdk = null;
+      expect(sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId)).toBe(0);
+      sessionManager.getMessageBuffer().enqueue(session.sessionDbId, { type: 'observation', tool_name: 'Read', toolUseId: 'fresh-after-quota' });
+      sdkFixture.currentSdk = null;
       await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
       expect(session.claudeAuthOverride).toBe('subscription');
       await sdkStarted();
@@ -870,12 +783,12 @@ describe('work preservation — a generator that throws, seen from the runner', 
     }
   });
 
-  it('a guard-paused login the CLI manages itself (no token injected) hands over to the fallback API key', async () => {
+  it('a guard-paused login the CLI manages itself (no token injected) sends fresh work to the fallback API key', async () => {
     const cleanUp = useCredentialFallback('api-key');
     try {
       // The token read came back expired or absent: no key, no token, no gateway.
-      spawnCredentials = {};
-      const { routes, session } = await buildRoutesWithRealProvider(6121);
+      sdkFixture.credentials = {};
+      const { routes, session, sessionManager } = await buildRoutesWithRealProvider(6121);
       liveSessions.push(session);
       await startAndClaim(routes, session);
       expect(session.observerAuth).toBe('subscription');
@@ -885,7 +798,9 @@ describe('work preservation — a generator that throws, seen from the runner', 
       await settle(5);
       expect(getQuotaCooldown('claude')?.auth).toBe('subscription');
 
-      currentSdk = null;
+      expect(sessionManager.getMessageBuffer().getPendingCount(session.sessionDbId)).toBe(0);
+      sessionManager.getMessageBuffer().enqueue(session.sessionDbId, { type: 'observation', tool_name: 'Read', toolUseId: 'fresh-after-quota' });
+      sdkFixture.currentSdk = null;
       await routes.ensureGeneratorRunning(session.sessionDbId, 'observation');
       expect(session.claudeAuthOverride).toBe('api-key');
       await sdkStarted();
@@ -934,19 +849,6 @@ describe('work preservation with observation batching', () => {
   afterEach(() => {
     if (previousBatchSize === undefined) delete process.env.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE;
     else process.env.CLAUDE_MEM_CLAUDE_OBSERVATION_BATCH_SIZE = previousBatchSize;
-  });
-
-  it('one prompt claims up to the batch size from the backlog', async () => {
-    const h = createHarness(6);
-    liveSessions.push(h.session);
-    const { run } = await claimFirstObservation(h);
-
-    expect(h.session.claimedMessageIds.length).toBe(4);
-    for (let i = 0; i < 4; i++) expect(sdk().prompts[1]).toContain(`step ${i}`);
-    expect(sdk().prompts[1]).not.toContain('step 4');
-
-    h.session.abortController.abort();
-    await withTimeout(run, 'startSession after abort');
   });
 
   it('an answered batch confirms every event in it, once', async () => {
