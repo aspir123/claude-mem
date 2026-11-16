@@ -1,14 +1,15 @@
-// MY FOCUS: the kept areas in priority order (the owner's order wins), then Other, then "N suggested", each with how
+// MY FOCUS: four kept areas in priority order (the owner's order wins), then Other, then "N suggested", each with how
 // many requests in it need you. On the wide rail it is a nav section; on phones and the icon-only rail, a chip row.
 // The rail's highlight is App's side-nav pill: one pill slides between focus areas, pages and Past focus.
-import { HistoryIcon, SparklesIcon } from 'lucide-react'
+import { useMemo } from 'react'
+import { Grid2X2Icon, HistoryIcon, SparklesIcon } from 'lucide-react'
 import { interpolate, useI18n } from '@/lib/i18n'
 import { ActivePill } from '@/components/bits'
 import { cn } from '@/lib/utils'
 import { Req } from '@/spec/req'
-import { needsYou, OTHER_FOCUS_AREA_ID } from '@/data'
+import { OTHER_FOCUS_AREA_ID } from '@/data'
 import { useWorkModel } from '@/store'
-import { resolveFocusAreaId } from '@/live/to-focus-model'
+import { focusNavActivity, focusNavAreas } from '@/live/focus-nav'
 
 /** What the rail can select: My Work filtered to one area (or Other), the Suggested queue, or Past focus. */
 /** App's page buttons use the same layoutId, so selecting anything in the rail slides the one pill there. */
@@ -20,17 +21,16 @@ export type FocusSelection = { kind: 'area'; focusAreaId: string } | { kind: 'su
 interface FocusNavEntry { key: string; label: string; count: number; moving?: boolean; selection: Exclude<FocusSelection, null>; muted?: boolean }
 
 /** The entries in rail order. Rail and chip row read the same list. */
-function useFocusNavEntries(): { focus: FocusNavEntry[]; pastFocus: FocusNavEntry } {
+function useFocusNavEntries(selected: FocusSelection): { focus: FocusNavEntry[]; pastFocus: FocusNavEntry } {
   const { t } = useI18n()
   const { focusAreas, requests } = useWorkModel()
-  const needsYouIn = (id: string) => requests.filter((request) => needsYou(request) && resolveFocusAreaId(request.focusAreaId, focusAreas) === id).length
-  const movingIn = (id: string) => requests.some((request) => !request.closed && request.state === 'working' && resolveFocusAreaId(request.focusAreaId, focusAreas) === id)
-  const kept = focusAreas.filter((area) => area.status === 'kept' && !area.mergedInto)
+  const activity = useMemo(() => focusNavActivity(focusAreas, requests), [focusAreas, requests])
+  const kept = focusNavAreas(focusAreas, selected?.kind === 'area' ? selected.focusAreaId : null)
   const suggested = focusAreas.filter((area) => area.status === 'suggested' && !area.mergedInto).length
   return {
     focus: [
-      ...kept.map((area) => ({ key: area.id, label: area.name, count: needsYouIn(area.id), moving: movingIn(area.id), selection: { kind: 'area' as const, focusAreaId: area.id } })),
-      { key: OTHER_FOCUS_AREA_ID, label: t('Other'), count: needsYouIn(OTHER_FOCUS_AREA_ID), moving: movingIn(OTHER_FOCUS_AREA_ID), selection: { kind: 'area', focusAreaId: OTHER_FOCUS_AREA_ID } },
+      ...kept.map((area) => ({ key: area.id, label: area.name, count: activity.get(area.id)?.count ?? 0, moving: activity.get(area.id)?.moving, selection: { kind: 'area' as const, focusAreaId: area.id } })),
+      { key: OTHER_FOCUS_AREA_ID, label: t('Other'), count: activity.get(OTHER_FOCUS_AREA_ID)?.count ?? 0, moving: activity.get(OTHER_FOCUS_AREA_ID)?.moving, selection: { kind: 'area', focusAreaId: OTHER_FOCUS_AREA_ID } },
       ...(suggested > 0 ? [{ key: 'suggested', label: interpolate(t('{count} suggested'), { count: suggested }), count: 0, selection: { kind: 'suggested' as const }, muted: true }] : []),
     ],
     pastFocus: { key: 'past-focus', label: t('Past focus'), count: 0, selection: { kind: 'past-focus' }, muted: true },
@@ -54,7 +54,7 @@ function Count({ count, className }: { count: number; className?: string }) {
 /** The wide rail's MY FOCUS section (lg and up). */
 export function FocusRail({ selected, onSelect }: { selected: FocusSelection; onSelect: (selection: FocusSelection) => void }) {
   const { t } = useI18n()
-  const { focus } = useFocusNavEntries()
+  const { focus } = useFocusNavEntries(selected)
   return (
     <Req ids={['R16.1', 'R16.3']}>
       <div className="space-y-0.5">
@@ -70,6 +70,9 @@ export function FocusRail({ selected, onSelect }: { selected: FocusSelection; on
             <Count count={entry.count} className="relative" />
           </button>
         ))}
+        <button type="button" onClick={() => onSelect(null)} className="flex min-h-9 w-full items-center gap-2 rounded-[10px] px-2 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-card/70">
+          <Grid2X2Icon aria-hidden="true" className="size-3.5 shrink-0" /><span>{t('Focus overview')}</span>
+        </button>
       </div>
     </Req>
   )
@@ -78,11 +81,11 @@ export function FocusRail({ selected, onSelect }: { selected: FocusSelection; on
 /** Past focus, at the bottom of the rail. */
 export function PastFocusLink({ selected, onSelect }: { selected: FocusSelection; onSelect: (selection: FocusSelection) => void }) {
   const { t } = useI18n()
-  const { pastFocus } = useFocusNavEntries()
-  const active = sameSelection(selected, pastFocus.selection)
+  const selection = { kind: 'past-focus' } as const
+  const active = sameSelection(selected, selection)
   return (
     <Req ids={['R16.7']}>
-      <button type="button" onClick={() => onSelect(pastFocus.selection)} aria-current={active ? 'page' : undefined}
+      <button type="button" onClick={() => onSelect(selection)} aria-current={active ? 'page' : undefined}
         className={cn('relative flex min-h-9 w-full items-center gap-2 rounded-[10px] px-2 text-left text-xs transition-colors', active ? 'font-medium text-accent-foreground' : 'text-muted-foreground hover:bg-card/70')}>
         {active && <ActivePill layoutId={SIDE_NAV_PILL} />}
         <HistoryIcon className="relative size-3.5" /><span className="relative">{t('Past focus')}</span>
@@ -95,10 +98,13 @@ export function PastFocusLink({ selected, onSelect }: { selected: FocusSelection
  * fades while more chips are off screen, and the row ends with room to scroll the last chip clear of the fade. */
 export function FocusChipRow({ selected, onSelect }: { selected: FocusSelection; onSelect: (selection: FocusSelection) => void }) {
   const { t } = useI18n()
-  const { focus, pastFocus } = useFocusNavEntries()
+  const { focus, pastFocus } = useFocusNavEntries(selected)
   return (
     <Req ids={['R16.1', 'R11.1']} className="lg:hidden">
       <nav aria-label={t('My focus')} className="relative -mx-4 flex gap-2 overflow-x-auto px-4 pb-1 [mask-image:linear-gradient(to_right,black_calc(100%-2.5rem),transparent)] after:shrink-0 after:basis-6 after:content-[''] md:mx-0 md:px-0 lg:hidden">
+        <button type="button" onClick={() => onSelect(null)} className="inline-flex h-11 shrink-0 items-center gap-1.5 rounded-full border bg-card px-3.5 text-sm whitespace-nowrap md:h-8">
+          <Grid2X2Icon aria-hidden="true" className="size-3.5" />{t('Focus overview')}
+        </button>
         {[...focus, pastFocus].map((entry) => {
           const active = sameSelection(selected, entry.selection)
           return (

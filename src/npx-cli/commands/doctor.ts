@@ -7,10 +7,41 @@
 
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
 import { isAbsolute, join, posix as posixPath, win32 as windowsPath } from 'path';
+import { homedir } from 'os';
+import { readTomlBooleanInTable } from '../../shared/codex-toml.js';
+import { CODEX_PLUGIN_CONFIG_TABLE } from '../../shared/plugin-state.js';
+import { registerCodexUserHooks } from '../../services/integrations/codex-user-hooks.js';
 import { styleText } from 'node:util';
-import { IS_WINDOWS, marketplaceDirectory, readPluginVersion } from '../utils/paths.js';
-import { getWorkerBaseUrl, resolvePluginRoot, type PluginRootResolution } from '../../shared/worker-utils.js';
+import { IS_WINDOWS, installedPluginsPath, marketplaceDirectory, readPluginVersion } from '../utils/paths.js';
+import { getWorkerBaseUrl, resolvePluginRoot, withWorkerAuth, type PluginRootResolution } from '../../shared/worker-utils.js';
+import {
+  AUTO_UPDATE_OFF_DECISIONS,
+  AutoUpdateCheckError,
+  claudeCodeBackgroundUpdateSetting,
+  describeAutoUpdateDecision,
+  readAutoUpdateSwitches,
+  type AutoUpdateSwitchesRead,
+  type ClaudeCodePluginState,
+  type ClaudeCodeSettingsEnvRead,
+} from '../../services/auto-update/auto-update-check.js';
+import { readClaudeMemInstallShape, type ClaudeMemInstallShape } from '../../services/auto-update/auto-update-install-shape.js';
+import {
+  autoUpdateBrokenInstall,
+  autoUpdateFixInstruction,
+  autoUpdateStatePath,
+  describeAutoUpdateBrokenInstall,
+  describeAutoUpdateStateFileProblem,
+  readAutoUpdateStateFile,
+  readInFlightAttempt,
+  targetVersionOf,
+  type AutoUpdateAttemptOutcome,
+  type AutoUpdateInFlightAttempt,
+  type AutoUpdateState,
+  type AutoUpdateStateFileRead,
+} from '../../services/auto-update/auto-update-state.js';
+import { productionAutoUpdateSwitchReaders } from '../../services/auto-update/auto-update-switch-readers.js';
 import { InvalidWorkerUrlError } from '../../shared/worker-url.js';
+import { DEPENDENCY_STATUS_LABELS, dependencyStatusLabels } from '../../shared/dependency-health.js';
 import { getBunVersion, getUvVersion, isInstallCurrent } from '../install/setup-runtime.js';
 import { findCodexExecutablePath, isCodexOnPath } from '../install/tool-path.js';
 import { getCredential } from '../../shared/EnvManager.js';
@@ -34,13 +65,27 @@ import {
 import {
   currentLauncherHostEnvironment,
   findExecutableOnPath,
+  launcherFileEmbedsBundle,
   probeLauncherVersion,
   resolveLauncherBinaryPath,
+  verifyLauncherSignature,
+  type LauncherCodesignRunner,
   type LauncherHostEnvironment,
 } from '../../launcher/install-launcher.js';
+import {
+  bunVersionHonoursMacosSignatureFix,
+  MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN,
+} from '../../launcher/bun-be-bun-support.js';
 import { LAUNCHER_PROTOCOL } from '../../launcher/launcher-protocol.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
+
+/**
+ * Row names are padded to this width, the one doctor has always used, so the
+ * details start in one column; only a longer name ("Observer data directory")
+ * pushes its own detail right. Continuation lines indent to the same column.
+ */
+const CHECK_NAME_COLUMN_WIDTH = 22;
 
 export interface CheckResult {
   name: string;
@@ -82,6 +127,23 @@ function probeVersion(bin: 'bun' | 'uv'): string | null {
     console.warn(`[doctor] Failed to probe \`${bin} --version\`:`, err);
     return null;
   }
+}
+
+export function bunRuntimeCheck(bunVersion: string | null, platform: NodeJS.Platform = process.platform): CheckResult {
+  const name = 'Bun runtime';
+  if (!bunVersion) {
+    return { name, status: 'fail', detail: 'not found on PATH — install: https://bun.sh', required: true };
+  }
+  const version = bunVersion.replace(/^v/, '');
+  if (platform === 'darwin' && !bunVersionHonoursMacosSignatureFix(version)) {
+    return {
+      name,
+      status: 'warn',
+      detail: `v${version}. Rebuilding the launcher for macOS 27 requires Bun ${MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN} or newer. Run \`bun upgrade\`.`,
+      required: true,
+    };
+  }
+  return { name, status: 'ok', detail: `v${version}`, required: true };
 }
 
 async function probeWorkerHealth(workerUrl: string): Promise<{
@@ -133,9 +195,9 @@ function describeChromaExit(lastExit: NonNullable<ChromaCrashState['lastExit']>)
  */
 export async function probeChromaDiagnostics(workerUrl: string): Promise<CheckResult[]> {
   try {
-    const response = await fetch(`${workerUrl}/api/admin/doctor`, {
+    const response = await fetch(`${workerUrl}/api/admin/doctor`, withWorkerAuth({
       signal: AbortSignal.timeout(3000),
-    });
+    }, { readOnly: true }));
     if (!response.ok) {
       return [];
     }
@@ -207,9 +269,9 @@ export async function probeWorkerDependencies(
   codexPath?: string | null,
 ): Promise<CheckResult[]> {
   try {
-    const response = await fetch(`${workerUrl}/api/admin/doctor`, {
+    const response = await fetch(`${workerUrl}/api/admin/doctor`, withWorkerAuth({
       signal: AbortSignal.timeout(3000),
-    });
+    }, { readOnly: true }));
     if (!response.ok) {
       return [];
     }
@@ -233,67 +295,24 @@ export function workerDependencyChecks(
   codexOnPath: boolean = false,
   codexPath?: string | null,
 ): CheckResult[] {
-  const checks: CheckResult[] = [];
-  for (const status of statuses) {
-    if (status.dependency === 'claude_cli' && status.kind === 'setup_required') {
-      let codexHint = '';
-      if (codexDetected) {
-        codexHint = codexOnPath || !codexPath
-          ? ' (Codex CLI is installed; you can switch by setting CLAUDE_MEM_PROVIDER to codex in ~/.claude-mem/settings.json)'
-          : ` (Codex CLI is installed at ${codexPath}; you can switch by setting CLAUDE_MEM_PROVIDER to codex and CLAUDE_MEM_CODEX_PATH to "${codexPath}" in ~/.claude-mem/settings.json)`;
-      }
-      const detail = status.remediation
-        ? `${status.message}${codexHint} — ${status.remediation}`
-        : `${status.message}${codexHint}`;
-      checks.push({
-        name: 'Claude CLI setup',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'codex_cli' && status.kind === 'setup_required') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'Codex CLI setup',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'uvx' && status.kind === 'vector_search_unavailable') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'uvx (vector search)',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'chroma' && status.kind === 'vector_search_unavailable') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'Chroma vector search',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'observer_dir' && status.kind === 'setup_required') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'Observer data directory',
-        status: 'warn',
-        detail,
-        required: false,
-      });
+  return statuses.map((status): CheckResult => {
+    const labels = dependencyStatusLabels(status.dependency, status.kind);
+    let codexHint = '';
+    if (labels === DEPENDENCY_STATUS_LABELS.claude_cli && codexDetected) {
+      codexHint = codexOnPath || !codexPath
+        ? ' (Codex CLI is installed; you can switch by setting CLAUDE_MEM_PROVIDER to codex in ~/.claude-mem/settings.json)'
+        : ` (Codex CLI is installed at ${codexPath}; you can switch by setting CLAUDE_MEM_PROVIDER to codex and CLAUDE_MEM_CODEX_PATH to "${codexPath}" in ~/.claude-mem/settings.json)`;
     }
-  }
-  return checks;
+    const message = `${status.message}${codexHint}`;
+    return {
+      // A pair this CLI does not list comes from a newer worker: it is shown
+      // under the worker's own names, never dropped.
+      name: labels?.doctorCheckName ?? `${status.dependency} (${status.kind})`,
+      status: 'warn',
+      detail: status.remediation ? `${message} — ${status.remediation}` : message,
+      required: false,
+    };
+  });
 }
 
 async function probeChromaCensus(): Promise<CheckResult> {
@@ -475,9 +494,18 @@ function realPathOrNull(path: string): string | null {
  * prints, and one timed `--version` round trip. Hooks call `claude-mem` in exec
  * form, so a missing launcher surfaces in Claude Code as
  * `Executable not found in $PATH: "claude-mem"` on every hook. Required: a
- * missing launcher, or a `claude-mem` on PATH that is not the launcher, fails
- * doctor. An older protocol only warns, because the SessionStart self-heal
- * (ensure-launcher.cjs) replaces it on the next startup. Exported for tests.
+ * missing launcher, a launcher macOS killed for its signature, or a
+ * `claude-mem` on PATH that is not the launcher fails doctor. An older protocol
+ * only warns, because the SessionStart self-heal (ensure-launcher.cjs) replaces
+ * it on the next startup.
+ *
+ * On macOS the launcher also gets `codesign --verify --strict` (#5247). A
+ * launcher that still answers but fails it only warns: it works on this OS, and
+ * macOS 27 is the one that kills it. When `codesign` cannot run, nothing is
+ * proven either way, so that warns too. With a Bun older than
+ * MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN (`bunVersion`), a rebuild
+ * gets the same rejected signature, so the hint names `bun upgrade` first.
+ * Exported for tests.
  *
  * `npx claude-mem doctor` runs with npx's own `node_modules/.bin` first on PATH, where `claude-mem` is this CLI.
  * Hooks run outside npx, so when this CLI (`runningCliPath`) is npx's copy, PATH directories that resolve to it
@@ -486,6 +514,8 @@ function realPathOrNull(path: string): string | null {
 export function hookLauncherCheck(
   host: LauncherHostEnvironment = currentLauncherHostEnvironment(),
   runningCliPath: string | undefined = process.argv[1],
+  verifySignature: LauncherCodesignRunner = verifyLauncherSignature,
+  bunVersion: string | null = null,
 ): CheckResult {
   const name = 'Hook launcher';
   const reinstallHint = 'run `npx claude-mem install`';
@@ -503,8 +533,45 @@ export function hookLauncherCheck(
     };
   }
   const probeStartedAt = performance.now();
-  const { protocol: printedProtocol, failure: probeFailure } = probeLauncherVersion(launcherOnPath);
+  const { protocol: printedProtocol, failure: probeFailure, signal } = probeLauncherVersion(launcherOnPath);
   const roundTripMilliseconds = Math.round(performance.now() - probeStartedAt);
+  // Only a file that is our launcher is verified: one that answered, or one a
+  // signal killed that embeds the launcher bundle (install-launcher.ts
+  // inspectExistingLauncherBinary uses the same rule to rebuild it).
+  const killedLauncher = printedProtocol === null && signal !== null && launcherFileEmbedsBundle(launcherOnPath);
+  const signature = host.platform === 'darwin' && (printedProtocol !== null || killedLauncher)
+    ? verifySignature(launcherOnPath)
+    : null;
+  const signatureReason = signature && signature.status !== 0
+    ? signature.stderr.trim().split('\n').pop() || (signature.status === null ? 'codesign did not run' : `exit ${signature.status}`)
+    : null;
+  const signatureRejected = signature !== null && signature.status !== null && signature.status !== 0;
+  const plainBunVersion = bunVersion?.replace(/^v/, '') ?? null;
+  const bunUpgradeFirst = plainBunVersion !== null && !bunVersionHonoursMacosSignatureFix(plainBunVersion)
+    ? `run \`bun upgrade\` first (Bun ${plainBunVersion} builds a launcher macOS 27 rejects; ${MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN} or newer does not), then `
+    : '';
+  if (killedLauncher && signatureRejected) {
+    // `npx claude-mem install` rebuilds a killed launcher in place (#5253), so
+    // nothing needs moving.
+    return {
+      name,
+      status: 'fail',
+      detail: `${launcherOnPath} was killed by ${signal} before it answered --version and fails codesign --verify --strict (${signatureReason}); macOS 27 kills a launcher whose signature it rejects. ${bunUpgradeFirst}${reinstallHint}, which rebuilds it`,
+      required: true,
+    };
+  }
+  if (printedProtocol !== null && signatureRejected) {
+    // The installer keeps a launcher that answers the current protocol or a
+    // newer one, so that one has to be moved aside before it is rebuilt; an
+    // older protocol is rebuilt on its own.
+    const rebuildHint = printedProtocol >= LAUNCHER_PROTOCOL ? `move it aside, then ${reinstallHint}` : reinstallHint;
+    return {
+      name,
+      status: 'warn',
+      detail: `${launcherOnPath} runs (protocol ${printedProtocol}) but fails codesign --verify --strict (${signatureReason}); macOS 27 will kill it. ${bunUpgradeFirst}${rebuildHint}`,
+      required: true,
+    };
+  }
   if (printedProtocol === null) {
     return {
       name,
@@ -521,12 +588,272 @@ export function hookLauncherCheck(
       required: true,
     };
   }
+  const detail = `${launcherOnPath} (protocol ${printedProtocol}, --version ${roundTripMilliseconds} ms)`;
+  if (signatureReason !== null) {
+    return { name, status: 'warn', detail: `${detail}; could not check its code signature (${signatureReason})`, required: true };
+  }
+  return { name, status: 'ok', detail, required: true };
+}
+
+/** Where the "Auto-update" row reads from: autoUpdateDoctorSources in production, fixtures in tests. */
+/**
+ * Codex runs claude-mem's hooks from the user's own hooks.json. A Codex home
+ * that has the plugin switched on but lacks those hooks captures nothing, and
+ * nothing else reports it. Null when this home does not use the Codex plugin.
+ */
+export function codexHooksCheck(options: {
+  codexHome: string;
+  hookDefinitionsPath: string;
+  launcherPath: string;
+  platform?: NodeJS.Platform;
+}): CheckResult | null {
+  const name = 'Codex hooks';
+  const configPath = join(options.codexHome, 'config.toml');
+  let pluginEnabled: boolean | undefined;
+  try {
+    pluginEnabled = readTomlBooleanInTable(readFileSync(configPath, 'utf-8'), CODEX_PLUGIN_CONFIG_TABLE, 'enabled');
+  } catch {
+    return null;
+  }
+  if (pluginEnabled !== true) return null;
+  try {
+    const hooks = registerCodexUserHooks({ ...options, dryRun: true });
+    if (hooks.changed) {
+      return {
+        name,
+        status: 'warn',
+        detail: `claude-mem's hooks are missing or out of date in ${hooks.hooksPath}, so Codex chats are not being captured — run \`npx claude-mem install\``,
+        required: false,
+      };
+    }
+    // The registered hooks match, so they name exactly this launcher. Codex has
+    // no SessionStart self-heal (ensure-launcher.cjs is Claude Code's), so a
+    // missing launcher fails every Codex hook until it is reinstalled.
+    if (!existsSync(options.launcherPath)) {
+      return {
+        name,
+        status: 'warn',
+        detail: `the hooks in ${hooks.hooksPath} run ${options.launcherPath}, which is missing, so Codex chats are not being captured — run \`npx claude-mem install\``,
+        required: false,
+      };
+    }
+    return {
+      name,
+      status: 'ok',
+      detail: `${hooks.hookCount} registered in ${hooks.hooksPath}; Codex runs them once you approve them (check with /hooks in Codex)`,
+      required: false,
+    };
+  } catch (error: unknown) {
+    return { name, status: 'warn', detail: error instanceof Error ? error.message : String(error), required: false };
+  }
+}
+
+export interface AutoUpdateDoctorSources {
+  now: number;
+  /**
+   * The worker check's gates 1 and 2 (auto-update-check.ts
+   * readAutoUpdateSwitches) as doctor's own environment reads them, used only
+   * while the worker has recorded no decision. Throws AutoUpdateCheckError
+   * when a file they read cannot be read.
+   */
+  readSwitches: () => AutoUpdateSwitchesRead;
+  /** Claude Code's settings files, read with the worker's reader, for the extraKnownMarketplaces declaration in force. Throws on a managed settings file Claude Code refuses to start with. */
+  readClaudeCodeSettingsEnv: () => ClaudeCodeSettingsEnvRead;
+  /** Claude Code's plugin records, read with the worker's reader, for known_marketplaces.json. */
+  readClaudeCodePluginState: () => ClaudeCodePluginState;
+  /** The version the install resolves to (worker-utils.ts resolvePluginRoot), null when nothing resolves. */
+  installedVersion: string | null;
+  statePath: string;
+  /** auto-update-state-file.ts readAutoUpdateStateFile: reads without writing or logging; throws on a read error other than a missing file. */
+  readStateFile: (statePath: string) => AutoUpdateStateFileRead;
+  /** auto-update-install-shape.ts readClaudeMemInstallShape on the install, the checks the SessionStart notice makes. */
+  readInstallShape: () => ClaudeMemInstallShape;
+  /** process-registry.ts isPidAlive. */
+  isProcessAlive: (pid: number) => boolean;
+  /** How an instant is shown: toLocaleString, as the Backups row shows its last snapshot. */
+  formatTime: (epochMs: number) => string;
+}
+
+/**
+ * The production sources: the same readers the worker's tick uses
+ * (auto-update-switch-readers.ts), with this process's environment, the plugin
+ * root doctor already resolved, the state file in the data dir, and the
+ * install's shape read where the installer writes it.
+ */
+export function autoUpdateDoctorSources(pluginRoot: PluginRootResolution | null): AutoUpdateDoctorSources {
+  const readers = productionAutoUpdateSwitchReaders({ env: process.env, resolvePluginRoot: () => pluginRoot });
   return {
-    name,
-    status: 'ok',
-    detail: `${launcherOnPath} (protocol ${printedProtocol}, --version ${roundTripMilliseconds} ms)`,
-    required: true,
+    now: Date.now(),
+    readSwitches: () => readAutoUpdateSwitches(readers),
+    readClaudeCodeSettingsEnv: readers.readClaudeCodeSettingsEnv,
+    readClaudeCodePluginState: readers.readClaudeCodePluginState,
+    installedVersion: pluginRoot?.version ?? null,
+    statePath: autoUpdateStatePath(),
+    readStateFile: readAutoUpdateStateFile,
+    readInstallShape: () => readClaudeMemInstallShape({ installedPluginsPath: installedPluginsPath(), marketplaceDirectory: marketplaceDirectory() }),
+    isProcessAlive: isPidAlive,
+    formatTime: (epochMs) => new Date(epochMs).toLocaleString(),
   };
+}
+
+/**
+ * The "Auto-update" row. Its first line is the takeaway; each line after it
+ * is one fact:
+ *  - on, or off and why, as the worker last decided it (the state file's
+ *    lastDecision), and once the attempt its `apply` started has ended, how
+ *    it ended: doctor runs in a terminal whose environment can differ from
+ *    the worker's, so it works the status out itself, with the worker
+ *    check's own gates 1 and 2, only while the worker has recorded none, and
+ *    says so;
+ *  - the installed version, the promoted version last seen, the last check;
+ *  - the last attempt, with its stage, and whether a worker has since shown
+ *    the install works; an attempt in flight;
+ *  - Claude Code's own background update of claude-mem's marketplace as
+ *    Claude Code reads it now, and what claude-mem last did with it;
+ *  - with no state file, that no check has run here yet.
+ * It warns only when the person needs to act: an automatic update may have
+ * left the install not working (the case the SessionStart notice reports,
+ * with the same fix line: auto-update-state-file.ts autoUpdateBrokenInstall),
+ * or the last check failed while the updater is on. A failed attempt is
+ * information, with its stage: the installed version still works. Read-only,
+ * and never required: the install's own rows say whether it works. Exported
+ * for tests.
+ */
+export function autoUpdateCheck(sources: AutoUpdateDoctorSources): CheckResult {
+  const name = 'Auto-update';
+  const time = sources.formatTime;
+  const unreadable: string[] = [];
+
+  let stateFile: AutoUpdateStateFileRead | null = null;
+  try {
+    stateFile = sources.readStateFile(sources.statePath);
+    if (stateFile.problem !== null) unreadable.push(capitalizeFirst(describeAutoUpdateStateFileProblem(sources.statePath, stateFile.problem)));
+  } catch (error: unknown) {
+    unreadable.push(`Cannot read ${sources.statePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const state = stateFile?.state ?? null;
+  const status = autoUpdateStatus(state, sources);
+
+  const broken = state === null ? null : autoUpdateBrokenInstall(state, sources.now, sources.isProcessAlive, () => {
+    const shape = sources.readInstallShape();
+    if (shape.kind === 'registration-unreadable') unreadable.push(`Cannot check the install for an interrupted update: ${shape.problem}`);
+    return shape;
+  });
+  const warnings: string[] = [];
+  if (broken !== null) warnings.push(`claude-mem may not work: ${describeAutoUpdateBrokenInstall(broken)}`);
+  if (status.updaterOn && state?.lastCheckError) warnings.push(`The last update check failed: ${state.lastCheckError.message}`);
+
+  const lines = [...warnings, status.line, ...unreadable, `Installed: ${sources.installedVersion ?? 'none found'}`];
+  if (stateFile !== null && !stateFile.exists) {
+    lines.push('No auto-update check has run on this machine yet. An install from before the first release with auto-update needs one `npx claude-mem update` by hand.');
+  } else if (state !== null) {
+    lines.push(`Promoted: ${state.lastSeenPromotedVersion ?? 'not seen yet'}`);
+    lines.push(`Last check: ${state.lastNetworkCheckAt === null ? 'never' : time(state.lastNetworkCheckAt)}`);
+    lines.push(state.lastAttemptOutcome === null ? 'Last update: none yet' : `Last update: ${describeLastAttempt(state.lastAttemptOutcome, time)}`);
+    if (state.inFlightAttempt !== null) lines.push(describeAttemptInFlight(state.inFlightAttempt, sources));
+  }
+  lines.push(describeClaudeCodeBackgroundUpdate(state, sources));
+  if (broken !== null) lines.push(autoUpdateFixInstruction(broken.fix, targetVersionOf(broken)));
+
+  return { name, status: warnings.length > 0 ? 'warn' : 'ok', detail: lines.join('\n'), required: false };
+}
+
+/**
+ * The status line: the worker's last recorded decision, or, while there is
+ * none, what gates 1 and 2 read in doctor's own environment, said to be that.
+ * After an `apply` with no attempt in flight, it is how that attempt ended:
+ * the worker records `apply` before it launches the attempt
+ * (auto-update-check.ts gate 9) and records no other decision until its next
+ * tick, while the supervisor replaces the attempt in flight with its outcome
+ * (auto-update-apply.ts), so "installing" would outlast the install.
+ * updaterOn is null when the status cannot be read.
+ */
+function autoUpdateStatus(state: AutoUpdateState | null, sources: AutoUpdateDoctorSources): { line: string; updaterOn: boolean | null } {
+  const recorded = state?.lastDecision ?? null;
+  if (state !== null && recorded !== null) {
+    const updaterOn = !AUTO_UPDATE_OFF_DECISIONS.has(recorded.decision);
+    const endedAttempt = recorded.decision === 'apply' && state.inFlightAttempt === null ? state.lastAttemptOutcome : null;
+    if (endedAttempt !== null) return { updaterOn, line: `On: ${describeEndedAttempt(endedAttempt, sources.formatTime)}` };
+    return { updaterOn, line: `${updaterOn ? 'On' : 'Off'}: ${recorded.reason} (the worker's decision at ${sources.formatTime(recorded.decidedAt)})` };
+  }
+  const workedOutHere = '(worked out by doctor, because the worker has not recorded a decision yet; its environment can differ from this terminal\'s)';
+  let switches: AutoUpdateSwitchesRead;
+  try {
+    switches = sources.readSwitches();
+  } catch (error: unknown) {
+    // The worker's tick stops at the same stage every hour, so nothing updates until the file is fixed.
+    const cause = error instanceof AutoUpdateCheckError && error.cause !== undefined ? error.cause : error;
+    return { updaterOn: null, line: `Off until this is fixed: ${cause instanceof Error ? cause.message : String(cause)}` };
+  }
+  if (switches.kind === 'off') return { updaterOn: false, line: `Off: ${describeAutoUpdateDecision(switches.decision)} ${workedOutHere}` };
+  return { updaterOn: true, line: `On ${workedOutHere}` };
+}
+
+/** How the attempt the worker's `apply` started ended: updated to its target, or not completed, with its result and stage. */
+function describeEndedAttempt(outcome: AutoUpdateAttemptOutcome, time: (epochMs: number) => string): string {
+  if (outcome.result === 'applied') return `updated to ${outcome.targetVersion} at ${time(outcome.finishedAt)}`;
+  return `the last update to ${outcome.targetVersion} did not complete (${describeAttemptEnding(outcome, time)})`;
+}
+
+/** The last attempt: its versions, result and stage, when it ended, and whether a worker has since shown the install works. */
+function describeLastAttempt(outcome: AutoUpdateAttemptOutcome, time: (epochMs: number) => string): string {
+  return `${outcome.previousVersion} → ${outcome.targetVersion}, ${describeAttemptEnding(outcome, time)}${describeResolution(outcome, time)}`;
+}
+
+/** An attempt's result, its stage when it failed, and when it ended: "failed at installer-exit, <time>". */
+function describeAttemptEnding(outcome: AutoUpdateAttemptOutcome, time: (epochMs: number) => string): string {
+  const stage = outcome.failureStage ? ` at ${outcome.failureStage}` : '';
+  return `${outcome.result}${stage}, ${time(outcome.finishedAt)}`;
+}
+
+/** How a failure was resolved, when it was: a worker on a version that finished starting since. */
+function describeResolution(resolved: { resolvedAt?: number; resolvedWithWorkerVersion?: string }, time: (epochMs: number) => string): string {
+  if (resolved.resolvedAt === undefined) return '';
+  return resolved.resolvedWithWorkerVersion === undefined
+    ? `; fixed at ${time(resolved.resolvedAt)}`
+    : `; fixed: a worker on ${resolved.resolvedWithWorkerVersion} finished starting at ${time(resolved.resolvedAt)}`;
+}
+
+function describeAttemptInFlight(attempt: AutoUpdateInFlightAttempt, sources: AutoUpdateDoctorSources): string {
+  const versions = `${attempt.previousVersion} → ${attempt.targetVersion}, started ${sources.formatTime(attempt.startedAt)}`;
+  const reading = readInFlightAttempt(attempt, sources.now, sources.isProcessAlive);
+  if (reading === 'running') return `In progress: ${versions}`;
+  if (reading === 'never-started') return `Never started: ${versions}; the worker records it at its next check`;
+  if (reading === 'interrupted') return `Interrupted: ${versions}; the worker records how it ended at its next check`;
+  return `Interrupted: ${versions}${describeResolution(attempt, sources.formatTime)}`;
+}
+
+/**
+ * Claude Code's own background update of the thedotmack marketplace, as
+ * Claude Code reads it now (auto-update-check.ts
+ * claudeCodeBackgroundUpdateSetting, over the worker's readers), and what
+ * claude-mem last did with it.
+ */
+function describeClaudeCodeBackgroundUpdate(state: AutoUpdateState | null, sources: AutoUpdateDoctorSources): string {
+  let setting: string;
+  try {
+    const inForce = claudeCodeBackgroundUpdateSetting(
+      sources.readClaudeCodeSettingsEnv().claudeMemMarketplaceDeclarations,
+      sources.readClaudeCodePluginState().knownMarketplaces,
+    );
+    setting = inForce.kind === 'set'
+      ? `${inForce.on ? 'on' : 'off'} (set in ${inForce.setIn})`
+      : inForce.kind === 'off-by-default' ? `off (${inForce.why})` : `cannot be read (${inForce.problem})`;
+  } catch (error: unknown) {
+    setting = `cannot be read (${error instanceof Error ? error.message : String(error)})`;
+  }
+  const lastAction = state === null
+    ? ''
+    : state.claudeCodeBackgroundUpdateLeftOnReason !== null
+      ? `; claude-mem left it on: ${state.claudeCodeBackgroundUpdateLeftOnReason}`
+      : state.claudeCodeBackgroundUpdateTurnedOffAt !== null
+        ? `; claude-mem turned it off at ${sources.formatTime(state.claudeCodeBackgroundUpdateTurnedOffAt)}`
+        : '; claude-mem has not changed it';
+  return `Claude Code's background update: ${setting}${lastAction}`;
+}
+
+function capitalizeFirst(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 /**
@@ -768,12 +1095,7 @@ export async function runDoctorCommand(): Promise<void> {
 
   // 1. Bun (required — hooks run on Bun).
   const bunVersion = probeVersion('bun');
-  checks.push({
-    name: 'Bun runtime',
-    status: bunVersion ? 'ok' : 'fail',
-    detail: bunVersion ? `v${bunVersion.replace(/^v/, '')}` : 'not found on PATH — install: https://bun.sh',
-    required: true,
-  });
+  checks.push(bunRuntimeCheck(bunVersion));
 
   // 2. uv (warn-only — only needed for vector search).
   const uvVersion = probeVersion('uv');
@@ -796,7 +1118,21 @@ export async function runDoctorCommand(): Promise<void> {
   if (pluginRoot) checks.push(await treeSitterCliCheck(pluginRoot.root));
 
   // 3c. The on-PATH `claude-mem` hook launcher (plan-17 #3605).
-  checks.push(hookLauncherCheck());
+  checks.push(hookLauncherCheck(currentLauncherHostEnvironment(), process.argv[1], verifyLauncherSignature, bunVersion));
+
+  // 3c-2. Codex runs the same launcher from the user's own hooks.json.
+  if (pluginRoot) {
+    const codexHooks = codexHooksCheck({
+      codexHome: process.env.CODEX_HOME || join(homedir(), '.codex'),
+      hookDefinitionsPath: join(pluginRoot.root, 'hooks', 'codex-hooks.json'),
+      launcherPath: resolveLauncherBinaryPath(currentLauncherHostEnvironment()),
+    });
+    if (codexHooks) checks.push(codexHooks);
+  }
+
+  // 3d. claude-mem's own updater: on or off, what it last did, and the fix
+  // when an automatic update may have left the install not working.
+  checks.push(autoUpdateCheck(autoUpdateDoctorSources(pluginRoot)));
 
   // 4. Marketplace runtime root materialized. The .install-version marker is
   // written only by the npx installer; installs via Claude Code's own plugin
@@ -1008,8 +1344,12 @@ export async function runDoctorCommand(): Promise<void> {
   checks.push(await probeChromaCensus());
 
   console.log(styleText('bold', '\nclaude-mem doctor\n'));
+  // A detail of several lines (the Auto-update row) continues under its first line.
+  const detailContinuationIndent = ' '.repeat(`  ! ${''.padEnd(CHECK_NAME_COLUMN_WIDTH)} `.length);
   for (const c of checks) {
-    console.log(`  ${icon(c.status)} ${c.name.padEnd(22)} ${styleText('dim', c.detail)}`);
+    const [firstDetailLine, ...moreDetailLines] = c.detail.split('\n');
+    console.log(`  ${icon(c.status)} ${c.name.padEnd(CHECK_NAME_COLUMN_WIDTH)} ${styleText('dim', firstDetailLine)}`);
+    for (const detailLine of moreDetailLines) console.log(`${detailContinuationIndent}${styleText('dim', detailLine)}`);
   }
 
   const hardFailures = checks.filter((c) => c.required && c.status === 'fail');

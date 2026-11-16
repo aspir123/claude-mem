@@ -4,6 +4,8 @@ export interface NormalizedHookInput {
   platform?: string;   
   prompt?: string;
   toolName?: string;
+  /** Exact host tool name before normalization, retained for configured exclusions. */
+  nativeToolName?: string;
   toolInput?: unknown;
   toolResponse?: unknown;
   /**
@@ -24,7 +26,7 @@ export interface NormalizedHookInput {
   stopHookActive?: boolean;
   permissionMode?: string;
   model?: string;
-  sessionSource?: 'startup' | 'resume' | 'clear' | 'compact';
+  sessionSource?: 'startup' | 'resume' | 'clear' | 'compact' | 'fork';
   /** Raw hook event name from the payload (e.g. Kimi binds both Stop and PreCompact to the same internal event — handlers use this to tell them apart). */
   hookEventName?: string;
   filePath?: string;
@@ -56,8 +58,6 @@ export interface NormalizedHookInput {
 }
 
 export interface HookResult {
-  /** Internal measurement hint; stripped before platform formatting/output. */
-  workStateTelemetry?: 'measure' | 'excluded' | 'unknown';
   continue?: boolean;
   suppressOutput?: boolean;
   hookSpecificOutput?: {

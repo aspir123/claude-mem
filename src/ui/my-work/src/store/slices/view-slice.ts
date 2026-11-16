@@ -66,6 +66,7 @@ export const createViewSlice = (environment: StoreEnvironment): SliceCreator<Vie
       listView: 'cards',
       filter: 'all',
       sort: 'attention',
+      focusArtwork: 'full',
     },
 
     goToPage: (page) => navigate({ section: page, focusChoice: null }),
@@ -106,6 +107,14 @@ export const createViewSlice = (environment: StoreEnvironment): SliceCreator<Vie
       get().reconcileOpenRequest()
     },
 
+    startSetup: () => {
+      const url = new URL(environment.href())
+      url.searchParams.set('setup', '1')
+      environment.writeUrl(url, true)
+      if (environment.reportsUsage) environment.sendUsage(usageReport('setup', get().view.section))
+      set((state) => { state.view.page = 'setup' })
+    },
+
     finishSetup: () => {
       const url = new URL(environment.href())
       url.searchParams.delete('setup')
@@ -132,6 +141,7 @@ export const createViewSlice = (environment: StoreEnvironment): SliceCreator<Vie
     setListView: (listView) => set((state) => { state.view.listView = listView }),
     setFilter: (filter) => set((state) => { state.view.filter = filter }),
     setSort: (sort) => set((state) => { state.view.sort = sort }),
+    setFocusArtwork: (focusArtwork) => set((state) => { state.view.focusArtwork = focusArtwork }),
   }
 }
 

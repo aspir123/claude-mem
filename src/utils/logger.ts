@@ -16,6 +16,7 @@ export enum LogLevel {
 
 export type Component =
   | 'AGENTS_MD'
+  | 'AUTO_UPDATE'
   | 'AWARENESS'
   | 'BACKUP'
   | 'BRANCH'
@@ -33,6 +34,7 @@ export type Component =
   | 'ENV'
   | 'FOLDER_INDEX'
   | 'GIT'
+  | 'GROK_BUILD'
   | 'GROK_INDEX'
   | 'HOOK'
   | 'HTTP'

@@ -1,6 +1,6 @@
 // Request types, the sample fixtures (SAMPLE_*) and pure request rules. The model every page reads is in the store (store/).
 import type { WorkModel } from './live/work-data-source.ts'
-import type { WorkViewMediaManifest, WorkViewRequestMedia } from './live/work-view-api-types.ts'
+import type { WorkViewFocusArea, WorkViewMediaManifest, WorkViewRequestMedia } from './live/work-view-api-types.ts'
 import { SAMPLE_MEDIA_REFS } from './components/observation-media/sample-media.ts'
 
 export interface Device { id: string; name: string; syncedMinutesAgo: number; online: boolean }
@@ -39,6 +39,9 @@ export interface Request {
   /** True when the title repeats the request's own prompts in full text (prompt-echo.ts); a shared page hides it. */
   titleRepeatsPrompt?: boolean
   summary: string | null
+  /** Full-prompt checks for text that shared pages omit, even when the local quote is shortened. */
+  summaryRepeatsPrompt?: boolean
+  nextRepeatsPrompt?: boolean
   /** The focus area it sits in: an area id, OTHER_FOCUS_AREA_ID, or absent while it is not sorted yet ("Sorting…"). */
   focusAreaId?: string
   /** False when the request has no conversation to file a move under (the worker refuses it). Sample fixtures leave it out. */
@@ -110,7 +113,9 @@ export interface FocusArea {
   name: string
   /** One sentence saying what the area is for; null until one is written. */
   goal: string | null
-  status: 'suggested' | 'kept' | 'dismissed' | 'done'
+  /** What belongs here, as recorded by the focus-area router. Older workers leave it out. */
+  about?: string | null
+  status: WorkViewFocusArea['status']
   /** The owner's order. When set it wins over priorityRank. */
   ownerRank: number | null
   priorityRank: number | null
@@ -139,6 +144,8 @@ export interface FocusChange {
   /** reorder: every live area (not dismissed, not merged), first = highest priority. */
   focusAreaIds?: string[]
   requestId?: string
+  /** Undo's saved version. The worker compares it inside the ordered read-and-write operation. */
+  expectedVersion?: string
 }
 
 /** The current owner-goals run. */

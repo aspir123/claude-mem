@@ -1,10 +1,11 @@
-import type { WorkStateEntry, WorkStateFields, WorkStateValue } from '../../sqlite/work-state.js';
+import type { WorkStateEntry, WorkStateFields } from '../../sqlite/work-state.js';
 import { describeDuration } from '../../../shared/observer-health.js';
 import { relativeTimePlaceholder } from '../../../shared/context-cache.js';
 import { isOwnerGoalsList } from '../../work-view/owner-goals.mjs';
 import { isMyRulesList } from '../../work-view/my-rules.mjs';
 import { isMyFocusList } from '../../work-view/my-focus.mjs';
 import { isSharedWorkList } from '../../work-view/shared-records.mjs';
+import { isClosedWorkStateStatus } from '../../work-view/work-state-status.mjs';
 
 /**
  * When "updated N ago" is measured from: an epoch, or 'placeholders' to leave
@@ -16,18 +17,8 @@ export type WorkStateClock = number | 'placeholders';
 /** Keeps the section small enough to leave most of the 10K hook budget to memory. */
 export const WORK_STATE_SECTION_CHARACTER_LIMIT = 3_000;
 
-const CLOSED_STATUSES = new Set(['done', 'dropped']);
-
-export const WORK_STATE_RULE = [
-  '# Work state: your to-do lists and working state',
-  "Use claude-mem's work_state_write tool to track all to-do lists and multi-step work. It is your canonical to-do list: use it instead of any built-in to-do tool. Also use it to track the state of anything you need an ongoing understanding of. Whatever is still open is shown here at the start of every session in this project.",
-  '- One list per to-do list or tracked thing: work_state_write with list="<name>" and the fields to set',
-  '- To-do item: fields {"task": "<name>", "status": "todo" | "doing" | "done" | "dropped", ...any details}',
-  '- State: fields {"<key>": <value>} (the latest value of each key wins; null clears a key; "status": "done" closes the list)',
-  '- Made something a person can open (PR, deck, page, image, report)? Attach it to that item: fields {"work_product": "https://…" or "/absolute/file"}; several, with titles, as one JSON string: "[{\\"title\\": \\"<name>\\", \\"url\\": \\"https://…\\"}]"',
-  '- Deliverables: write a deck, report, page or other file the person asked for as a file and attach it as work_product before you finish. When you stop, claude-mem copies each attached file (and any deck, document, page, image or spreadsheet you wrote outside the source tree) into this project\'s deliverables bucket, ~/.claude-mem/deliverables/<project>/, and links it on the request\'s card in My Work.',
-  '- Read every list, closed items included: work_state_read with includeClosed=true',
-].join('\n');
+/** Heads the open lists in the SessionStart context; how to use work state is in the MCP server's instructions. */
+export const WORK_STATE_SECTION_HEADING = 'Work state, still open:';
 
 export interface FoldedWorkStateList {
   /** Latest value of every key written without a `task`. */
@@ -56,10 +47,6 @@ export function foldWorkStateList(entries: WorkStateEntry[]): FoldedWorkStateLis
   return folded;
 }
 
-function isClosed(status: WorkStateValue | undefined): boolean {
-  return status !== undefined && status !== null && CLOSED_STATUSES.has(String(status).toLowerCase());
-}
-
 /** `key=value` pairs; null values are skipped because null clears a key. */
 function formatFields(fields: WorkStateFields, omittedKeys: string[]): string {
   return Object.entries(fields)
@@ -84,7 +71,7 @@ export function renderWorkStateList(
   includeClosed: boolean = false,
 ): string[] {
   const taskLines = [...folded.tasks.entries()]
-    .filter(([, task]) => includeClosed || !isClosed(task.fields.status))
+    .filter(([, task]) => includeClosed || !isClosedWorkStateStatus(task.fields.status))
     .map(([taskName, task]) => {
       const status = task.fields.status === undefined || task.fields.status === null ? '' : `[${String(task.fields.status)}] `;
       const details = formatFields(task.fields, ['task', 'status']);
@@ -92,7 +79,7 @@ export function renderWorkStateList(
     });
 
   const stateFields = formatFields(folded.state, ['task']);
-  const showState = stateFields !== '' && (includeClosed || !isClosed(folded.state.status));
+  const showState = stateFields !== '' && (includeClosed || !isClosedWorkStateStatus(folded.state.status));
   if (!showState && taskLines.length === 0) return [];
 
   // A shown state line always has a state entry behind it; the fallback only satisfies the type.
@@ -149,17 +136,19 @@ export function isSessionStartWorkStateList(listName: string): boolean {
   return !isOwnerGoalsList(listName) && !isMyRulesList(listName) && !isMyFocusList(listName) && !isSharedWorkList(listName);
 }
 
-/** The SessionStart section: the rule, then what is still open, cut to `characterLimit`. */
+/**
+ * The SessionStart section: what is still open, cut to `characterLimit`, or
+ * `''` when nothing is. The rule for using work state is not repeated here: it
+ * is in the MCP server's instructions (shared/memory-instructions.ts).
+ */
 export function buildWorkStateContextSection(
   entries: WorkStateEntry[],
   nowEpoch: WorkStateClock,
   characterLimit: number = WORK_STATE_SECTION_CHARACTER_LIMIT,
 ): string {
   const openLines = renderWorkStateLines(entries.filter(entry => isSessionStartWorkStateList(entry.list_name)), nowEpoch);
-  if (openLines.length === 0) {
-    return `${WORK_STATE_RULE}\n\nNothing open yet.`;
-  }
-  return fitWorkStateLines(`${WORK_STATE_RULE}\n\nStill open:`, openLines, characterLimit);
+  if (openLines.length === 0) return '';
+  return fitWorkStateLines(WORK_STATE_SECTION_HEADING, openLines, characterLimit);
 }
 
 /** `heading`, then as many of `lines` as fit in `characterLimit`, then how many were left out. */

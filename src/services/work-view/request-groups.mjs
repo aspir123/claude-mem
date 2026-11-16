@@ -22,7 +22,7 @@
 //   bun request-groups.mjs refresh-needs [--days 14]  what the automatic refresh would do now
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { conversationKey, isConversationKey, isHumanActionRequest, originalFor, requestText } from './request-projection.mjs';
@@ -30,6 +30,8 @@ import { GOAL_KINDS, goalKindOf, OWNER_GOALS_LIST } from './owner-goals.mjs';
 import { NO_PROJECT, projectRoot, upgradedGroupRoot, withDerivedProjects } from './session-project.mjs';
 import { isOwnerDismissedArea, isPlaceableArea, OTHER_FOCUS_AREA_ID, PROPOSAL_KINDS, readFocus } from './my-focus.mjs';
 import { beforeSharedFileWrite } from './shared-file-hooks.mjs';
+import { isClosedWorkStateStatus } from './work-state-status.mjs';
+import { writeJsonFileAtomic } from '../../shared/atomic-json.js';
 
 const DATA_DIR = process.env.CLAUDE_MEM_DATA_DIR || join(homedir(), '.claude-mem');
 export const LEDGER_DIR = join(DATA_DIR, 'work-view');
@@ -54,6 +56,21 @@ export const groupIdFor = (anchorConversationKey) => `g_${createHash('sha256').u
 
 function placeholders(values) { return values.map(() => '?').join(','); }
 
+// Keep bound parameters below SQLite limits even for large history scans.
+function queryInChunks(database, values, sqlFor, parametersFor = (chunk) => chunk, chunkSize = 500) {
+  const rows = [];
+  for (let index = 0; index < values.length; index += chunkSize) {
+    const chunk = values.slice(index, index + chunkSize);
+    const statement = database.prepare(sqlFor(chunk));
+    try {
+      for (const row of statement.all(...parametersFor(chunk))) rows.push(row);
+    } finally {
+      statement.finalize();
+    }
+  }
+  return rows;
+}
+
 // Pass sinceEpoch for a time window, or conversationKeys for specific conversations.
 // fullAsks returns every qualifying ask untruncated (for `show`); listings stay short.
 // excludedPromptIds: hook-recorded prompts the setup scan found an agent wrote (agent-written-prompts.json).
@@ -61,7 +78,7 @@ export function readCandidates(database, { sinceEpoch = 0, conversationKeys = nu
   const columns = 'SELECT id, platform_source, content_session_id, project, user_prompt, started_at_epoch FROM sdk_sessions';
   const pairs = conversationKeys?.map((key) => JSON.parse(key).slice(1));
   const stored = pairs
-    ? pairs.length ? database.prepare(`${columns} WHERE (platform_source, content_session_id) IN (VALUES ${pairs.map(() => '(?, ?)').join(',')})`).all(...pairs.flat()) : []
+    ? queryInChunks(database, pairs, (chunk) => `${columns} WHERE (platform_source, content_session_id) IN (VALUES ${chunk.map(() => '(?, ?)').join(',')})`, (chunk) => chunk.flat(), 250)
     // Any recent activity counts: a new start, prompt, observation or recorded tool use (a commit, a push, a work-state write).
     : database.prepare(`${columns} WHERE started_at_epoch >= ?
         OR id IN (SELECT DISTINCT session_db_id FROM user_prompts WHERE created_at_epoch >= ?)
@@ -70,18 +87,18 @@ export function readCandidates(database, { sinceEpoch = 0, conversationKeys = nu
   if (!stored.length) return [];
   // A session started from an agent scratch folder takes the repo its tool calls touched.
   const sessions = withDerivedProjects(database, stored);
-  const ids = sessions.map((session) => session.id);
-  const prompts = database.prepare(`SELECT id, session_db_id, prompt_number, ${fullAsks ? 'prompt_text' : 'substr(prompt_text, 1, 1200) AS prompt_text'}, created_at_epoch
-    FROM user_prompts WHERE session_db_id IN (${placeholders(ids)})`).all(...ids);
-  const writes = database.prepare(`SELECT session_db_id, tool_input, created_at_epoch FROM tool_uses
-    WHERE tool_name LIKE '%work_state_write%' AND session_db_id IN (${placeholders(ids)})`).all(...ids);
-  const observations = database.prepare(`SELECT s.id AS session_db_id, COUNT(*) AS count, MAX(o.created_at_epoch) AS last_epoch
+  const ids = [...new Set(sessions.map((session) => session.id))];
+  const prompts = queryInChunks(database, ids, (chunk) => `SELECT id, session_db_id, prompt_number, ${fullAsks ? 'prompt_text' : 'substr(prompt_text, 1, 1200) AS prompt_text'}, created_at_epoch
+    FROM user_prompts WHERE session_db_id IN (${placeholders(chunk)})`);
+  const writes = queryInChunks(database, ids, (chunk) => `SELECT session_db_id, tool_input, created_at_epoch FROM tool_uses
+    WHERE tool_name LIKE '%work_state_write%' AND session_db_id IN (${placeholders(chunk)})`);
+  const observations = queryInChunks(database, ids, (chunk) => `SELECT s.id AS session_db_id, COUNT(*) AS count, MAX(o.created_at_epoch) AS last_epoch
     FROM observations o JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id
-    WHERE s.id IN (${placeholders(ids)}) GROUP BY s.id`).all(...ids);
+    WHERE s.id IN (${placeholders(chunk)}) GROUP BY s.id`);
   const observationsBySession = new Map(observations.map((row) => [row.session_db_id, row]));
   // Work after a review without a new prompt or observation (a commit, a push) still makes the review due again.
-  const toolActivity = database.prepare(`SELECT session_db_id, MAX(created_at_epoch) AS last_epoch FROM tool_uses
-    WHERE session_db_id IN (${placeholders(ids)}) GROUP BY session_db_id`).all(...ids);
+  const toolActivity = queryInChunks(database, ids, (chunk) => `SELECT session_db_id, MAX(created_at_epoch) AS last_epoch FROM tool_uses
+    WHERE session_db_id IN (${placeholders(chunk)}) GROUP BY session_db_id`);
   const lastToolUseBySession = new Map(toolActivity.map((row) => [row.session_db_id, row.last_epoch ?? 0]));
   const promptsBySession = new Map();
   for (const prompt of prompts) {
@@ -161,14 +178,14 @@ export function linkBackwards(candidates) {
 
 /** Fold the owner-goals list (patch entries) into its open focus areas and asks, areas first. */
 export function readGoals(database) {
-  const rows = database.prepare('SELECT fields FROM work_state_entries WHERE list_name = ? ORDER BY id').all(OWNER_GOALS_LIST);
+  const rows = database.prepare('SELECT fields FROM work_state_entries WHERE list_name = ? ORDER BY created_at_epoch, id').all(OWNER_GOALS_LIST);
   const listState = {}, items = new Map();
   for (const row of rows) {
     const fields = JSON.parse(row.fields);
     const target = fields.task ? items.get(fields.task) ?? items.set(fields.task, {}).get(fields.task) : listState;
     for (const [key, value] of Object.entries(fields)) { if (value === null) delete target[key]; else target[key] = value; }
   }
-  const goals = [...items.values()].filter((item) => !['done', 'dropped'].includes(String(item.status).toLowerCase())).map((item) => ({
+  const goals = [...items.values()].filter((item) => !isClosedWorkStateStatus(item.status)).map((item) => ({
     // taskKey is the item's work-state task; goal is only ever a focus area's sentence.
     taskKey: item.task, ...goalKindOf(item), rank: Number(item.rank) || null,
     title: item.title ?? item.task, goal: item.goal ?? null, focusArea: item.focus_area ?? null, focusAreaId: item.focus_area_id ?? null,
@@ -188,11 +205,8 @@ function readJson(path, fallback) {
 
 export function writeJsonAtomic(path, value) {
   const finish = beforeSharedFileWrite(path, value);
-  mkdirSync(join(path, '..'), { recursive: true });
-  const temp = `${path}.tmp`;
   const stored = finish && Object.hasOwn(finish, 'value') ? finish.value : value;
-  writeFileSync(temp, `${JSON.stringify(stored, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
+  writeJsonFileAtomic(path, stored, { mode: 0o600 });
   finish?.();
 }
 
@@ -265,7 +279,10 @@ export function applyGroupDecisions(stored, decisions, now = Date.now(), { proje
     delete next.conversations[ignored.conversation];
   }
   const used = new Set(Object.values(next.conversations));
-  for (const id of Object.keys(next.groups)) if (!used.has(id)) delete next.groups[id];
+  for (const [id, group] of Object.entries(next.groups)) {
+    if (!used.has(id)) delete next.groups[id];
+    else group.links = (group.links ?? []).filter((link) => link.conversations.every((key) => next.conversations[key] === id));
+  }
   next.updatedAt = iso(now);
   return next;
 }
@@ -623,9 +640,8 @@ function openingAsks(database, ledger, conversationKeys) {
 
 /** One request as the focus step sees it, keyed by its anchor conversation. Every conversation's opening ask is listed,
  * so a request holding several separate asks (one to promote into an area) can be told from one ask. */
-function requestRecord(ledger, groupId, asks) {
+function requestRecord(ledger, groupId, asks, conversations) {
   const group = ledger.groups.groups[groupId], review = ledger.progress[groupId];
-  const conversations = groupConversations(ledger, groupId);
   return {
     anchor: group.anchor, groupId, title: group.title, firstAsk: requestText(group.anchorAsk?.text ?? null, FOCUS_ASK_CHARS),
     state: review?.state ?? null, summary: review?.summary ?? null,
@@ -636,16 +652,46 @@ function requestRecord(ledger, groupId, asks) {
   };
 }
 
-const records = (database, ledger, groupIds) => {
-  const asks = openingAsks(database, ledger, groupIds.flatMap((groupId) => groupConversations(ledger, groupId)));
-  return groupIds.map((groupId) => requestRecord(ledger, groupId, asks));
+const records = (database, ledger, groupIds, requests) => {
+  const asks = openingAsks(database, ledger, groupIds.flatMap(requests.conversations));
+  return groupIds.map((groupId) => requestRecord(ledger, groupId, asks, requests.conversations(groupId)));
 };
+
+function basisForConversations(ledger, groupId, conversations) {
+  const group = ledger.groups.groups[groupId];
+  return createHash('sha256').update(JSON.stringify({ title: group.title, firstAsk: group.anchorAsk?.text ?? null, conversations })).digest('hex').slice(0, 16);
+}
 
 /** What decides a request's area: its title, its first ask and its conversations. Its review (state, percent, summary)
  * is left out, so a request is not placed again every time it is reviewed. */
 export function focusBasis(ledger, groupId) {
-  const group = ledger.groups.groups[groupId];
-  return createHash('sha256').update(JSON.stringify({ title: group.title, firstAsk: group.anchorAsk?.text ?? null, conversations: groupConversations(ledger, groupId) })).digest('hex').slice(0, 16);
+  return basisForConversations(ledger, groupId, groupConversations(ledger, groupId));
+}
+
+/** One synchronous focus operation shares sorted memberships and fingerprints.
+ * Build lazily: owner placements and empty batches need no membership scan.
+ * Keep this local to the operation so the next read sees ledger edits. */
+function focusRequestIndex(ledger) {
+  let byGroup;
+  const bases = new Map();
+  const conversations = (groupId) => {
+    if (!byGroup) {
+      byGroup = new Map();
+      for (const [key, id] of Object.entries(ledger.groups.conversations)) {
+        if (!byGroup.has(id)) byGroup.set(id, []);
+        byGroup.get(id).push(key);
+      }
+      for (const keys of byGroup.values()) keys.sort();
+    }
+    return byGroup.get(groupId) ?? [];
+  };
+  return {
+    conversations,
+    basis: (groupId) => {
+      if (!bases.has(groupId)) bases.set(groupId, basisForConversations(ledger, groupId, conversations(groupId)));
+      return bases.get(groupId);
+    },
+  };
 }
 
 /** Requests the focus step still has to place: no placement, a placement whose area holds no requests any more
@@ -654,13 +700,13 @@ export function focusBasis(ledger, groupId) {
  * binds (buildFocusAreas), and the router's placement must stand on its own. A router basis is compared only on the
  * device that wrote it: another device decided on its own copy of the request, and comparing would re-place every
  * request on every device in turn. Placements written without a basis (a seed) count as current. */
-function focusDue(ledger, focus, localDeviceId) {
+function focusDue(ledger, focus, localDeviceId, requests) {
   return Object.keys(ledger.groups.groups).filter((groupId) => {
     const placement = focus.placementsByAnchor.get(ledger.groups.groups[groupId].anchor);
     if (placement?.owner && focus.resolveFocusAreaId(placement.owner.focusAreaId)) return false;
     const router = placement?.router;
     if (!router || !focus.resolveFocusAreaId(router.focusAreaId)) return true;
-    return router.device === localDeviceId && router.basis != null && router.basis !== focusBasis(ledger, groupId);
+    return router.device === localDeviceId && router.basis != null && router.basis !== requests.basis(groupId);
   });
 }
 
@@ -677,8 +723,8 @@ function routerOther(ledger, focus, queued) {
 
 /** Which Other requests a proposal pass looked at, and what each one held then (its focusBasis), so a request that
  * gained conversations or a new ask and stayed in Other is looked at again; null when Other holds none. */
-const otherPassHash = (ledger, groupIds) => groupIds.length
-  ? createHash('sha256').update(JSON.stringify(groupIds.map((groupId) => [ledger.groups.groups[groupId].anchor, focusBasis(ledger, groupId)]).sort())).digest('hex').slice(0, 16)
+const otherPassHash = (ledger, groupIds, requests) => groupIds.length
+  ? createHash('sha256').update(JSON.stringify(groupIds.map((groupId) => [ledger.groups.groups[groupId].anchor, requests.basis(groupId)]).sort())).digest('hex').slice(0, 16)
   : null;
 
 const focusAreaRecord = (area) => ({ focusAreaId: area.focusAreaId, name: area.name, goal: area.goal, about: area.about, status: area.status });
@@ -686,11 +732,12 @@ const focusAreaRecord = (area) => ({ focusAreaId: area.focusAreaId, name: area.n
 /** focus-input: the areas a request may go in, the dismissed areas never to propose again, and one batch of requests to
  * place, earliest in the ledger first. `remaining` counts the requests left for later batches. */
 export function focusInput(ledger, focus, localDeviceId, database, { limit = FOCUS_BATCH } = {}) {
-  const due = focusDue(ledger, focus, localDeviceId);
+  const requests = focusRequestIndex(ledger);
+  const due = focusDue(ledger, focus, localDeviceId, requests);
   return {
     areas: focus.focusAreas.filter(isPlaceableArea).map(focusAreaRecord),
     dismissed: focus.focusAreas.filter(isOwnerDismissedArea).map(focusAreaRecord),
-    requests: records(database, ledger, due.slice(0, limit)),
+    requests: records(database, ledger, due.slice(0, limit), requests),
     remaining: Math.max(0, due.length - limit),
   };
 }
@@ -698,12 +745,13 @@ export function focusInput(ledger, focus, localDeviceId, database, { limit = FOC
 /** focus-input --other: the requests the router put in Other, for proposing areas. `due` is false when the last pass
  * (on any device: the hash is a synced my-focus row) already looked at exactly these requests. */
 export function otherInput(ledger, focus, localDeviceId, database) {
-  const other = routerOther(ledger, focus, new Set(focusDue(ledger, focus, localDeviceId)));
-  const hash = otherPassHash(ledger, other);
+  const requests = focusRequestIndex(ledger);
+  const other = routerOther(ledger, focus, new Set(focusDue(ledger, focus, localDeviceId, requests)));
+  const hash = otherPassHash(ledger, other, requests);
   return {
     areas: focus.focusAreas.filter(isPlaceableArea).map(focusAreaRecord),
     dismissed: focus.focusAreas.filter(isOwnerDismissedArea).map(focusAreaRecord),
-    other: records(database, ledger, other),
+    other: records(database, ledger, other, requests),
     due: hash !== null && hash !== focus.otherPassHash,
   };
 }
@@ -727,6 +775,7 @@ export function validateFocusAnswer(answer, input, ledger, { other = false } = {
   if (!Array.isArray(answer?.placements)) throw new TypeError('The answer needs a placements array.');
   if (!Array.isArray(answer?.proposals)) throw new TypeError('The answer needs a proposals array (empty when there is nothing to propose).');
   const listed = new Map((other ? input.other : input.requests).map((request) => [request.anchor, request]));
+  const requestIndex = focusRequestIndex(ledger);
   const areaIds = new Set(input.areas.map((area) => area.focusAreaId));
   const dismissed = new Map(input.dismissed.map((area) => [area.focusAreaId, area]));
   const placed = new Map();
@@ -761,7 +810,7 @@ export function validateFocusAnswer(answer, input, ledger, { other = false } = {
       if (!listed.has(anchor)) throw new TypeError(`${label} holds ${anchor}, which ${other ? 'is not a listed Other request' : 'was not asked about'}.`);
       if (held.has(anchor)) throw new TypeError(`${label} holds ${anchor}, which another proposal already holds.`);
       held.add(anchor);
-      return { anchorConversationKey: anchor, basis: focusBasis(ledger, listed.get(anchor).groupId) };
+      return { anchorConversationKey: anchor, basis: requestIndex.basis(listed.get(anchor).groupId) };
     });
     return {
       kind: proposal.kind, name: boundedText(proposal.name, AREA_NAME_MAX, `${label}.name`), goal: boundedText(proposal.goal, AREA_SENTENCE_MAX, `${label}.goal`),
@@ -771,10 +820,10 @@ export function validateFocusAnswer(answer, input, ledger, { other = false } = {
   });
   return {
     placements: [...placed].filter(([anchor]) => !held.has(anchor)).map(([anchor, { focusAreaId, evidence }]) => ({
-      anchorConversationKey: anchor, focusAreaId, basis: focusBasis(ledger, listed.get(anchor).groupId), evidence,
+      anchorConversationKey: anchor, focusAreaId, basis: requestIndex.basis(listed.get(anchor).groupId), evidence,
     })),
     proposals,
-    ...(other ? { otherPassHash: otherPassHash(ledger, [...listed.keys()].filter((anchor) => !held.has(anchor)).map((anchor) => listed.get(anchor).groupId)) } : {}),
+    ...(other ? { otherPassHash: otherPassHash(ledger, [...listed.keys()].filter((anchor) => !held.has(anchor)).map((anchor) => listed.get(anchor).groupId), requestIndex) } : {}),
   };
 }
 
@@ -794,8 +843,9 @@ export function refreshNeeds({ dir = LEDGER_DIR, database, now = Date.now(), day
   const generated = Date.parse(goals.generatedAt ?? '');
   const goalsStale = !Number.isFinite(generated) || now - generated > GOALS_STALE_MS;
   const focus = readFocus(database, { localDeviceId });
-  const queued = focusDue(ledger, focus, localDeviceId);
-  const otherHash = otherPassHash(ledger, routerOther(ledger, focus, new Set(queued)));
+  const requests = focusRequestIndex(ledger);
+  const queued = focusDue(ledger, focus, localDeviceId, requests);
+  const otherHash = otherPassHash(ledger, routerOther(ledger, focus, new Set(queued)), requests);
   const otherChanged = otherHash !== null && otherHash !== focus.otherPassHash;
   return { due: due.length, ungrouped, goalsStale, unplaced: queued.length, otherChanged, needed: Boolean(due.length || ungrouped || goalsStale || queued.length || otherChanged) };
 }

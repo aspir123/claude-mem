@@ -1,11 +1,11 @@
 
 import path from 'path';
 import { homedir } from 'os';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, renameSync } from 'fs';
+import { existsSync, readFileSync, unlinkSync, mkdirSync } from 'fs';
 import { logger } from '../../utils/logger.js';
 import { getProjectContext } from '../../utils/project-name.js';
-import { getWorkerBaseUrl } from '../../shared/worker-utils.js';
-import { parseJsonWithBom } from '../../shared/atomic-json.js';
+import { getWorkerBaseUrl, withWorkerAuth } from '../../shared/worker-utils.js';
+import { parseJsonWithBom, writeJsonFileAtomic, writeTextFileAtomic } from '../../shared/atomic-json.js';
 import { DATA_DIR } from '../../shared/paths.js';
 import { getBunAbsolutePath as findBunPath, getWorkerServiceAbsolutePath as findWorkerServicePath } from './install-paths.js';
 
@@ -59,7 +59,7 @@ export function readWindsurfRegistry(): WindsurfProjectRegistry {
 export function writeWindsurfRegistry(registry: WindsurfProjectRegistry): void {
   const dir = path.dirname(WINDSURF_REGISTRY_FILE);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(WINDSURF_REGISTRY_FILE, JSON.stringify(registry, null, 2));
+  writeJsonFileAtomic(WINDSURF_REGISTRY_FILE, registry);
 }
 
 export function registerWindsurfProject(workspacePath: string): void {
@@ -83,7 +83,6 @@ export function unregisterWindsurfProject(workspacePath: string): void {
 export function writeWindsurfContextFile(workspacePath: string, context: string): void {
   const rulesDir = path.join(workspacePath, '.windsurf', 'rules');
   const rulesFile = path.join(rulesDir, 'claude-mem-context.md');
-  const tempFile = `${rulesFile}.tmp`;
 
   mkdirSync(rulesDir, { recursive: true });
 
@@ -102,8 +101,7 @@ ${context}
       '\n\n*[Truncated — use MCP search for full history]*\n';
   }
 
-  writeFileSync(tempFile, content);
-  renameSync(tempFile, rulesFile);
+  writeTextFileAtomic(rulesFile, content);
 }
 
 function buildHookCommand(bunPath: string, workerServicePath: string, eventName: string): string {
@@ -119,6 +117,18 @@ function buildHookCommand(bunPath: string, workerServicePath: string, eventName:
 
   const callOperator = process.platform === 'win32' ? '& ' : '';
   return `${callOperator}"${bunPath}" "${workerServicePath}" hook windsurf ${hookCommand}`;
+}
+
+/** Only the complete command this installer writes is owned. A user's audit
+ * script, echo, or shell wrapper can also mention both worker-service and
+ * windsurf; removing that entry would delete the user's automation. */
+function isClaudeMemWindsurfHook(hook: unknown): boolean {
+  const command = (hook as { command?: unknown } | null)?.command;
+  if (typeof command !== 'string') return false;
+  const match = /^(?:&\s+)?"([^"]+)"\s+"([^"]+)"\s+hook windsurf (?:session-init|file-edit|observation)$/.exec(command.trim());
+  if (!match) return false;
+  const runtime = match[1].split(/[\\/]/).pop()!;
+  return /^bun(?:\.exe)?$/i.test(runtime) && /(?:^|[\\/])worker-service\.cjs$/.test(match[2]);
 }
 
 function mergeAndWriteHooksJson(
@@ -155,13 +165,13 @@ function mergeAndWriteHooksJson(
     };
 
     const existingHooks = (existingConfig.hooks[eventName] ?? []).filter(
-      (hook) => !hook.command.includes('worker-service') || !hook.command.includes('windsurf')
+      (hook) => !isClaudeMemWindsurfHook(hook)
     );
 
     existingConfig.hooks[eventName] = [...existingHooks, hookEntry];
   }
 
-  writeFileSync(WINDSURF_HOOKS_JSON_PATH, JSON.stringify(existingConfig, null, 2));
+  writeJsonFileAtomic(WINDSURF_HOOKS_JSON_PATH, existingConfig);
 }
 
 export async function installWindsurfHooks(): Promise<number> {
@@ -252,7 +262,7 @@ async function setupWindsurfProjectContext(workspaceRoot: string): Promise<void>
 
 Use claude-mem's MCP search tools for manual memory queries.
 `;
-    writeFileSync(rulesFile, placeholderContent);
+    writeTextFileAtomic(rulesFile, placeholderContent);
     console.log(`  Created placeholder context file (will populate after first session)`);
   }
 
@@ -265,11 +275,12 @@ async function fetchWindsurfContextFromWorker(
   workspaceRoot: string,
 ): Promise<boolean> {
   const workerUrl = getWorkerBaseUrl();
-  const healthResponse = await fetch(`${workerUrl}/api/readiness`);
+  const healthResponse = await fetch(`${workerUrl}/api/readiness`, withWorkerAuth());
   if (!healthResponse.ok) return false;
 
   const contextResponse = await fetch(
     `${workerUrl}/api/context/inject?project=${encodeURIComponent(projectName)}`,
+    withWorkerAuth(),
   );
   if (!contextResponse.ok) return false;
 
@@ -320,7 +331,7 @@ function removeClaudeMemHookEntries(): void {
     const eventHooks = config.hooks[eventName] ?? [];
     if (eventHooks.length > 0) {
       config.hooks[eventName] = eventHooks.filter(
-        (hook) => !hook.command.includes('worker-service') || !hook.command.includes('windsurf'),
+        (hook) => !isClaudeMemWindsurfHook(hook),
       );
       if (config.hooks[eventName].length === 0) {
         delete config.hooks[eventName];
@@ -332,7 +343,7 @@ function removeClaudeMemHookEntries(): void {
     unlinkSync(WINDSURF_HOOKS_JSON_PATH);
     console.log(`  Removed hooks.json (no hooks remaining)`);
   } else {
-    writeFileSync(WINDSURF_HOOKS_JSON_PATH, JSON.stringify(config, null, 2));
+    writeJsonFileAtomic(WINDSURF_HOOKS_JSON_PATH, config);
     console.log(`  Removed claude-mem entries from hooks.json (other hooks preserved)`);
   }
 }

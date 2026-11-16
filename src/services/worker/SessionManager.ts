@@ -10,7 +10,7 @@ import { deliverSessionWrapup, type TelegramWrapupFormatter } from '../integrati
 import { MAX_LLM_TIMEOUT_MS, resolveLlmTimeoutMs } from './retry.js';
 import { canCmemGatewayServe } from '../../shared/cmem-gateway.js';
 import { planUnattendedGatewayResume, unattendedGatewayResumesSpent } from './session/response-pacer.js';
-import { PROVIDER_SWITCH_BOUNDARY_ABORT_REASON } from './session/abort-reason.js';
+import { CAPTURE_DISABLED_ABORT_REASON, PROVIDER_SWITCH_BOUNDARY_ABORT_REASON } from './session/abort-reason.js';
 import { isSimpleTierMessage } from './session/tier-routing.js';
 import { claudeStandInStillServes } from '../../shared/claude-fallback-readiness.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
@@ -63,6 +63,8 @@ export class SessionManager {
   private transportResumeDispositionEpochs = new WeakMap<ActiveSession, number>();
   /** Sessions that already used their one summarize rescue (#3419). */
   private readonly summarizeRescues = new Set<number>();
+  /** Telegram wrap-ups started by deliverSessionWrapupInBackground and not yet settled. */
+  private sessionWrapupsInFlight = 0;
 
   constructor(
     dbManager: DatabaseManager,
@@ -422,15 +424,31 @@ export class SessionManager {
       return;
     }
 
+    // Read before the count goes up: it throws while the database is not open,
+    // and a count that never comes down would read as busy forever.
+    const sessionStore = this.dbManager.getSessionStore();
+    this.sessionWrapupsInFlight++;
     void deliverSessionWrapup({
-      sessionStore: this.dbManager.getSessionStore(),
+      sessionStore,
       sessionDbId,
       formatSummary,
     }).catch((error: unknown) => {
       logger.warn('TELEGRAM', 'Failed to deliver Telegram session wrap-up from SessionManager', {
         sessionId: sessionDbId,
       }, error instanceof Error ? error : new Error(String(error)));
+    }).finally(() => {
+      this.sessionWrapupsInFlight--;
     });
+  }
+
+  /**
+   * Telegram session wrap-ups being written and sent now: each one runs after
+   * its session has left the session map (an LLM call, then a Telegram post),
+   * and nothing asks for it again if the worker stops first. The auto-updater
+   * counts them as busy (worker-service.ts runningBackgroundJobNames).
+   */
+  getSessionWrapupsInFlight(): number {
+    return this.sessionWrapupsInFlight;
   }
 
   private takeRequestedSessionWrapup(session: ActiveSession): boolean {
@@ -547,13 +565,18 @@ export class SessionManager {
   async clearPendingForSession(sessionDbId: number): Promise<number> {
     const session = this.sessions.get(sessionDbId);
     if (session) {
+      // Every caller is a capture-off guard at a safe send boundary. Carry
+      // that decision through provider exit: normal finalization would
+      // dispose the receipts we are keeping below and admit old events again.
+      session.abortReason = CAPTURE_DISABLED_ABORT_REASON;
+      session.abortController.abort();
       session.claimedMessageIds = [];
       session.earliestPendingTimestamp = null;
     }
-    return this.buffer.clear(sessionDbId);
+    return this.buffer.discardKeepingDedup(sessionDbId);
   }
 
-  /** Discard a session's buffered work for good: unlike clearPendingForSession, nothing in it can be re-enqueued. */
+  /** Discard a session's buffered work without permitting old tool IDs to re-enter. */
   discardBufferedWork(sessionDbId: number): number {
     const session = this.sessions.get(sessionDbId);
     if (session) {
@@ -883,16 +906,6 @@ export class SessionManager {
     return this.buffer.getTotalDepth();
   }
 
-  /** See SessionMessageBuffer.getLastAssignedId. */
-  getLastBufferedMessageId(): number {
-    return this.buffer.getLastAssignedId();
-  }
-
-  /** See SessionMessageBuffer.getOldestPendingId. */
-  getOldestPendingMessageId(sessionDbId: number): number | null {
-    return this.buffer.getOldestPendingId(sessionDbId);
-  }
-
   async getTotalActiveWork(): Promise<number> {
     return this.getTotalQueueDepth();
   }
@@ -925,8 +938,8 @@ export class SessionManager {
     })) {
       // Re-check at every message boundary so a settings-file edit made while
       // a generator is already alive takes effect after its current request.
-      // Clear the RAM-only queue: transcript replay remains the durable
-      // recovery path if capture is enabled again later.
+      // Drop buffered payloads but keep delivery identities: enabling capture
+      // again permits fresh work, not a replay of these discarded events.
       if (!isObserverCaptureEnabled(SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH))) {
         const discarded = await this.clearPendingForSession(sessionDbId);
         logger.info('SESSION', 'Observer capture disabled at message boundary; discarding buffered work', {

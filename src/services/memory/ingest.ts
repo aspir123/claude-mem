@@ -35,10 +35,13 @@ import {
   statSync,
 } from 'fs';
 import { basename, dirname, isAbsolute, join, relative } from 'path';
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
 import { CLAUDE_CONFIG_DIR } from '../../shared/paths.js';
 import { expandHome } from '../../shared/expand-home.js';
 import { cwdToDashed } from '../context/ObservationCompiler.js';
 import { getProjectContext } from '../../utils/project-name.js';
+import { retainTextHeadTail } from '../../shared/text-truncation.js';
 
 const MD_EXT = '.md';
 const JSONL_EXT = '.jsonl';
@@ -140,20 +143,39 @@ export interface MemoryFrontmatter {
   nodeType?: string;
 }
 
+const YAML_ESCAPES: Readonly<Record<string, string>> = {
+  '0': '\0', a: '\x07', b: '\b', t: '\t', '\t': '\t', n: '\n',
+  v: '\v', f: '\f', r: '\r', e: '\x1b', ' ': ' ', '"': '"',
+  '/': '/', '\\': '\\', N: '\u0085', _: '\u00a0', L: '\u2028', P: '\u2029',
+};
+
+/** Decode the single-line scalar styles used by these known frontmatter keys. */
 function unquote(value: string): string {
   const v = value.trim();
-  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
-    return v.slice(1, -1);
-  }
-  return v;
+  if (v.length < 2) return v;
+  if (v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1).replace(/''/g, "'");
+  if (!v.startsWith('"') || !v.endsWith('"')) return v;
+
+  // One pass: a decoded backslash must not start a second escape. Unknown or
+  // malformed escapes stay literal so a bad metadata value cannot drop a note.
+  return v.slice(1, -1).replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)/g, (match, escape: string) => {
+    if (escape.length === 1) return YAML_ESCAPES[escape] ?? match;
+    const codePoint = Number.parseInt(escape.slice(1), 16);
+    return codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ? String.fromCodePoint(codePoint)
+      : match;
+  });
 }
 
 /**
  * Split leading `--- ... ---` frontmatter from the body. Returns parsed (known)
  * keys and the remaining markdown body. Files without frontmatter return `{}`
- * and the original text as body.
+ * and the original text as body, apart from a leading UTF-8 byte-order mark.
  */
 export function parseMemoryFrontmatter(raw: string): { frontmatter: MemoryFrontmatter; body: string } {
+  // A UTF-8 signature is encoding metadata, not part of the first Markdown
+  // line. Remove it before recognizing frontmatter or deriving a heading.
+  raw = raw.replace(/^\uFEFF/, '');
   const lines = raw.split('\n');
   // The opener must be a complete `---` line at column 0 (a trailing \r is
   // tolerated for CRLF files): a `----` horizontal rule or an indented `---`
@@ -164,29 +186,36 @@ export function parseMemoryFrontmatter(raw: string): { frontmatter: MemoryFrontm
   // First line is the opening '---'; find the closing one.
   let close = -1;
   for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === '---') { close = i; break; }
+    if (/^---\r?$/.test(lines[i])) { close = i; break; }
   }
   if (close === -1) return { frontmatter: {}, body: raw };
 
   const fm: MemoryFrontmatter = {};
   let inMetadata = false;
+  let metadataIndent: number | undefined;
   for (let i = 1; i < close; i++) {
     const line = lines[i];
-    if (!line.trim()) continue;
-    const indented = /^\s+/.test(line);
+    const trimmed = line.trimStart();
+    // YAML comments do not end a mapping or establish its child indentation.
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = line.length - trimmed.length;
     const colon = line.indexOf(':');
     if (colon === -1) continue;
     const key = line.slice(0, colon).trim();
     const value = line.slice(colon + 1).trim();
 
-    if (!indented) {
+    if (indent === 0) {
       inMetadata = key === 'metadata';
+      metadataIndent = undefined;
       if (key === 'name') fm.name = unquote(value);
       else if (key === 'description') fm.description = unquote(value);
       continue;
     }
-    // Indented: a child of `metadata:`.
+    // Only direct children belong to this note's metadata. Unknown fields may
+    // contain nested objects or literal examples with the same key names.
     if (inMetadata) {
+      metadataIndent ??= indent;
+      if (indent !== metadataIndent) continue;
       if (key === 'type') fm.type = unquote(value);
       else if (key === 'originSessionId') fm.originSessionId = unquote(value);
       else if (key === 'node_type') fm.nodeType = unquote(value);
@@ -197,18 +226,24 @@ export function parseMemoryFrontmatter(raw: string): { frontmatter: MemoryFrontm
   return { frontmatter: fm, body };
 }
 
+const memoryMarkdown = unified().use(remarkParse);
+
 /** Derive a human title: frontmatter name → first H1 → first H2 → filename stem. */
 export function deriveTitle(fileName: string, frontmatter: MemoryFrontmatter, body: string): string {
   if (frontmatter.name && frontmatter.name.trim()) return frontmatter.name.trim();
-  for (const line of body.split('\n')) {
+  let firstH2: string | undefined;
+  // A shell comment or Markdown example inside a code block is not a note
+  // heading. Use the existing Markdown parser for block context, but retain
+  // the source spelling instead of reformatting valid headings.
+  for (const node of memoryMarkdown.parse(body).children) {
+    if (node.type !== 'heading' || node.position?.start.offset === undefined) continue;
+    const line = body.slice(node.position.start.offset, node.position.end.offset).split('\n', 1)[0];
     const h1 = line.match(/^#\s+(.+)/);
     if (h1) return h1[1].trim();
-  }
-  for (const line of body.split('\n')) {
     const h2 = line.match(/^##\s+(.+)/);
-    if (h2) return h2[1].trim();
+    if (h2 && firstH2 === undefined) firstH2 = h2[1].trim();
   }
-  return basename(fileName, MD_EXT);
+  return firstH2 ?? basename(fileName, MD_EXT);
 }
 
 // ───────────────────────────── enumeration ──────────────────────────────
@@ -596,7 +631,7 @@ export function buildMemoryObservation(ref: MemoryDirRef, file: MemoryFileRef): 
   const concepts = ['memory-import', `memory-type:${memoryType}`];
   const description = file.frontmatter.description?.trim();
   const subtitle = description && description.length
-    ? description.slice(0, 300)
+    ? retainTextHeadTail(description, 300, 0).head
     : `Imported memory (${memoryType})`;
 
   const metadata: Record<string, unknown> = {
@@ -611,7 +646,7 @@ export function buildMemoryObservation(ref: MemoryDirRef, file: MemoryFileRef): 
   return {
     project: ref.project,
     type: 'discovery',
-    title: file.title.slice(0, 200),
+    title: retainTextHeadTail(file.title, 200, 0).head,
     subtitle,
     narrative: file.body,
     concepts,

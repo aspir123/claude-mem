@@ -25,7 +25,7 @@ import { SAMPLE_DEVICES, SAMPLE_RUNS } from '@/data'
 import { type RuleChangeRecord, type RuleSaveOutcome, useStore, useWorkModel, useWorkspace } from '@/store'
 import { RULE_TIERS, type OwnerRule, type RuleChange, type RuleQuote, type RuleScope, type RuleTier } from '@/data-rules'
 import { addedRuleFromSave, currentRuleDecisions, ruleUndoIsCurrent, type RuleDecision } from '@/live/rule-actions'
-import type { RuleSaveResult } from '@/live/work-data-source'
+import type { AutoRefresh, RuleSaveResult } from '@/live/work-data-source'
 
 // ---------- Derived facts ----------
 
@@ -131,6 +131,24 @@ function Quote({ quote, rule }: { quote: RuleQuote; rule: OwnerRule }) {
   )
 }
 
+/** Saving a long rule can omit evidence even while this computer still has the original story. */
+export function RuleEvidenceNotice({ rule }: { rule: OwnerRule }) {
+  const count = rule.quotesOmitted ?? 0
+  if (count === 0) return null
+  return <p className="text-xs text-review-foreground">{interpolate(t(count === 1
+    ? '{count} supporting quote could not fit in this saved rule. Other devices may show fewer quotes.'
+    : '{count} supporting quotes could not fit in this saved rule. Other devices may show fewer quotes.'), { count })}</p>
+}
+
+export function RuleEvidence({ rule }: { rule: OwnerRule }) {
+  return <div className="space-y-2">
+    {rule.quotes.length ? rule.quotes.map((quote) => <Quote key={quote.quote} quote={quote} rule={rule} />)
+      : <p className="text-xs text-muted-foreground">{t(rule.source === 'you'
+        ? 'You wrote this rule in My Rules, so there are no quotes behind it.'
+        : 'No supporting quotes are available on this computer.')}</p>}
+  </div>
+}
+
 /** Third layer of disclosure: the records the rule was built from (§14: request-progress reviews, owner-goals runs, prompts). */
 function SourceRecords({ rule }: { rule: OwnerRule }) {
   return (
@@ -209,8 +227,9 @@ function RuleBlock({ rule, replaces, justApproved, highlighted, actions }: { rul
             </div>
           </div>
 
+          <RuleEvidenceNotice rule={rule} />
           <CollapsibleContent className="mt-2 space-y-3 border-t pt-3 sm:ml-[3.25rem]">
-            <div className="space-y-2">{rule.quotes.length ? rule.quotes.map((quote) => <Quote key={quote.quote} quote={quote} rule={rule} />) : <p className="text-xs text-muted-foreground">{t("You wrote this rule in My Rules, so there are no quotes behind it.")}</p>}</div>
+            <RuleEvidence rule={rule} />
             {replaces.length > 0 && (
               <Req ids={['R14.4']}>
                 <div className="space-y-1">
@@ -284,6 +303,7 @@ function SuggestionCard({ rule, decision, saving, onDecide, onEdit, onUndo, onSh
         <button type="button" onClick={() => scrollToId(`scope-${scope.id}`)} className="-my-2 inline-flex min-h-11 w-fit items-center text-xs text-muted-foreground hover:text-foreground sm:min-h-0 sm:my-0">{displayScope(scope)}</button>
 
         <div className={cn(decision === 'rejected' && 'line-through opacity-60')}><RuleSentence rule={rule} large /></div>
+        <RuleEvidenceNotice rule={rule} />
 
         <ConfirmationRequest>
           <Req ids={['R11.1']}>
@@ -673,13 +693,18 @@ function RuleEditor({ draft, error, saving, onChange, onClose, onSave }: { draft
 // ---------- Page ----------
 
 /** No story and no saved rules yet: say so, and how to get learned rules, instead of showing anything made up. */
-function NoRulesYet({ onAdd, readError }: { onAdd: () => void; readError: string | null }) {
+export function NoRulesYet({ onAdd, readError, refresh }: { onAdd: () => void; readError: string | null; refresh: AutoRefresh | null }) {
+  const waiting = refresh?.state === 'waiting-for-agent'
+  const description = waiting
+    ? t('Rule learning is waiting for an agent. Sign in to a supported agent on the worker machine, or add a rule yourself.')
+    : t('claude-mem learns how you like to work from your requests on its own. You can also add one.')
   return (
     <Req ids={['R12.1']}>
       <Empty className="border bg-card/60">
         <EmptyHeader>
           <EmptyTitle>{readError ? t("Can’t read your rules right now") : t("No rules yet")}</EmptyTitle>
-          <EmptyDescription>{readError ?? <>{t("claude-mem learns how you like to work from your requests on its own. You can also add one.")}</>}</EmptyDescription>
+          <EmptyDescription>{readError ?? description}</EmptyDescription>
+          {!readError && waiting && <RefreshStatus refresh={refresh} run={null} ids={['R14.13']} />}
         </EmptyHeader>
         {!readError && (
           <EmptyContent className="flex-row justify-center gap-2">
@@ -781,7 +806,7 @@ export function MyRules() {
   if (!sample && (rulesReadError || (rules.length === 0 && !rulesLearning))) {
     return (
       <div className="space-y-5">
-        <NoRulesYet onAdd={startAdding} readError={rulesReadError} />
+        <NoRulesYet onAdd={startAdding} readError={rulesReadError} refresh={refresh} />
         <RuleEditor draft={draft} error={draftError} saving={saving} onChange={setDraft} onClose={() => setDraft(null)} onSave={saveDraft} />
       </div>
     )

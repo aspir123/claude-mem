@@ -7,6 +7,8 @@ description: Maintainer release workflow for the thedotmack/claude-mem repositor
 
 **IMPORTANT:** Plan and write detailed release notes before starting.
 
+Include the pending Unreleased section at the top of `docs/CHANGELOG.md` in the next GitHub release notes; remove that section after those notes are published, before regenerating the changelog.
+
 **CRITICAL:** Commit EVERYTHING (including build artifacts). At the end of this workflow, NOTHING should be left uncommitted or unpushed. Run `git status` at the end to verify.
 
 ## Scope — check this first
@@ -49,7 +51,7 @@ If either check fails, stop and tell the user this skill does not apply here.
 
 ## Workflow
 
-1.  **Update**: Increment the version string in every path above. Do NOT touch `docs/CHANGELOG.md` — it's regenerated.
+1.  **Update**: Increment the version string in every path above. Published entries in `docs/CHANGELOG.md` are regenerated; only move pending Unreleased notes as described above.
 2.  **Verify**: `git grep -n "\"version\": \"<NEW>\""` — confirm all fourteen JSON files match, and the README badge reads `version-<NEW>-green`. `git grep -n "\"version\": \"<OLD>\""` — should return zero hits.
 3.  **Build and sync**: `npm run build-and-sync` to regenerate artifacts, sync the local marketplace copy, restart the worker, and clear the queue. Do not use plain `npm run build` for release validation because it can leave the local marketplace/worker out of sync.
 4.  **Commit**: `git add -A && git commit -m "chore: bump version to X.Y.Z"`.
@@ -83,14 +85,41 @@ If either check fails, stop and tell the user this skill does not apply here.
     Trusted Publisher (GitHub Actions, `thedotmack/claude-mem`, `npm-publish.yml`,
     `npm publish` allowed). Renaming the workflow file breaks publishing until
     that entry is updated; changing it requires the maintainer's security key.
-12. **Post-publish verification and notification**: After publishing, verify
+12. **Post-publish verification**: After publishing, verify
     both the exact version and the latest dist-tag:
     ```bash
     npm view claude-mem@X.Y.Z version
     npm view claude-mem dist-tags.latest
     npm view claude-mem@X.Y.Z dist.attestations --json   # provenance from the workflow
     ```
-    Then post the release to X, only after npm verification:
+13. **Promote for auto-update**: `releases/promoted-release.json` on `main` names
+    the version claude-mem's own updater moves installs to. Promote, hold and
+    pull back control only that updater: installs where Claude Code's own
+    auto-update for this marketplace is on follow `main` instead, so a bad
+    release that reached `main` is fixed with a new patch release. Do this step
+    only after npm verification.
+    - **Promote:** these commands work from a detached release worktree and
+      when `main` has moved since the release push:
+      ```bash
+      git pull --rebase origin main
+      # set "promotedVersion" in releases/promoted-release.json to "X.Y.Z"
+      bun test tests/infrastructure/promoted-release.test.ts
+      git add releases/promoted-release.json
+      git commit -m "chore: promote X.Y.Z for auto-update"
+      git push origin HEAD:main
+      ```
+      If the push is rejected because `main` moved again (git reports
+      `non-fast-forward` or `fetch first`), run `git pull --rebase origin main`
+      and push again. Most installs update within about a day; a machine that
+      is never quiet updates within about two days.
+    - **Hold:** only when the owner asked to hold this release. Skip this step
+      and say so in the release report.
+    - **Pull back a bad release:** set `promotedVersion` to the last good
+      version (find it with `git log -p -- releases/promoted-release.json`) and
+      push it with the same commands. Installs below it still move up to it.
+      Installs already on the bad version stay there until a newer version is
+      promoted. Nothing is downgraded.
+14. **Notification**: Post the release to X, only after npm verification:
     - Generate one image about the release with an available image-generation
       tool, drawn from the release notes.
     - In a browser that is already logged in to X (for example Claude in
@@ -99,7 +128,7 @@ If either check fails, stop and tell the user this skill does not apply here.
       post and say so in the release report. Never sign in or switch accounts.
     - Post a short summary of the release with the version, the GitHub release
       URL and the image attached, then report the post's URL.
-13. **Finalize**: `git status` — working tree must be clean and everything must
+15. **Finalize**: `git status` — working tree must be clean and everything must
     be pushed.
 
 ## Checklist
@@ -113,5 +142,6 @@ If either check fails, stop and tell the user this skill does not apply here.
 - [ ] Pre-publish audit passed
 - [ ] `Publish to npm` workflow run for the tag succeeded (no local `npm publish`)
 - [ ] Exact npm version and `latest` both verified after publishing
+- [ ] `releases/promoted-release.json` set to X.Y.Z and pushed to `main` after npm verification (or the owner's hold stated in the release report)
 - [ ] Release posted to X as `@Claude_Memory` with a generated image after npm verification (or skipped because no browser was logged in as that account)
 - [ ] `git status` shows clean tree

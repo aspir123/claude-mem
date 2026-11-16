@@ -10,6 +10,7 @@
  */
 
 import type { Database } from 'bun:sqlite';
+import type { HistoryImportRunState } from '../../shared/setup-funnel.js';
 import { logger } from '../../utils/logger.js';
 
 export const HISTORY_IMPORT_BATCH = 100;
@@ -17,7 +18,7 @@ export const HISTORY_IMPORT_BATCH = 100;
 export interface SetupHistoryCounts { projects: number; sessions: number; observations: number }
 
 export interface HistoryImportState {
-  state: 'idle' | 'running' | 'done' | 'failed';
+  state: HistoryImportRunState;
   total: number;
   sent: number;
   /** Observations cmem.ai wrote (new to the account). */
@@ -100,15 +101,19 @@ export class HistoryImport {
   private async run(token: string): Promise<void> {
     const request = this.options.fetch ?? fetch;
     const url = `${this.options.origin()}/api/import`;
-    const database = this.options.openDatabase();
+    let database: Database | undefined;
     try {
-      const total = readHistoryCounts(database).observations;
+      database = this.options.openDatabase();
+      // Fix the run's count and upper ID in one read. Live capture may append
+      // observations while an upload is awaiting its network receipt.
+      const { total, through } = database.prepare(`SELECT COUNT(*) AS total, COALESCE(MAX(id), 0) AS through ${OWN_OBSERVATIONS}`)
+        .get() as { total: number; through: number };
       this.update({ state: 'running', total, sent: 0, imported: 0, skipped: 0, percent: 0, error: null, startedAt: this.iso(), finishedAt: null });
       const page = database.prepare(`SELECT id, memory_session_id, project, type, title, subtitle, narrative, text, facts, concepts, files_read, files_modified,
-        prompt_number, created_at, created_at_epoch ${OWN_OBSERVATIONS} AND id > ? ORDER BY id LIMIT ?`);
+        prompt_number, created_at, created_at_epoch ${OWN_OBSERVATIONS} AND id > ? AND id <= ? ORDER BY id LIMIT ?`);
       let after = 0;
       for (;;) {
-        const rows = page.all(after, HISTORY_IMPORT_BATCH) as ObservationRow[];
+        const rows = page.all(after, through, HISTORY_IMPORT_BATCH) as ObservationRow[];
         if (!rows.length) break;
         const response = await request(url, {
           method: 'POST',
@@ -117,12 +122,19 @@ export class HistoryImport {
         });
         const answer = await response.json().catch(() => null) as { stats?: { observationsImported?: number; observationsSkipped?: number }; error?: string; message?: string } | null;
         if (!response.ok) throw new Error(`cmem.ai refused the import (HTTP ${response.status}${answer?.message || answer?.error ? `: ${answer.message ?? answer.error}` : ''}).`);
+        const imported = answer?.stats?.observationsImported;
+        const skipped = answer?.stats?.observationsSkipped;
+        if (typeof imported !== 'number' || typeof skipped !== 'number'
+          || !Number.isSafeInteger(imported) || !Number.isSafeInteger(skipped)
+          || imported < 0 || skipped < 0 || imported + skipped !== rows.length) {
+          throw new Error('cmem.ai did not acknowledge every observation in the import batch. Continue to resend it safely.');
+        }
         after = rows[rows.length - 1].id;
         const sent = this.current.sent + rows.length;
         this.update({
           sent,
-          imported: this.current.imported + (answer?.stats?.observationsImported ?? 0),
-          skipped: this.current.skipped + (answer?.stats?.observationsSkipped ?? 0),
+          imported: this.current.imported + imported,
+          skipped: this.current.skipped + skipped,
           percent: total ? Math.min(99, Math.floor((sent / total) * 100)) : 99,
         });
       }
@@ -133,7 +145,7 @@ export class HistoryImport {
       logger.warn('IMPORT', 'History import stopped', { error: message, sent: this.current.sent });
       this.update({ state: 'failed', error: message, finishedAt: this.iso() });
     } finally {
-      database.close();
+      database?.close();
     }
   }
 }

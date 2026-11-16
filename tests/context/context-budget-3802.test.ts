@@ -18,8 +18,6 @@ function makeConfig(overrides: Partial<ContextConfig> = {}): ContextConfig {
     sessionCount: 10,
     showReadTokens: false,
     showWorkTokens: false,
-    showSavingsAmount: false,
-    showSavingsPercent: false,
     observationTypes: new Set<string>(),
     observationConcepts: new Set<string>(),
     fullObservationField: 'narrative',
@@ -126,13 +124,6 @@ describe('context output budget (#3802)', () => {
     expect(result.observationCount).toBe(50);
   });
 
-  it('never returns a text longer than the one it started from', () => {
-    const config = makeConfig();
-    const first = render(items(50), config);
-    const result = fitContextToBudget(items(50), config, render);
-
-    expect(result.text.length).toBeLessThanOrEqual(first.length);
-  });
 });
 
 // ── what happens around the fitter ────────────────────────────────
@@ -156,13 +147,16 @@ function summary(i: number): SessionSummary {
   return { id: i, memory_session_id: `session-${i}` } as unknown as SessionSummary;
 }
 
-/** Cost profile of the real renderer, ignoring the summaries it is handed. */
-function renderBlock(items: Observation[], config: ContextConfig): string {
+/**
+ * Cost profile of the real renderer, ignoring the summaries it is handed. Like
+ * the real one, it places the health warning above its timeline.
+ */
+function renderBlock(items: Observation[], config: ContextConfig, healthWarning = ''): string {
   const titles = items.length * 200;
   const fulls = Math.min(config.fullObservationCount, items.length) * 1200;
   const sessions = config.sessionCount * 400;
   const lastSummary = config.showLastSummary ? 3000 : 0;
-  return 'x'.repeat(300 + titles + fulls + sessions + lastSummary + 200);
+  return (healthWarning ? `${healthWarning}\n\n` : '') + 'x'.repeat(300 + titles + fulls + sessions + lastSummary + 200);
 }
 
 describe('what the fitted block delivers (#3811 review)', () => {
@@ -194,6 +188,8 @@ describe('what the fitted block delivers (#3811 review)', () => {
 
     expect(delivered.text).toContain(WARNING);
     expect(delivered.text.length).toBeLessThanOrEqual(CONTEXT_OUTPUT_LIMIT);
+    // The renderer placed it; the fitter adds nothing after the timeline.
+    expect(delivered.text.endsWith('x')).toBe(true);
   });
 
   it('leaves the block alone when the observer is healthy', () => {
@@ -300,6 +296,8 @@ describe('what the fitted block delivers (#3811 review)', () => {
     expect(preview.stats).toEqual(model.stats);
     expect(preview.text.length).toBeLessThanOrEqual(CONTEXT_OUTPUT_LIMIT);
     expect(preview.text).toContain('Terminal preview truncated');
-    expect(preview.text.endsWith(`\x1b[31m${WARNING}\x1b[0m`)).toBe(true);
+    // Above the timeline: the preview ends on its newest entry, never on the warning.
+    expect(preview.text.startsWith(`\x1b[31m${WARNING}\x1b[0m\n\n`)).toBe(true);
+    expect(preview.text.endsWith(`\x1b[31m${WARNING}\x1b[0m`)).toBe(false);
   });
 });

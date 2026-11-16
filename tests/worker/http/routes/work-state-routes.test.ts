@@ -3,7 +3,7 @@
 // reads every key the checkout reads. These are what the work_state_write and
 // work_state_read MCP tools call with the session's cwd.
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -90,7 +90,86 @@ function read(query: Record<string, string>): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/api/work-state?${new URLSearchParams(query)}`);
 }
 
+describe('complete work-state export', () => {
+  it('exports every ordered patch and closure beyond the MCP text limit without widening the project or list', async () => {
+    for (let index = 0; index < 80; index++) {
+      store.appendWorkStateEntry({ project, listName: 'pagination-demo', fields: { task: `task-${index}`, status: 'todo', note: '內容'.repeat(200) } });
+    }
+    store.appendWorkStateEntry({ project, listName: 'pagination-demo', fields: { task: 'task-0', status: 'done' } });
+    store.appendWorkStateEntry({ project, listName: 'pagination-demo', fields: { task: 'task-1', status: 'dropped' } });
+    store.appendWorkStateEntry({ project, listName: 'other-list', fields: { task: 'not selected' } });
+    store.appendWorkStateEntry({ project: 'unrelated-project', listName: 'pagination-demo', fields: { task: 'private' } });
+
+    const response = await fetch(`http://127.0.0.1:${port}/api/work-state/export?${new URLSearchParams({ cwd: checkout, list: 'pagination-demo' })}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('application/json');
+    const text = await response.text();
+    expect(Buffer.byteLength(text)).toBeGreaterThan(32 * 1024);
+    const exported = JSON.parse(text);
+    expect(exported.version).toBe(1);
+    expect(exported.entries).toEqual(store.getWorkStateEntries(getProjectContext(checkout).allProjects, 'pagination-demo'));
+    expect(exported.entries).toHaveLength(82);
+    expect(exported.entries.slice(-2).map((entry: any) => entry.fields.status)).toEqual(['done', 'dropped']);
+    expect(text).not.toContain('unrelated-project');
+    expect(text).not.toContain('not selected');
+  });
+
+  it('exports an empty history without inventing records', async () => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/work-state/export?${new URLSearchParams({ cwd: checkout })}`);
+    expect(response.status).toBe(200);
+    expect((await response.json()).entries).toEqual([]);
+  });
+
+  it('keeps complete JSON for the equivalent paths accepted by Express', async () => {
+    store.appendWorkStateEntry({ project, listName: 'release', fields: { task: 'publish', status: 'done' } });
+    for (const path of ['/api/work-state/export/', '/API/work-state/export']) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}?${new URLSearchParams({ cwd: checkout })}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toContain('application/json');
+      expect((await response.json()).entries[0].fields.status).toBe('done');
+    }
+  });
+
+  it('keeps the read route validation and browser-origin protection', async () => {
+    const endpoint = `http://127.0.0.1:${port}/api/work-state/export`;
+    expect((await fetch(endpoint)).status).toBe(400);
+    expect((await fetch(`${endpoint}?${new URLSearchParams({ cwd: checkout })}`, { headers: { Origin: 'https://example.com' } })).status).toBe(403);
+    expect((await fetch(`${endpoint}?${new URLSearchParams({ cwd: checkout })}`, { headers: { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'no-cors' } })).status).toBe(403);
+  });
+});
+
 describe('WorkStateRoutes', () => {
+  // Windows does not support these distinct trailing-whitespace directories.
+  const posixIt = process.platform === 'win32' ? it.skip : it;
+  posixIt('writes to the literal checkout without changing a plain-named sibling', async () => {
+    mkdirSync(join(checkout, 'topic'));
+    for (const [index, name] of ['topic ', 'topic\t', 'topic\n'].entries()) {
+      const cwd = join(checkout, name);
+      mkdirSync(cwd);
+      const response = await write({ cwd, list: 'release', fields: { task: `literal-${index}`, status: 'todo' } });
+      expect(response.status).toBe(200);
+      expect(store.getWorkStateEntries([getProjectContext(cwd).primary]).map(entry => entry.fields))
+        .toEqual([{ task: `literal-${index}`, status: 'todo' }]);
+    }
+    expect(store.getWorkStateEntries([getProjectContext(join(checkout, 'topic')).primary])).toEqual([]);
+  });
+
+  posixIt('reads the literal checkout without exposing a plain-named sibling list', async () => {
+    const sibling = join(checkout, 'topic');
+    mkdirSync(sibling);
+    store.appendWorkStateEntry({ project: getProjectContext(sibling).primary, listName: 'release', fields: { task: 'plain-sibling', status: 'todo' } });
+    for (const [index, name] of ['topic ', 'topic\t', 'topic\n'].entries()) {
+      const cwd = join(checkout, name);
+      mkdirSync(cwd);
+      store.appendWorkStateEntry({ project: getProjectContext(cwd).primary, listName: 'release', fields: { task: `literal-${index}`, status: 'todo' } });
+      const response = await read({ cwd, list: 'release' });
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).toContain(`literal-${index}`);
+      expect(text).not.toContain('plain-sibling');
+    }
+  });
+
   it('reads open work state from a project adopted into the checkout', async () => {
     const adoptedProject = `${project}-merged-worktree`;
     const session = store.createSDKSession('adopted-host', adoptedProject, 'prompt');
@@ -182,6 +261,7 @@ describe('WorkStateRoutes', () => {
       { cwd: checkout, list: 'release', fields: { note: { nested: true } } },
       { cwd: checkout, list: 'release', fields: { note: 'x'.repeat(MAX_WORK_STATE_FIELDS_JSON_CHARS) } },
       { cwd: checkout, list: '  ', fields: { task: 'publish' } },
+      { cwd: ' \t\n', list: 'release', fields: { task: 'publish' } },
       { list: 'release', fields: { task: 'publish' } },
     ];
 
@@ -192,6 +272,7 @@ describe('WorkStateRoutes', () => {
     const emptyFields = await (await write(refused[0])).json() as { issues: Array<{ message: string }> };
     expect(emptyFields.issues.map(issue => issue.message)).toContain('fields must set at least one key');
     expect(store.getWorkStateEntries([project])).toEqual([]);
+    expect((await read({ cwd: ' \t\n' })).status).toBe(400);
   });
 
   it('does not save for a project the user excluded', async () => {

@@ -1,13 +1,23 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 import { rmSync } from 'fs';
 import path from 'path';
 
 import { PRO_FALLBACK_NOTICE_MARKER } from '../../../src/shared/cmem-gateway.js';
 import { paths } from '../../../src/shared/paths.js';
+import {
+  contextCacheKeys,
+  removeContextCache,
+  writeContextCache,
+} from '../../../src/shared/context-cache.js';
 import * as realHookSettings from '../../../src/shared/hook-settings.js';
 import * as realOauthToken from '../../../src/shared/oauth-token.js';
 import * as realProjectName from '../../../src/utils/project-name.js';
 import * as realWorkerUtils from '../../../src/shared/worker-utils.js';
+import * as realSetupState from '../../../src/shared/setup-state.js';
+import type { SetupStateFile } from '../../../src/shared/setup-state.js';
+import * as runtimeSelector from '../../../src/services/hooks/runtime-selector.js';
+import * as contextBuilder from '../../../src/services/context/ContextBuilder.js';
+import { ServerClient } from '../../../src/services/hooks/server-client.js';
 
 /**
  * Snapshot the real namespaces EAGERLY, before the mock.module calls below.
@@ -19,6 +29,7 @@ const realHookSettingsSnapshot = { ...realHookSettings };
 const realOauthTokenSnapshot = { ...realOauthToken };
 const realProjectNameSnapshot = { ...realProjectName };
 const realWorkerUtilsSnapshot = { ...realWorkerUtils };
+const realSetupStateSnapshot = { ...realSetupState };
 
 const calls: unknown[][] = [];
 let includeAllSources = false;
@@ -34,8 +45,13 @@ let proFallbackAt = '';
 let openRouterBaseUrl = '';
 let staleReason: string | null = null;
 let workerContext = 'context from worker';
-let memoryInstructions: string | undefined = 'false';
 const outageNoticeRequests: Array<string | undefined> = [];
+let setupState: SetupStateFile = { ...realSetupState.INITIAL_SETUP_STATE };
+
+mock.module('../../../src/shared/setup-state.js', () => ({
+  ...realSetupStateSnapshot,
+  readSetupState: () => setupState,
+}));
 
 mock.module('../../../src/shared/hook-settings.js', () => ({
   loadFromFileOnce: () => ({
@@ -48,7 +64,6 @@ mock.module('../../../src/shared/hook-settings.js', () => ({
     CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER: quotaFallbackProvider,
     CLAUDE_MEM_PRO_FALLBACK_AT: proFallbackAt,
     CLAUDE_MEM_OPENROUTER_BASE_URL: openRouterBaseUrl,
-    CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED: memoryInstructions,
   }),
 }));
 
@@ -85,6 +100,7 @@ afterAll(() => {
   mock.module('../../../src/shared/oauth-token.js', () => realOauthTokenSnapshot);
   mock.module('../../../src/utils/project-name.js', () => realProjectNameSnapshot);
   mock.module('../../../src/shared/worker-utils.js', () => realWorkerUtilsSnapshot);
+  mock.module('../../../src/shared/setup-state.js', () => realSetupStateSnapshot);
 });
 
 beforeEach(() => {
@@ -95,10 +111,52 @@ beforeEach(() => {
   openRouterBaseUrl = '';
   staleReason = null;
   workerContext = 'context from worker';
-  memoryInstructions = 'false';
+  setupState = { ...realSetupStateSnapshot.INITIAL_SETUP_STATE };
 });
 
 describe('contextHandler SessionStart path', () => {
+  const pendingInstall = (): SetupStateFile => ({
+    ...realSetupStateSnapshot.INITIAL_SETUP_STATE,
+    install: {
+      status: 'waiting', selection: null, error: null,
+      catalog: {
+        agents: [], skills: [], reinstall: false,
+        defaults: { agents: [], skills: [], installClaudeCode: false, disableAutoMemory: false, telemetryEnabled: false },
+      },
+    },
+  });
+
+  it('brings an explicitly deferred install to the human on first use without selecting defaults', async () => {
+    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+    setupState = pendingInstall();
+    const result = await contextHandler.execute({ sessionId: 'pending-onboarding', cwd: '/tmp/repo', platform: 'claude-code' });
+    expect(result.hookSpecificOutput?.additionalContext).toContain('Setup is waiting for your choices:');
+    expect(result.hookSpecificOutput?.additionalContext).toContain('?setup=1');
+    expect(result.hookSpecificOutput?.additionalContext).toContain('Otherwise leave setup pending');
+    expect(result.systemMessage).toContain('Do not choose agents, integrations, skills, or account options on their behalf.');
+  });
+
+  it('does not push existing installs or completed onboarding back through setup', async () => {
+    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+    const oldInstall = await contextHandler.execute({ sessionId: 'old-install', cwd: '/tmp/repo', platform: 'claude-code' });
+    expect(oldInstall.hookSpecificOutput?.additionalContext).not.toContain('Setup is waiting');
+    setupState = { ...pendingInstall(), status: 'complete' };
+    const completed = await contextHandler.execute({ sessionId: 'completed-onboarding', cwd: '/tmp/repo', platform: 'claude-code' });
+    expect(completed.hookSpecificOutput?.additionalContext).not.toContain('Setup is waiting');
+  });
+
+  it('keeps the deferred onboarding link visible even when the worker cannot return context', async () => {
+    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+    setupState = pendingInstall();
+    workerUnreachable = true;
+    try {
+      const result = await contextHandler.execute({ sessionId: 'pending-worker-down', cwd: '/tmp/repo', platform: 'claude-code' });
+      expect(result.hookSpecificOutput?.additionalContext).toContain('?setup=1');
+      expect(result.systemMessage).toContain('Setup is waiting for your choices:');
+      expect(result.systemMessage).toContain('worker unreachable');
+    } finally { workerUnreachable = false; }
+  });
+
   it('reads only this checkout by default and every project, this checkout last, when CLAUDE_MEM_CONTEXT_PROJECTS is all', async () => {
     const { contextHandler } = await import('../../../src/cli/handlers/context.js');
     const injectUrl = () => String(calls.filter(call => String(call[0]).startsWith('/api/context/inject')).at(-1)?.[0]);
@@ -172,26 +230,7 @@ describe('contextHandler SessionStart path', () => {
       expect(calls.some(call => call[0] === '/api/projects')).toBe(false);
     });
   });
-  it('steers note-taking to available plugin tools by default and still injects instructions during a worker outage', async () => {
-    memoryInstructions = undefined;
-    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-    const input = { sessionId: 'memory-instructions', cwd: '/tmp/repo', platform: 'codex' };
-    const result = await contextHandler.execute(input);
-    expect(result.hookSpecificOutput?.additionalContext).toContain('context from worker');
-    expect(result.hookSpecificOutput?.additionalContext).toContain('save_memory tool is available');
-    expect(result.hookSpecificOutput?.additionalContext).toContain('concise purpose-specific text');
-    expect(result.hookSpecificOutput?.additionalContext).toContain('internal metadata out of model context');
-    expect(result.hookSpecificOutput?.additionalContext).toContain('observation_add for the selected server project');
-    expect(result.hookSpecificOutput?.additionalContext).toContain('save_memory is local-worker only');
-    expect(result.hookSpecificOutput?.additionalContext).toContain('hosted read-only connector');
-    workerUnreachable = true;
-    try {
-      const fallback = await contextHandler.execute(input);
-      expect(fallback.hookSpecificOutput?.additionalContext).toContain('save_memory tool is available');
-    } finally { workerUnreachable = false; }
-  });
   it('explicitly omits an oversized old-worker body without cutting its records', async () => {
-    memoryInstructions = undefined;
     staleReason = 'expired keychain entry';
     workerContext = 'recent observation\n'.repeat(600).slice(0, 10_000);
     const { contextHandler } = await import('../../../src/cli/handlers/context.js');
@@ -202,16 +241,7 @@ describe('contextHandler SessionStart path', () => {
     expect(output).toContain('Recent context omitted');
     const url = new URL(String(calls.at(-1)![0]), 'http://worker');
     expect(Number(url.searchParams.get('reserveChars'))).toBeGreaterThan(0);
-    expect(output).toContain('save_memory tool is available');
-  });
-
-  it('keeps a budgeted body under the cap when only the OAuth notice is added', async () => {
-    staleReason = 'expired keychain entry';
-    workerContext = 'recent observation\n'.repeat(600).slice(0, 10_000);
-    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-    const result = await contextHandler.execute({ sessionId: 'full-context-no-instructions', cwd: '/tmp/repo', platform: 'codex' });
-    expect(result.hookSpecificOutput!.additionalContext!.length).toBeLessThanOrEqual(10_000);
-    expect(result.hookSpecificOutput!.additionalContext).toContain('claude auth login');
+    expect(output).not.toContain('save_memory tool is available');
   });
 
   it('bounds an oversized stale reason without losing its login remedy', async () => {
@@ -222,13 +252,12 @@ describe('contextHandler SessionStart path', () => {
     expect(result.hookSpecificOutput!.additionalContext).toContain('claude auth login');
   });
 
-  it('keeps the gateway notice and instructions when the body fills the budget', async () => {
+  it('keeps the gateway notice when the body fills the budget', async () => {
     const marker = path.join(paths.dataDir(), PRO_FALLBACK_NOTICE_MARKER);
     rmSync(marker, { force: true });
     providerBySource = '{"codex":"openrouter"}';
     openRouterBaseUrl = 'https://cmem.ai/api/inference/v1';
     proFallbackAt = new Date().toISOString();
-    memoryInstructions = undefined;
     staleReason = 'expired keychain entry';
     workerContext = 'recent observation\n'.repeat(600).slice(0, 10_000);
     try {
@@ -238,32 +267,34 @@ describe('contextHandler SessionStart path', () => {
       expect(output.length).toBeLessThanOrEqual(10_000);
       expect(output).toContain('Memory is using your Anthropic plan for now.');
       expect(output).toContain('claude auth login');
-      expect(output).toContain('save_memory tool is available');
     } finally { rmSync(marker, { force: true }); }
   });
 
   it('preserves exact fits and fits TeamBrain after accounting for every separator', async () => {
     const { composeSessionStartContext } = await import('../../../src/cli/handlers/context.js');
-    expect(composeSessionStartContext('body', 'notice', 'instructions', 'team', 32))
-      .toBe('notice\n\nbody\n\nteam\n\ninstructions');
-    const output = composeSessionStartContext('row\n'.repeat(300), 'notice', 'instructions', 'brief '.repeat(300), 1_000);
+    // The timeline body comes last, so later updates can append rows to it.
+    expect(composeSessionStartContext('body', 'notice', 'team', 18))
+      .toBe('notice\n\nteam\n\nbody');
+    const body = Array.from({ length: 200 }, () => 'row').join('\n');
+    const output = composeSessionStartContext(body, 'notice', 'brief '.repeat(300), 1_000);
     expect(output.length).toBeLessThanOrEqual(1_000);
     expect(output.startsWith('notice\n\n')).toBe(true);
-    expect(output.endsWith('instructions')).toBe(true);
-    expect(composeSessionStartContext('x'.repeat(1_100), 'notice', 'instructions', '', 1_000))
+    expect(output).toContain('TeamBrain brief left out');
+    expect(output.endsWith(body)).toBe(true);
+    expect(composeSessionStartContext('x'.repeat(1_100), 'notice', '', 1_000))
       .toContain('Recent context omitted');
   });
 
   it('preserves complete records and code fences when they fit, and never cuts them when they do not', async () => {
     const { composeSessionStartContext } = await import('../../../src/cli/handlers/context.js');
     const body = '# old\n# newest\n```js\nconst emoji = "😀";\n```';
-    expect(composeSessionStartContext(body, 'notice', 'instructions', '', 200))
-      .toBe('notice\n\n' + body + '\n\ninstructions');
-    const omitted = composeSessionStartContext(body.repeat(100), 'notice', 'instructions', '', 200);
+    expect(composeSessionStartContext(body, 'notice', '', 200))
+      .toBe('notice\n\n' + body);
+    const omitted = composeSessionStartContext(body.repeat(100), 'notice', '', 200);
     expect(omitted).toContain('Recent context omitted');
     expect(omitted).not.toContain('```');
     expect(omitted).not.toContain('# old');
-    expect(omitted.endsWith('instructions')).toBe(true);
+    expect(omitted.startsWith('notice\n\n')).toBe(true);
   });
 
   it('skips the model and terminal timeline on Claude resume before contacting the worker', async () => {
@@ -347,92 +378,42 @@ describe('contextHandler SessionStart path', () => {
     expect(startup.hookSpecificOutput?.hookEventName).toBe('SessionStart');
   });
 
-  for (const memoryProvider of ['codex', 'openai-compatible', 'openrouter', 'gemini']) {
-    it(`does not request Claude login when memory uses ${memoryProvider} with the fallback turned off`, async () => {
-      provider = memoryProvider;
-      quotaFallbackProvider = 'off';
+  const loginHintCases: Array<{
+    name: string; provider: string; quotaFallback?: string; bySource?: string;
+    baseUrl?: string; fallbackAt?: boolean; expectHint: boolean;
+  }> = [
+    ...['codex', 'openai-compatible', 'openrouter', 'gemini'].map(provider => ({
+      name: `${provider} with fallback off`, provider, quotaFallback: 'off', expectHint: false,
+    })),
+    ...['claude', ''].map(provider => ({ name: provider || 'default', provider, expectHint: true })),
+    { name: 'default fallback', provider: 'gemini', quotaFallback: '', expectHint: true },
+    { name: 'Claude fallback', provider: 'codex', quotaFallback: ' claude ', expectHint: true },
+    { name: 'gateway fallback', provider: 'openrouter', baseUrl: 'https://cmem.ai/api/gateway', fallbackAt: true, expectHint: true },
+    { name: 'source mapped to Claude', provider: 'codex', quotaFallback: 'gemini', bySource: '{"claude":"claude"}', expectHint: true },
+    { name: 'source mapped elsewhere', provider: 'codex', quotaFallback: 'gemini', bySource: '{"cursor":"gemini"}', expectHint: false },
+    { name: 'malformed source map', provider: 'codex', quotaFallback: 'gemini', bySource: '{"claude":"nope"}', expectHint: false },
+  ];
+
+  for (const row of loginHintCases) {
+    it(`shows the Claude login hint exactly when needed: ${row.name}`, async () => {
+      provider = row.provider;
+      quotaFallbackProvider = row.quotaFallback ?? '';
+      providerBySource = row.bySource ?? '';
+      openRouterBaseUrl = row.baseUrl ?? '';
+      proFallbackAt = row.fallbackAt ? new Date().toISOString() : '';
       staleReason = 'expired keychain entry';
       const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-      const result = await contextHandler.execute({
-        sessionId: `session-stale-${memoryProvider}`,
-        cwd: '/tmp/repo',
-        platform: 'codex',
-      });
-      expect(result.hookSpecificOutput?.additionalContext).toBe('context from worker');
+      const result = await contextHandler.execute({ sessionId: `login-hint-${row.name}`, cwd: '/tmp/repo', platform: 'codex' });
+      const output = result.hookSpecificOutput?.additionalContext;
+      if (row.expectHint) {
+        expect(output).toContain('Claude Code OAuth token is stale');
+        expect(output).toContain('claude auth login');
+      } else {
+        expect(output).not.toContain('claude auth login');
+        if (!row.bySource) expect(output).toBe('context from worker');
+      }
     });
   }
-
-  for (const memoryProvider of ['claude', '']) {
-    it(`keeps the Claude login hint for ${memoryProvider || 'default'} memory`, async () => {
-      provider = memoryProvider;
-      staleReason = 'expired keychain entry';
-      const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-      const result = await contextHandler.execute({
-        sessionId: 'session-stale-claude',
-        cwd: '/tmp/repo',
-        platform: 'codex',
-      });
-      expect(result.hookSpecificOutput?.additionalContext).toContain('Claude Code OAuth token is stale');
-      expect(result.hookSpecificOutput?.additionalContext).toContain('claude auth login');
-    });
-  }
-
-  it('keeps the Claude login hint for the default (empty) fallback, the Anthropic plan', async () => {
-    provider = 'gemini';
-    quotaFallbackProvider = '';
-    staleReason = 'expired keychain entry';
-    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-    const result = await contextHandler.execute({
-      sessionId: 'session-stale-default-fallback',
-      cwd: '/tmp/repo',
-      platform: 'codex',
-    });
-    expect(result.hookSpecificOutput?.additionalContext).toContain('Claude Code OAuth token is stale');
-  });
-
-  it('keeps the Claude login hint for a configured Claude quota fallback', async () => {
-    provider = 'codex';
-    quotaFallbackProvider = ' claude ';
-    staleReason = 'expired keychain entry';
-    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-    const result = await contextHandler.execute({
-      sessionId: 'session-stale-claude-fallback',
-      cwd: '/tmp/repo',
-      platform: 'codex',
-    });
-    expect(result.hookSpecificOutput?.additionalContext).toContain('claude auth login');
-  });
-
-  it('keeps the Claude login hint while the primary cmem gateway falls back to Claude', async () => {
-    provider = 'openrouter';
-    openRouterBaseUrl = 'https://cmem.ai/api/gateway';
-    proFallbackAt = new Date().toISOString();
-    staleReason = 'expired keychain entry';
-    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-    const result = await contextHandler.execute({
-      sessionId: 'session-stale-cmem-fallback',
-      cwd: '/tmp/repo',
-      platform: 'codex',
-    });
-    expect(result.hookSpecificOutput?.additionalContext).toContain('claude auth login');
-  });
-
-  it('keeps the Claude login hint when a source is mapped to Claude, whatever the global provider', async () => {
-    provider = 'codex';
-    quotaFallbackProvider = 'gemini';
-    staleReason = 'expired keychain entry';
-    const { contextHandler } = await import('../../../src/cli/handlers/context.js');
-    const hintFor = async (bySource: string, sessionId: string) => {
-      providerBySource = bySource;
-      const result = await contextHandler.execute({ sessionId, cwd: '/tmp/repo', platform: 'codex' });
-      return result.hookSpecificOutput?.additionalContext;
-    };
-
-    expect(await hintFor('{"claude":"claude"}', 'session-stale-mapped')).toContain('claude auth login');
-    expect(await hintFor('{"cursor":"gemini"}', 'session-stale-mapped-other')).not.toContain('claude auth login');
-    // A malformed map is ignored, as dispatch ignores it.
-    expect(await hintFor('{"claude":"nope"}', 'session-stale-malformed')).not.toContain('claude auth login');
-  });
 
   describe('cmem fallback notice with a source mapped to the gateway', () => {
     const noticeMarker = path.join(paths.dataDir(), PRO_FALLBACK_NOTICE_MARKER);
@@ -514,6 +495,30 @@ describe('contextHandler SessionStart path', () => {
     ]]);
   });
 
+  it('passes the Codex host budget to the server context renderer', async () => {
+    const runtime = {
+      runtime: 'server' as const,
+      projectId: 'server-project',
+      serverBaseUrl: 'http://127.0.0.1:0',
+      client: new ServerClient({ serverBaseUrl: 'http://127.0.0.1:0', apiKey: 'test-key' }),
+    };
+    const runtimeSpy = spyOn(runtimeSelector, 'resolveRuntimeContext').mockReturnValue(runtime);
+    const renderSpy = spyOn(contextBuilder, 'generateServerSessionStartContext').mockResolvedValue({ model: '', terminal: null });
+    calls.length = 0;
+    try {
+      const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+      const result = await contextHandler.execute({ sessionId: 'codex-server-budget', cwd: process.cwd(), platform: 'codex' });
+      expect(renderSpy).toHaveBeenCalledTimes(1);
+      expect(renderSpy.mock.calls[0][0]).toBe(runtime);
+      expect(renderSpy.mock.calls[0][2]).toEqual({ withTerminalRender: false, timeoutMs: 15_000 });
+      expect(calls).toEqual([]);
+      expect(result.hookSpecificOutput).toEqual({ hookEventName: 'SessionStart', additionalContext: '' });
+    } finally {
+      renderSpy.mockRestore();
+      runtimeSpy.mockRestore();
+    }
+  });
+
   it('keeps the existing worker lifecycle behavior for Claude', async () => {
     calls.length = 0;
     const { contextHandler } = await import('../../../src/cli/handlers/context.js');
@@ -593,5 +598,65 @@ describe('contextHandler SessionStart path', () => {
     } finally {
       includeAllSources = false;
     }
+  });
+
+  describe('context cache reserve (#5672)', () => {
+    const fallbackMarker = path.join(paths.dataDir(), PRO_FALLBACK_NOTICE_MARKER);
+    const cacheKeys = () => contextCacheKeys(['parent-project', 'repo-project'], 'claude', false);
+    const seedCache = (body: string) => writeContextCache(cacheKeys(), body, Date.now());
+    const clearCache = () => removeContextCache(cacheKeys());
+
+    beforeEach(() => {
+      rmSync(fallbackMarker, { force: true });
+      clearCache();
+    });
+    afterEach(() => {
+      rmSync(fallbackMarker, { force: true });
+      clearCache();
+    });
+
+    it('shares one room definition between the cache read and the compose step', async () => {
+      const { sessionStartBodyRoom } = await import('../../../src/cli/handlers/context.js');
+      expect(sessionStartBodyRoom('', 1_000)).toBe(1_000);
+      expect(sessionStartBodyRoom('notice', 1_000)).toBe(992);
+      expect(sessionStartBodyRoom('x'.repeat(999), 1_000)).toBe(0);
+    });
+
+    it('treats a cached body over the reserve-adjusted room as a miss and fetches live', async () => {
+      staleReason = 'x'.repeat(2_000);
+      proFallbackAt = new Date().toISOString();
+      workerContext = 'LIVE BODY FROM WORKER';
+      // Rendered for the full budget, over the room the notices leave (about
+      // 8.7k here) but under the raw 10k limit: exactly the body #5672 saw
+      // served and then dropped.
+      const cachedBody = 'CACHED BODY MARKER\n' + 'y'.repeat(9_342);
+      expect(cachedBody.length).toBe(9_361);
+      seedCache(cachedBody);
+      calls.length = 0;
+      const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+      const result = await contextHandler.execute({ sessionId: 'cache-over-room', cwd: '/tmp/repo', platform: 'claude-code' });
+      const output = result.hookSpecificOutput!.additionalContext!;
+      expect(output).toContain('LIVE BODY FROM WORKER');
+      expect(output).not.toContain('CACHED BODY MARKER');
+      expect(output).not.toContain('Recent context omitted');
+      const injectUrl = new URL(String(calls.find(call => String(call[0]).startsWith('/api/context/inject'))?.[0]), 'http://worker');
+      expect(Number(injectUrl.searchParams.get('reserveChars'))).toBeGreaterThan(0);
+    });
+
+    it('still serves a cached body that fits the reserve-adjusted room', async () => {
+      staleReason = 'x'.repeat(2_000);
+      proFallbackAt = new Date().toISOString();
+      workerContext = 'LIVE BODY FROM WORKER';
+      const cachedBody = 'CACHED BODY MARKER\n' + 'y'.repeat(4_981);
+      expect(cachedBody.length).toBe(5_000);
+      seedCache(cachedBody);
+      calls.length = 0;
+      const { contextHandler } = await import('../../../src/cli/handlers/context.js');
+      const result = await contextHandler.execute({ sessionId: 'cache-fits-room', cwd: '/tmp/repo', platform: 'claude-code' });
+      const output = result.hookSpecificOutput!.additionalContext!;
+      expect(output).toContain('CACHED BODY MARKER');
+      expect(output).not.toContain('LIVE BODY FROM WORKER');
+      expect(calls).toEqual([]);
+    });
   });
 });

@@ -5,6 +5,7 @@ import type { Agent, CurrentPeriod, Device, FocusArea, FocusAsk, FocusChange, Pa
 import type { OwnerRule, RuleChange, RulesFile, RulesLearning, RuleScope } from '../data-rules.ts'
 import type { ConnectionStatus } from './connection-status.ts'
 import type { ReviewResult, SaveReceipt } from './review-response.ts'
+import type { WorkViewRefreshState } from './work-view-api-types.ts'
 
 export type SourceKind = 'sample' | 'local' | 'cloud'
 
@@ -56,7 +57,7 @@ export interface WorkModel {
 }
 
 /** What the automatic refresh is doing. `finishedAt` is display text. */
-export interface AutoRefresh { state: 'idle' | 'running' | 'ok' | 'failed' | 'waiting-for-agent'; finishedAt: string | null; error: string | null }
+export interface AutoRefresh { state: WorkViewRefreshState; finishedAt: string | null; error: string | null }
 
 /** The last build story request-progress wrote. `writtenAt` is display text; null when not recorded. */
 export interface BuildStory { recap: string; paragraphs: string[]; writtenAt: string | null }
@@ -84,7 +85,7 @@ export interface WorkDataSource {
   answerRequestSuggestion?(suggestion: NonNullable<Request['suggestion']>, action: 'join' | 'not-this'): Promise<SuggestionSaveResult>
   /** Saves one change to My Rules and answers with the model after it. Rejects with the reason it was not saved. */
   saveRuleChange(change: RuleChange): Promise<RuleSaveResult>
-  /** Saves one change to My Focus and answers with the model after it. Rejects with the reason it was not saved. */
+  /** Saves one focus change and returns its own saved snapshot, even when a newer live model is displayed. */
   saveFocusChange(change: FocusChange): Promise<WorkModel>
   /** Records the owner's stop for a subagent no recorded stop covers, and answers with the model after it. */
   markAgentFinished(agentId: string): Promise<WorkModel>

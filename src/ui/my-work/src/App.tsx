@@ -1,12 +1,13 @@
 import { lazy, Suspense, useEffect, type ReactNode } from 'react'
 import { MotionConfig } from 'motion/react'
 import { CreditCardIcon, InboxIcon, ListChecksIcon, UsersIcon } from 'lucide-react'
-import { useI18n } from '@/lib/i18n'
+import { LOCALES, LOCALE_NAMES, useI18n, type Locale } from '@/lib/i18n'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { ActivePill, ClassicViewerLink, DeviceFreshness, FeedbackLink, GitHubStars, LiveIndicator } from '@/components/bits'
@@ -15,12 +16,8 @@ import { Notch } from '@/components/aceternity/notch'
 import { StickyBanner } from '@/components/aceternity/sticky-banner'
 import { CmemMark } from '@/components/brand'
 import { FocusChipRow, FocusRail, PastFocusLink, SIDE_NAV_PILL } from '@/components/focus-nav'
-import { RequestDetail } from '@/components/request-detail'
 import { cn } from '@/lib/utils'
-import { PastFocus } from '@/pages/past-focus'
-import { MyRules } from '@/pages/my-rules'
 import { MyWork } from '@/pages/my-work'
-import { SuggestedAreas } from '@/pages/suggested-areas'
 import { Req } from '@/spec/req'
 import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from '@/components/ui/empty'
 import { Spinner } from '@/components/ui/spinner'
@@ -107,25 +104,60 @@ function LanguageSelector() {
       <select
         aria-label={t('Language')}
         value={locale}
-        onChange={(e) => setLocale(e.target.value as 'en' | 'zh-CN')}
+        onChange={(e) => setLocale(e.target.value as Locale)}
         className="h-7 rounded-md border border-border bg-card px-2 text-xs text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
       >
-        <option value="en">English</option>
-        <option value="zh-CN">简体中文</option>
+        {LOCALES.map((code) => <option key={code} value={code}>{LOCALE_NAMES[code]}</option>)}
       </select>
     </div>
   )
 }
 
 const SetupPage = lazy(() => import('@/setup/setup-page'))
+const MyRules = lazy(() => import('@/pages/my-rules').then(module => ({ default: module.MyRules })))
+const SuggestedAreas = lazy(() => import('@/pages/suggested-areas').then(module => ({ default: module.SuggestedAreas })))
+const PastFocus = lazy(() => import('@/pages/past-focus').then(module => ({ default: module.PastFocus })))
+const RequestDetail = lazy(() => import('@/components/request-detail').then(module => ({ default: module.RequestDetail })))
+
+/** The shell remains usable while a secondary page's code arrives. */
+function PageLoading({ label }: { label: string }) {
+  const { t } = useI18n()
+  return <section aria-label={label} aria-busy="true" className="rounded-xl border bg-card/60 p-6">
+    <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner className="size-4" />{t('Loading…')}</p>
+  </section>
+}
+
+/** Opening a request responds immediately, including focus trapping and a working close control. */
+function RequestDetailLoading({ title, onClose }: { title: string; onClose: () => void }) {
+  const { t } = useI18n()
+  return <Sheet open onOpenChange={(open) => { if (!open) onClose() }}>
+    <SheetContent className="w-full gap-0 overflow-y-auto data-[side=right]:w-full data-[side=right]:sm:max-w-xl">
+      <SheetHeader className="gap-3 border-b p-5 md:p-6">
+        <SheetTitle className="pr-8 text-xl leading-snug">{title}</SheetTitle>
+        <SheetDescription>{t('Request details')}</SheetDescription>
+      </SheetHeader>
+      <p role="status" className="flex items-center gap-2 p-5 text-sm text-muted-foreground md:p-6"><Spinner className="size-4" />{t('Loading request detail…')}</p>
+    </SheetContent>
+  </Sheet>
+}
+
 export default function App() {
-  // Only the explicit installer handoff opens setup. Missing state on an
-  // existing installation must never lock My Work behind checkout.
+  // An agent may leave setup for the person's first visit. Only a persisted
+  // install handoff opens it automatically; old installations and cloud readers keep My Work.
   const page = useStore((state) => state.view.page)
   const finishSetup = useStore.use.finishSetup()
   // Once per mount, read from the store at effect time. Depending on the action
   // identity re-posted an open whenever that function was replaced.
   useEffect(() => { useStore.getState().reportOpen() }, [])
+  useEffect(() => {
+    if (page === 'setup' || isServedFromCloud(window.location.hostname)
+      || new URLSearchParams(window.location.search).get('source') === 'sample') return
+    let active = true
+    void import('@/setup/setup-data').then(module => module.setupPending()).then(pending => {
+      if (active && pending && useStore.getState().view.page === 'app') useStore.getState().startSetup()
+    }).catch(() => { /* No confirmed handoff: keep the existing workspace usable. */ })
+    return () => { active = false }
+  }, [page])
   if (page !== 'setup') return <WorkApp />
   return <MotionConfig reducedMotion="user"><Suspense fallback={null}><SetupPage onComplete={finishSetup} /></Suspense></MotionConfig>
 }
@@ -254,10 +286,12 @@ function LoadedApp() {
 
                 <main className="min-w-0 space-y-4 md:space-y-5">
                   <FocusChipRow selected={selected} onSelect={selectFocus} />
-                  {view === 'work' && <MyWork focusAreaId={focusAreaId} onOpen={openRequestDrawer} onOpenFocus={goToFocus} onOpenRules={() => goToPage('rules')} />}
-                  {view === 'suggested' && <SuggestedAreas onOpenFocus={goToFocus} />}
-                  {view === 'past-focus' && <PastFocus onOpenFocus={goToFocus} />}
-                  {view === 'rules' && <MyRules />}
+                  <Suspense fallback={<PageLoading label={heading} />}>
+                    {view === 'work' && <MyWork focusAreaId={focusAreaId} onOpen={openRequestDrawer} onOpenFocus={goToFocus} onOpenRules={() => goToPage('rules')} />}
+                    {view === 'suggested' && <SuggestedAreas onOpenFocus={goToFocus} />}
+                    {view === 'past-focus' && <PastFocus onOpenFocus={goToFocus} />}
+                    {view === 'rules' && <MyRules />}
+                  </Suspense>
                 </main>
               </div>
 
@@ -289,7 +323,10 @@ function LoadedApp() {
                 </nav>
               </Req>
 
-              <RequestDetail request={liveOpenRequest} onClose={closeRequestDrawer} onOpenFocus={goToFocus} />
+              {/* Always mounted: its code loads after first paint, and closing keeps the loaded detail for a reopen. */}
+              <Suspense fallback={liveOpenRequest ? <RequestDetailLoading title={liveOpenRequest.title ?? liveOpenRequest.resolvesTo?.title ?? t('Untitled request')} onClose={closeRequestDrawer} /> : null}>
+                <RequestDetail request={liveOpenRequest} onClose={closeRequestDrawer} onOpenFocus={goToFocus} />
+              </Suspense>
             </div>
           </Req>
         </TooltipProvider>

@@ -4,11 +4,25 @@ import { viewerZh } from './viewer-zh';
 import { myworkZh } from './mywork-zh';
 import { setupZh } from './setup-zh';
 import { settingsZh } from './settings-zh';
+import { viewerKo } from './viewer-ko';
+import { myworkKo } from './mywork-ko';
+import { setupKo } from './setup-ko';
+import { settingsKo } from './settings-ko';
+import { myworkTr } from './mywork-tr';
+import { viewerFr } from './viewer-fr';
+import { myworkFr } from './mywork-fr';
+import { setupFr } from './setup-fr';
+import { settingsFr } from './settings-fr';
 import { LANGUAGE_STORAGE_KEY, parseLocale, type Locale } from './locale';
 
 export type { Locale } from './locale';
-export { interpolate } from './locale';
-const messages: Record<string, string> = { ...viewerZh, ...myworkZh, ...setupZh, ...settingsZh };
+export { interpolate, LOCALES, LOCALE_NAMES } from './locale';
+const catalogs: Partial<Record<Locale, Record<string, string>>> = {
+  'zh-CN': { ...viewerZh, ...myworkZh, ...setupZh, ...settingsZh },
+  ko: { ...viewerKo, ...myworkKo, ...setupKo, ...settingsKo },
+  tr: myworkTr,
+  fr: { ...viewerFr, ...myworkFr, ...setupFr, ...settingsFr },
+};
 const listeners = new Set<() => void>();
 let sessionLocale: Locale = 'en';
 let hasUnpersistedChoice = false;
@@ -60,5 +74,5 @@ export function subscribeLocale(listener: () => void): () => void {
 
 /** The exact English source text is also the catalog key and English default. */
 export function t(english: string): string {
-  return getLocale() === 'zh-CN' ? messages[english] ?? english : english;
+  return catalogs[getLocale()]?.[english] ?? english;
 }

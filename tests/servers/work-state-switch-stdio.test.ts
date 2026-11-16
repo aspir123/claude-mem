@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { ListRootsRequestSchema, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { pathToFileURL } from 'node:url';
+import { WORK_STATE_RULE, mcpServerInstructions } from '../../src/shared/memory-instructions.js';
 
 // #4606: behavioral check of CLAUDE_MEM_WORK_STATE_ENABLED through the real stdio
 // transport. A stub worker records every request, so the test sees whether a
@@ -14,7 +15,7 @@ import { pathToFileURL } from 'node:url';
 async function withServer(
   env: Record<string, string>,
   run: (client: Client, workStateHits: () => string[], workStateWrites: () => Array<Record<string, unknown>>) => Promise<void>,
-  options: { cwd?: string; pwd?: string; clientName?: string; roots?: Array<{ uri: string; name?: string }> } = {},
+  options: { cwd?: string; pwd?: string; clientName?: string; roots?: Array<{ uri: string; name?: string }>; workStateText?: string } = {},
 ): Promise<void> {
   const hits: string[] = [];
   const writes: Array<Record<string, unknown>> = [];
@@ -23,7 +24,8 @@ async function withServer(
   app.use((req, _res, next) => { hits.push(`${req.method} ${req.path}`); next(); });
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
   app.post('/api/work-state/entries', (req, res) => { writes.push(req.body); res.json({ entries: [] }); });
-  app.get('/api/work-state', (_req, res) => res.json({ entries: [] }));
+  app.get('/api/work-state', (_req, res) => options.workStateText === undefined
+    ? res.json({ entries: [] }) : res.type('text').send(options.workStateText));
   const server = app.listen(0, '127.0.0.1');
   await new Promise<void>(resolve => server.once('listening', resolve));
   const { port } = server.address() as { port: number };
@@ -32,6 +34,7 @@ async function withServer(
   // each test sets the value it means to check.
   const inherited = { ...process.env };
   delete inherited.CLAUDE_MEM_WORK_STATE_ENABLED;
+  delete inherited.CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED;
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [join(import.meta.dir, '..', '..', 'src', 'servers', 'mcp-server.ts')],
@@ -73,6 +76,16 @@ const workStateCalls = [
 ];
 
 describe('CLAUDE_MEM_WORK_STATE_ENABLED over stdio (#4606)', () => {
+  it('carries work-state truncation metadata and complete-export guidance over MCP', async () => {
+    await withServer({}, async client => {
+      const result = await client.callTool(workStateCalls[1]) as CallToolResult;
+      expect(result._meta).toEqual({ 'claude-mem/truncated': true });
+      const text = result.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+      expect(text).toContain('/api/work-state/export');
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(32 * 1024);
+    }, { workStateText: '任務'.repeat(10_000) });
+  }, 20_000);
+
   it('turned off: tools/list hides both work_state tools and tools/call rejects them without reaching the worker', async () => {
     await withServer({ CLAUDE_MEM_WORK_STATE_ENABLED: 'false' }, async (client, workStateHits) => {
       const names = (await client.listTools()).tools.map(tool => tool.name);
@@ -157,4 +170,30 @@ describe('CLAUDE_MEM_WORK_STATE_ENABLED over stdio (#4606)', () => {
       expect(workStateHits().length).toBeGreaterThanOrEqual(2);
     });
   }, 20_000);
+});
+
+// The work-state rule and the memory-use guidance moved out of the SessionStart
+// block, which is the memory timeline alone now, into the instructions this
+// server sends the host at initialize.
+describe('MCP server instructions over stdio', () => {
+  it('hands the host the work-state rule, then the memory guidance, at initialize', async () => {
+    await withServer({}, async (client) => {
+      expect(client.getInstructions()).toBe(mcpServerInstructions({ runtime: 'worker', workStateEnabled: true, memoryInstructionsEnabled: true }));
+      expect(client.getInstructions()).toStartWith('# Work state: your to-do lists and working state');
+      expect(client.getInstructions()).toContain('# claude-mem memory use');
+    });
+  }, 20_000);
+
+  it('leaves out each part its setting turns off', async () => {
+    await withServer({ CLAUDE_MEM_WORK_STATE_ENABLED: 'false' }, async (client) => {
+      expect(client.getInstructions()).toStartWith('# claude-mem memory use');
+      expect(client.getInstructions()).not.toContain('# Work state');
+    });
+    await withServer({ CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED: 'false' }, async (client) => {
+      expect(client.getInstructions()).toBe(WORK_STATE_RULE);
+    });
+    await withServer({ CLAUDE_MEM_WORK_STATE_ENABLED: 'false', CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED: 'false' }, async (client) => {
+      expect(client.getInstructions()).toBeUndefined();
+    });
+  }, 60_000);
 });

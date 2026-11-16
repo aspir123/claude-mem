@@ -1,7 +1,7 @@
 
 import { logger } from '../../../utils/logger.js';
 import { hasStorableTitle } from '../../sqlite/observations/store.js';
-import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
+import { maskXmlLiteralMarkup, parseAgentXml, OBSERVATION_OPEN_TAG, OBSERVATION_BLOCK, SUMMARY_BLOCK, SKIP_SUMMARY_TAG, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
 import {
   classifyObserverOutput,
   isAnthropicVerificationHoldObserverOutput,
@@ -14,6 +14,7 @@ import {
   previewOutput,
 } from '../../../sdk/output-classifier.js';
 import { updateCursorContextForProject } from '../../integrations/CursorHooksInstaller.js';
+import { updateGrokContextForProject } from '../../integrations/GrokBuildRules.js';
 import { notifyTelegram } from '../../integrations/TelegramNotifier.js';
 import { notifyNotion } from '../../integrations/NotionExporter.js';
 import { notifyGrokBotAwareness } from '../../integrations/GrokBotAwarenessPusher.js';
@@ -38,6 +39,8 @@ import { logChromaWriteFailure } from '../search/errors.js';
 import { linkAttachmentRefs, type ResponseMediaContext } from '../../media/inference.js';
 import { observationMediaFromMetadata } from '../../media/feed.js';
 import { captureOnlyLinkWrites, hasWaitingCaptureOnlyEvents, skippedTurnCaptureOnlyLinkWrites, withWaitingCaptureOnlyLinkWrites, writeMediaEventResults, writeObservationMediaLinks, type MediaLinkageWriteResult, type ObservationLinkWrite } from '../../media/linkage.js';
+import { deriveLineAnchors, lineAnchorsForObservation, withLineAnchors, type LineAnchor } from '../../../shared/line-anchors.js';
+import { normalizePlatformSource } from '../../../shared/platform-source.js';
 import type { Database } from 'bun:sqlite';
 
 type ObservationFileEvidenceMessage = Pick<PendingMessage, 'type' | 'tool_name' | 'tool_input' | 'tool_response'>;
@@ -107,6 +110,33 @@ export function extractObservationFileEvidence(messages: ReadonlyArray<Observati
 function toolResponseIndicatesError(toolResponse: unknown): boolean {
   const record = maybeParseObject(toolResponse);
   return record !== null && (record.is_error === true || record.isError === true);
+}
+
+/**
+ * Line anchors (#4943), opt-in with CLAUDE_MEM_LINE_ANCHORS_ENABLED: where in
+ * each file the batch's successful Edit, MultiEdit and targeted Read calls
+ * landed (src/shared/line-anchors.ts). Claude Code sessions only: other hosts'
+ * adapters rename their own tools to these names. Off, no source file is
+ * read. Runs outside the storage transaction, and a failure stores the batch
+ * without anchors: it must never fail or retry a batch.
+ */
+function captureLineAnchors(
+  messages: ReadonlyArray<PendingMessage>,
+  sessionDbId: number,
+  platformSource: string | undefined,
+): LineAnchor[] {
+  try {
+    if (SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_LINE_ANCHORS_ENABLED !== 'true') return [];
+    if (normalizePlatformSource(platformSource) !== 'claude') return [];
+    // A denied or failed call changed nothing, as with file evidence above.
+    return deriveLineAnchors(messages.filter(message => !toolResponseIndicatesError(message.tool_response)));
+  } catch (error) {
+    logger.debug('DB', 'Line anchors skipped for this batch', {
+      sessionId: sessionDbId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return [];
+  }
 }
 
 function pushUnique(seen: Set<string>, output: string[], filePath: string): void {
@@ -243,26 +273,52 @@ function extractPatchPaths(toolInput: unknown): string[] {
 
 function parsePatchFiles(patch: string): string[] {
   const files: string[] = [];
+  let customPatch = false;
+  let oldLines = 0;
+  let newLines = 0;
   for (const line of patch.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith('*** Update File: ')) {
-      files.push(trimmed.replace('*** Update File: ', '').trim());
+    // Unified hunks can contain header-shaped context and +/- content. Count
+    // their lines so a later file header is still recognized without treating
+    // an added "++ b/path" line as another modified file.
+    // A `diff --git` line always starts a new file, so overstated hunk counts
+    // from a model-written diff cannot swallow the next file's headers.
+    if (line.startsWith('diff --git ')) {
+      oldLines = 0;
+      newLines = 0;
+    }
+    if (oldLines > 0 || newLines > 0) {
+      // An empty line is a context line whose single leading space was
+      // stripped by an editor or model.
+      const context = line === '' || line.startsWith(' ');
+      if (context || line.startsWith('-')) oldLines--;
+      if (context || line.startsWith('+')) newLines--;
       continue;
     }
-    if (trimmed.startsWith('*** Add File: ')) {
-      files.push(trimmed.replace('*** Add File: ', '').trim());
+    if (line === '*** Begin Patch') {
+      customPatch = true;
       continue;
     }
-    if (trimmed.startsWith('*** Delete File: ')) {
-      files.push(trimmed.replace('*** Delete File: ', '').trim());
+    const customHeader = line.match(/^\*\*\* (?:Update File|Add File|Delete File|Move to): (.+)$/);
+    if (customHeader) {
+      customPatch = true;
+      files.push(customHeader[1].trim());
       continue;
     }
-    if (trimmed.startsWith('*** Move to: ')) {
-      files.push(trimmed.replace('*** Move to: ', '').trim());
+    if (line === '*** End Patch') {
+      customPatch = false;
       continue;
     }
-    if (trimmed.startsWith('+++ ')) {
-      const filePath = trimmed.replace('+++ ', '').replace(/^b\//, '').trim();
+    // Custom patch body lines use a leading space, + or -. Their file
+    // directives start in column zero; +++ is never a header in this format.
+    if (customPatch) continue;
+    const hunk = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+    if (hunk) {
+      oldLines = Number(hunk[1] ?? 1);
+      newLines = Number(hunk[2] ?? 1);
+      continue;
+    }
+    if (line.startsWith('+++ ')) {
+      const filePath = line.slice(4).replace(/^b\//, '').trim();
       if (filePath && filePath !== '/dev/null') {
         files.push(filePath);
       }
@@ -582,11 +638,11 @@ export function isOutputCapFinishReason(finishReason: string | null | undefined)
  * close after it, so it begins the cut-off tail.
  */
 export function hasUnfinishedObservationBlock(text: string): boolean {
-  const outsideWholeBlocks = text
-    .replace(/<observation>[\s\S]*?<\/observation>/gi, '')
-    .replace(/<summary>[\s\S]*?<\/summary>/gi, '')
-    .replace(/<skip_summary(?:\s+reason="[^"]*")?\s*\/>/gi, '');
-  return /<observation>/i.test(outsideWholeBlocks);
+  const outsideWholeBlocks = maskXmlLiteralMarkup(text)
+    .replace(new RegExp(OBSERVATION_BLOCK.source, 'gi'), '')
+    .replace(new RegExp(SUMMARY_BLOCK.source, 'gi'), '')
+    .replace(new RegExp(SKIP_SUMMARY_TAG.source, 'gi'), '');
+  return OBSERVATION_OPEN_TAG.test(outsideWholeBlocks);
 }
 
 export async function processAgentResponse(
@@ -990,11 +1046,21 @@ export async function processAgentResponse(
       dropped: sanitizedObservations.length - storableObservations.length,
     });
   }
-  const labeledObservations = storableObservations.map(({ attachments: _attachmentLabels, ...obs }) => ({
-    ...obs,
-    agent_type: context.pendingAgentType,
-    agent_id: context.pendingAgentId
-  }));
+  // Line anchors (#4943): an observation without any gets no metadata key,
+  // so with the setting off (the default) every row is stored as before. A
+  // batch that stores no observation reads no file for them.
+  const lineAnchors = storableObservations.length > 0
+    ? captureLineAnchors(claimedMessages, session.sessionDbId, session.platformSource)
+    : [];
+  const labeledObservations = storableObservations.map(({ attachments: _attachmentLabels, ...obs }) => {
+    const anchors = lineAnchorsForObservation(obs, lineAnchors);
+    return {
+      ...obs,
+      agent_type: context.pendingAgentType,
+      agent_id: context.pendingAgentId,
+      ...(anchors.length > 0 ? { metadata: withLineAnchors(null, anchors) } : {}),
+    };
+  });
 
   let result: ReturnType<typeof sessionStore.storeObservations>;
   let mediaLinkResult: MediaLinkageWriteResult | null = null;
@@ -1096,7 +1162,7 @@ export async function processAgentResponse(
   // memorySessionId. The batch's FIRST observation id owns the link (see
   // linkToolUsesToObservation), and docs/receipt-join.md documents that
   // observation_id is a pointer into the batch, not a 1:1 mapping; the reliable
-  // per-call join stays (content_session_id, tool_use_id).
+  // per-call join is (platform_source, content_session_id, tool_use_id).
   //
   // Never fatal: a failed link costs a back-reference, not an observation.
   const linkObservationId = firstStoredObservationId(result);
@@ -1104,6 +1170,7 @@ export async function processAgentResponse(
     try {
       const linked = sessionStore.linkToolUsesToObservation({
         contentSessionId: session.contentSessionId,
+        platformSource: session.platformSource,
         toolUseIds: claimedToolUseIds,
         observationId: linkObservationId,
         memorySessionId: registeredMemorySessionId,
@@ -1551,5 +1618,8 @@ async function syncAndBroadcastSummary(
 
   updateCursorContextForProject(context.project).catch(error => {
     logger.warn('CURSOR', 'Context update failed (non-critical)', { project: context.project }, error as Error);
+  });
+  updateGrokContextForProject(context.project).catch(error => {
+    logger.warn('GROK_BUILD', 'Context update failed (non-critical)', { project: context.project }, error as Error);
   });
 }

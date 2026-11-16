@@ -13,11 +13,12 @@
  * never used). No `/opt/homebrew/bin` or
  * `/usr/local/bin` symlink (SPIKE Decision 2).
  */
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync } from 'fs';
 import { spawnSync, type SpawnSyncReturns } from 'child_process';
 import { homedir } from 'os';
 import { posix as posixPath, win32 as windowsPath } from 'path';
 import { buildSpawnSyncInvocation } from '../shared/spawn.js';
+import { writeTextFileAtomic } from '../shared/atomic-json.js';
 import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 import { LAUNCHER_PROTOCOL } from './launcher-protocol.js';
 import { MINIMUM_BUN_VERSION_FOR_BUN_BE_BUN, MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN, bunVersionHonoursBunBeBun, bunVersionHonoursMacosSignatureFix } from './bun-be-bun-support.js';
@@ -165,7 +166,17 @@ export function launcherSignatureFixHint(
   probe: LauncherVersionProbe,
   bunVersion: string | null,
 ): string {
-  if (platform !== 'darwin' || probe.signal !== 'SIGKILL') return '';
+  if (probe.signal !== 'SIGKILL') return '';
+  return bunSignatureUpgradeHint(platform, bunVersion);
+}
+
+/**
+ * The `bun upgrade` line for a launcher macOS rejects, when the Bun that built
+ * it is too old to produce one it accepts. Shared by the killed-probe error and
+ * the signing-failure messages, which fire before any probe runs (#5247).
+ */
+export function bunSignatureUpgradeHint(platform: NodeJS.Platform, bunVersion: string | null): string {
+  if (platform !== 'darwin') return '';
   if (bunVersion === null || bunVersionHonoursMacosSignatureFix(bunVersion)) return '';
   return `; Bun ${bunVersion} cannot produce a launcher macOS 27 accepts, so reinstalling cannot fix this: run \`bun upgrade\` (${MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN} or newer), then \`npx claude-mem install\``;
 }
@@ -308,7 +319,9 @@ export function ensureLocalBinOnShellPath(options: {
     try {
       const trailingNewline = existingContent.length === 0 || existingContent.endsWith('\n') ? '' : '\n';
       const appendedBlock = `${trailingNewline}\n${shellPathSetupMarkerComment(purposeLabel)}\n${exportLine}\n`;
-      writeFileSync(configFile, existingContent + appendedBlock, 'utf-8');
+      // The user's own shell rc: a crash mid-write must leave the previous
+      // contents, never a truncated file, so write through the shared helper.
+      writeTextFileAtomic(configFile, existingContent + appendedBlock);
       logger.success(`Added ${purposeLabel} to PATH in ${configFile}`);
       outcome = 'rc-file-updated';
     } catch (error: unknown) {
@@ -488,6 +501,12 @@ export function ensureDirectoryOnWindowsUserPath(options: {
   const host = options.host ?? currentLauncherHostEnvironment();
   const runPowerShell = options.runPowerShell ?? runPowerShellHidden;
 
+  // Already on this process's PATH (inherited from the user or machine Path):
+  // nothing to edit, so no hidden PowerShell spawn, which antivirus
+  // heuristics flag (#5830).
+  const currentProcessPath = host.environmentVariables.PATH ?? '';
+  if (appendDirectoryToWindowsPathValue(currentProcessPath, directory).alreadyPresent) return 'already-on-user-path';
+
   const powerShellResult = runPowerShell(WINDOWS_USER_PATH_APPEND_SCRIPT, {
     [LAUNCHER_DIRECTORY_ENVIRONMENT_VARIABLE]: directory,
   });
@@ -506,7 +525,6 @@ export function ensureDirectoryOnWindowsUserPath(options: {
     logger.info(`Add ${directory} to your user Path (Settings → System → About → Advanced system settings → Environment Variables).`);
     return 'user-path-update-failed';
   }
-  const currentProcessPath = host.environmentVariables.PATH ?? '';
   host.environmentVariables.PATH = appendDirectoryToWindowsPathValue(currentProcessPath, directory).updatedPathValue;
   return outcome;
 }
@@ -570,6 +588,13 @@ const runCodesignCommand = (codesignArguments: readonly string[]): ReturnType<La
   };
 };
 
+export function verifyLauncherSignature(
+  binaryPath: string,
+  runCommand: (args: readonly string[]) => ReturnType<LauncherCodesignRunner> = runCodesignCommand,
+): ReturnType<LauncherCodesignRunner> {
+  return runCommand(['--verify', '--strict', binaryPath]);
+}
+
 /** The `codesign` argv lists that ad-hoc sign `binaryPath`, in the order they must run. */
 const adhocCodesignArguments = (binaryPath: string): [clearSignature: string[], sign: string[]] => [
   ['--remove-signature', binaryPath],
@@ -596,8 +621,8 @@ const adhocCodesignArguments = (binaryPath: string): [clearSignature: string[], 
  * unexecutable on macOS 27.
  *
  * `runCommand` is a seam for tests; production passes the real `codesign`
- * spawn. The factory keeps the two-step order under test without spawning a
- * process, so the order cannot drift from what the installer runs.
+ * spawn. The factory keeps signing and strict verification under test without
+ * spawning a process, so the order cannot drift from what the installer runs.
  */
 export function createAdhocCodesigner(
   runCommand: (codesignArguments: readonly string[]) => ReturnType<LauncherCodesignRunner>,
@@ -605,7 +630,9 @@ export function createAdhocCodesigner(
   return (binaryPath) => {
     const [clearSignature, sign] = adhocCodesignArguments(binaryPath);
     runCommand(clearSignature);
-    return runCommand(sign);
+    const signed = runCommand(sign);
+    if (signed.status !== 0) return signed;
+    return verifyLauncherSignature(binaryPath, runCommand);
   };
 }
 
@@ -716,8 +743,12 @@ function inspectExistingLauncherBinary(binaryPath: string): ExistingLauncherBina
 const TEMPORARY_OUTFILE_PATTERN = /^\.claude-mem-.*\.tmp/;
 const RENAMED_ASIDE_WINDOWS_BINARY_PATTERN = /^claude-mem\.old-(\d+)\.exe$/;
 
-/** True while `processId` is running (EPERM: it exists but belongs to someone else). */
-function isProcessRunning(processId: number): boolean {
+/**
+ * True while `processId` is running (EPERM: it exists but belongs to someone
+ * else). Exported for the SessionStart self-heal (ensure-launcher.ts), whose
+ * auto-update notice needs a liveness probe without process-registry.ts.
+ */
+export function isProcessRunning(processId: number): boolean {
   try {
     process.kill(processId, 0);
     return true;
@@ -840,7 +871,9 @@ function moveCompiledLauncherIntoPlace(
  * A foreign `claude-mem` at the launcher path is never replaced; a launcher of
  * ours that a signal killed on exec is rebuilt (#5247).
  * Throws on a missing bundle, a Bun older than 1.2.16 (#4933), a Windows Bun
- * path with no ASCII form (#5038), a failed compile or an unusable result.
+ * path with no ASCII form (#5038), a failed compile or an unusable result,
+ * and on macOS when signing fails while an older launcher of ours still runs
+ * (that launcher is kept, #5247).
  */
 export function ensureLauncherOnPath(options: {
   pluginRoot: string;
@@ -924,15 +957,23 @@ export function ensureLauncherOnPath(options: {
       throw new Error(`bun build --compile failed (exit ${compileResult.status}): ${compileResult.stderr.trim().split('\n').pop() ?? ''}`);
     }
     if (host.platform !== 'win32') chmodSync(temporaryOutfilePath, 0o755);
-    // Best effort: when signing is unavailable or fails (no codesign on the
-    // machine, odd filesystem), probe anyway and report through the existing
-    // errors — the probe, not the signing, decides whether the binary runs.
+    // A protocol probe can pass on an OS that tolerates an invalid signature
+    // (macOS 26 and older), but macOS 27 kills that launcher on exec (#5247).
     let codesignFailure: string | null = null;
     if (host.platform === 'darwin') {
       const codesignResult = runCodesign(temporaryOutfilePath);
       if (codesignResult.status !== 0) {
-        codesignFailure = `codesign --force --sign - failed (exit ${codesignResult.status}): ${codesignResult.stderr.trim().split('\n').pop() ?? ''}`;
-        logger.warn(`${codesignFailure}; the launcher may not start on macOS versions that enforce valid code signatures`);
+        codesignFailure = `launcher signing or strict verification failed (exit ${codesignResult.status}): ${codesignResult.stderr.trim().split('\n').pop() ?? ''}`;
+        const bunSignFix = bunSignatureUpgradeHint(host.platform, bunVersion);
+        // A launcher of ours that still runs stays: swapping it for one macOS
+        // 27 will kill trades a working install for a later break.
+        if (existingBinary.kind === 'launcher') {
+          throw new Error(`${codesignFailure}; kept the existing launcher at ${binaryPath} (protocol ${existingBinary.protocol})${bunSignFix}`);
+        }
+        // Nothing that runs is at the launcher path, so the probe decides, as
+        // before: a fresh install on macOS 26 keeps working instead of getting
+        // no launcher at all.
+        logger.warn(`${codesignFailure}; the launcher may not start on macOS versions that enforce valid code signatures${bunSignFix}`);
       }
     }
     // Verified before the move: after it, a concurrent session may already
@@ -944,7 +985,9 @@ export function ensureLauncherOnPath(options: {
       // binary (macOS SIGKILLs it on exec), and its stderr is the actionable
       // half: the protocol message alone reads like a broken build.
       const signFailure = codesignFailure ? `; ${codesignFailure}` : '';
-      const bunSignFix = launcherSignatureFixHint(host.platform, compiledProbe, bunVersion);
+      const bunSignFix = codesignFailure
+        ? bunSignatureUpgradeHint(host.platform, bunVersion)
+        : launcherSignatureFixHint(host.platform, compiledProbe, bunVersion);
       throw new Error(`compiled launcher printed protocol ${compiledProbe.protocol}, expected ${LAUNCHER_PROTOCOL}${probeFailure}${signFailure}${bunSignFix}`);
     }
     moveCompiledLauncherIntoPlace(temporaryOutfilePath, binaryPath, binDirectory, host.platform, placementFileOperations);

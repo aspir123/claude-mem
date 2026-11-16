@@ -144,7 +144,7 @@ export function ProgressMeter({ request, compact = false }: { request: Request; 
   const estimate = measuredEstimate(request)
   const translatedEstimate = estimate
     ? (estimate.startsWith('at this pace, about ')
-      ? interpolate(t('at this pace, about {date}'), { date: estimate.slice('at this pace, about '.length) })
+      ? interpolate(t('at this pace, about {date}'), { date: displayTime(estimate.slice('at this pace, about '.length)) })
       : t(estimate))
     : null
   return (
@@ -285,7 +285,7 @@ export function GitHubStars() {
       <a href={CLAUDE_MEM_REPO_URL} target="_blank" rel="noreferrer" aria-label={t('Star claude-mem on GitHub')}>
         <StarIcon className="size-3.5" />
         <span className="hidden sm:inline">{t('Star')}</span>
-        {stargazerCount !== null && <span className="tabular-nums">{new Intl.NumberFormat(locale === 'zh-CN' ? 'zh-CN' : 'en', { notation: 'compact', maximumFractionDigits: 1 }).format(stargazerCount)}</span>}
+        {stargazerCount !== null && <span className="tabular-nums">{new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 }).format(stargazerCount)}</span>}
       </a>
     </Button>
   )

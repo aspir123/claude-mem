@@ -28,8 +28,10 @@ import { needsYou, OTHER_FOCUS_AREA_ID, SAMPLE_RUNS, startedTimestamp, type Agen
 import { type WorkFilter, type WorkListView, type WorkSort, deviceById, useFreshlyUpdated, useStore, useWorkModel, useWorkspace } from '@/store'
 import { useShallow } from 'zustand/react/shallow'
 import type { BuildStory, RequestReadError } from '@/live/work-data-source'
-import { resolveFocusAreaId } from '@/live/to-focus-model'
+import { createFocusAreaResolver } from '@/live/to-focus-model'
 import { cardGridEntries } from '@/live/card-groups'
+import { FocusOverview } from '@/components/focus-overview'
+import '@/components/focus-overview.css'
 
 type View = WorkListView
 const VIEWS: { value: View; label: string }[] = [
@@ -490,13 +492,18 @@ export function MyWork({ focusAreaId, onOpen, onOpenFocus, onOpenRules }: { focu
   const { team } = useWorkspace()
   const { sourceKind, requests: allRequests, requestReadErrors: allReadErrors, unlinkedWorkCount, sourceHealth, buildStory, lastRuns, refresh, focusAreas } = useWorkModel()
   const area = focusAreaId && focusAreaId !== OTHER_FOCUS_AREA_ID ? focusAreas.find((entry) => entry.id === focusAreaId) ?? null : null
-  const requests = useMemo(() => focusAreaId ? allRequests.filter((request) => resolveFocusAreaId(request.focusAreaId, focusAreas) === focusAreaId) : allRequests, [allRequests, focusAreas, focusAreaId])
+  const requests = useMemo(() => {
+    if (!focusAreaId) return allRequests
+    const resolveArea = createFocusAreaResolver(focusAreas)
+    return allRequests.filter((request) => resolveArea(request.focusAreaId) === focusAreaId)
+  }, [allRequests, focusAreas, focusAreaId])
   // A request that could not be read has no placement to file it under, so its card shows only under every request.
   const requestReadErrors = focusAreaId ? [] : allReadErrors
   const focusChanges = useFocusChanges()
   const sample = sourceKind === 'sample'
   // How the person likes to see My Work is saved across visits (store/create-store.ts).
   const { listView: view, filter, sort } = useStore(useShallow((state) => ({ listView: state.view.listView, filter: state.view.filter, sort: state.view.sort })))
+  const focusArtwork = useStore((state) => state.view.focusArtwork)
   const { setListView: setView, setFilter, setSort } = useStore.getState()
   const [storyOpen, setStoryOpen] = useState(false)
   const matches = FILTERS.find((entry) => entry.value === filter)!.matches
@@ -512,9 +519,11 @@ export function MyWork({ focusAreaId, onOpen, onOpenFocus, onOpenRules }: { focu
         </Alert>
       )}
       <FocusChangeBar changes={focusChanges} />
+      {!focusAreaId && <FocusOverview areas={focusAreas} requests={allRequests} incomplete={allReadErrors.length > 0} onOpenArea={onOpenFocus} onOpenRequest={onOpen} artwork={focusArtwork} onArtworkChange={useStore.getState().setFocusArtwork} />}
       {/* Every request in the area, closed ones too: the combined progress counts each reviewed request (D1's rule). */}
       {area ? <FocusHeader key={area.id} area={area} requests={requests} changes={focusChanges} />
         : focusAreaId === OTHER_FOCUS_AREA_ID && <OtherHeader requests={requests} />}
+      {!focusAreaId && <h2 className="section-label">{t('All requests')}</h2>}
       <Summary requests={requests.filter((request) => !request.closed)} onOpen={onOpen} onShowNeedsYou={() => setFilter('needs-you')} onShowWorking={() => setFilter('working')} />
       <ChangeTicker onOpen={(requestId) => { const request = allRequests.find((entry) => entry.id === requestId); if (request) onOpen(request) }} />
 

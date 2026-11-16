@@ -9,9 +9,9 @@ import type { ContextConfig } from './types.js';
 export const CONTEXT_OUTPUT_LIMIT = 10_000;
 
 /**
- * Room the terminal preview leaves for the lines a hook adds after it. The
+ * Room the terminal preview leaves for the lines a hook adds above it. The
  * SessionStart hook puts the viewer link, the trial line, the trial countdown
- * and the TeamBrain discovery line under the preview in the same
+ * and the TeamBrain discovery line over the preview in the same
  * `systemMessage`, so a preview fitted to the full limit pushed that field past
  * 10,000 and Claude Code showed the saved-to-disk stub instead (#5079).
  */
@@ -75,8 +75,9 @@ function reduceConfig(config: ContextConfig, observationCount: number): { config
 /**
  * Render within `limit` characters, giving up content in `reduceConfig`'s order.
  *
- * `render` must be pure: it is called repeatedly with progressively smaller
- * inputs, and the last result that fits is the one returned.
+ * `render` must be pure. Adding timeline entries must not shorten its output:
+ * after finding a fitting count, the fitter probes that final count interval
+ * to retain the largest prefix that fits, without restoring earlier losses.
  */
 export function fitContextToBudget<T>(
   observations: T[],
@@ -94,10 +95,35 @@ export function fitContextToBudget<T>(
     if (!next) {
       return { text, config: currentConfig, observationCount: currentCount, reductions, overBudget: true };
     }
+    const previousConfig = currentConfig;
+    const previousCount = currentCount;
     currentConfig = next.config;
     currentCount = next.observationCount;
     text = render(observations.slice(0, currentCount), currentConfig);
     reductions++;
+
+    // Halving finds a fitting interval quickly, but stopping there can discard
+    // almost half the timeline for a one-character overflow. Refine only the
+    // last count reduction, preserving the existing priority of earlier losses.
+    if (text.length <= limit) {
+      const sessionsReduced = currentConfig.sessionCount < previousConfig.sessionCount;
+      let low = (sessionsReduced ? currentConfig.sessionCount : currentCount) + 1;
+      let high = (sessionsReduced ? previousConfig.sessionCount : previousCount) - 1;
+      while (low <= high) {
+        const mid = low + Math.floor((high - low) / 2);
+        const candidateConfig = sessionsReduced ? { ...currentConfig, sessionCount: mid } : currentConfig;
+        const candidateCount = sessionsReduced ? currentCount : mid;
+        const candidateText = render(observations.slice(0, candidateCount), candidateConfig);
+        if (candidateText.length <= limit) {
+          currentConfig = candidateConfig;
+          currentCount = candidateCount;
+          text = candidateText;
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
+      }
+    }
   }
 
   return { text, config: currentConfig, observationCount: currentCount, reductions, overBudget: false };

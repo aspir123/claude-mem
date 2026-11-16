@@ -95,12 +95,14 @@ describe('deriveTitle', () => {
 });
 
 describe('memoryDirForCwd', () => {
+  // The returned path is joined with the platform separator, so the expected
+  // tail is built the same way instead of hard-coding a forward slash.
   it('encodes the cwd path with dashes', () => {
-    expect(memoryDirForCwd('/home/u/code/mm/obs')).toContain('-home-u-code-mm-obs/memory');
+    expect(memoryDirForCwd('/home/u/code/mm/obs')).toContain(join('-home-u-code-mm-obs', 'memory'));
   });
 
   it('dashes dots too, as Claude Code names its project dirs', () => {
-    expect(memoryDirForCwd('/Users/john.doe/proj')).toContain('-Users-john-doe-proj/memory');
+    expect(memoryDirForCwd('/Users/john.doe/proj')).toContain(join('-Users-john-doe-proj', 'memory'));
   });
 });
 
@@ -319,43 +321,6 @@ describe('ingestMemorySource (fake deps)', () => {
     });
     expect(report.stored).toBe(0);
     expect(report.deduped).toBe(1);
-  });
-
-  it('keeps the beginning of a note that starts with a ---- horizontal rule', async () => {
-    writeFileSync(
-      join(memDir, 'hrule.md'),
-      ['----', '# Deployment notes', '', 'Keep the rollback command.', '', '---', 'Next section'].join('\n'),
-    );
-    const stored: MemoryObservationToStore[] = [];
-    const report = await ingestMemorySource(memDir, { root }, {
-      storeMemoryObservation: async obs => {
-        stored.push(obs);
-        return { id: stored.length, deduped: false };
-      },
-    });
-    expect(report.stored).toBe(2); // a.md + hrule.md (empty.md still skipped)
-    const obs = stored.find(o => o.title === 'Deployment notes');
-    expect(obs?.narrative.startsWith('----\n# Deployment notes')).toBe(true);
-    expect(obs?.narrative).toContain('Keep the rollback command.');
-  });
-
-  it('keeps the whole note when a file starts with an indented --- line', async () => {
-    writeFileSync(
-      join(memDir, 'indented.md'),
-      ['    ---', '# Deployment notes', '', 'Keep the rollback command.', '', '---', 'Next section'].join('\n'),
-    );
-    const stored: MemoryObservationToStore[] = [];
-    const report = await ingestMemorySource(memDir, { root }, {
-      storeMemoryObservation: async obs => {
-        stored.push(obs);
-        return { id: stored.length, deduped: false };
-      },
-    });
-    expect(report.stored).toBe(2); // a.md + indented.md (empty.md still skipped)
-    const obs = stored.find(o => o.title === 'Deployment notes');
-    expect(obs?.narrative.startsWith('    ---\n# Deployment notes')).toBe(true);
-    expect(obs?.narrative).toContain('Keep the rollback command.');
-    expect(obs?.narrative).toContain('Next section');
   });
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(

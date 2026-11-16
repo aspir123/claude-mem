@@ -5,6 +5,8 @@
 // `&usage=partial|none` shows an incomplete or missing usage history (default: a complete 30-day window).
 import type { MemoryResult, SetupData, SetupSource } from './setup-data'
 import { toSetupUsage, type SetupScanUsage } from './setup-usage'
+import { SAMPLE_REQUESTS } from '../data'
+import { SAMPLE_FOCUS_AREAS } from '../data-goals'
 
 const SCAN_MS = 8000
 const REVEAL_GAP_MS = 900
@@ -59,8 +61,31 @@ const RECENT_PROMPTS = [
 
 function sampleData(newInstall: boolean, usage: SampleUsage, waitingForAgent: boolean): SetupData {
   return {
+    connectionError: null,
+    choice: null,
+    install: {
+      status: 'waiting', selection: null, error: null,
+      catalog: {
+        agents: [
+          { id: 'claude-code', label: 'Claude Code', hint: 'Recommended', detected: true },
+          { id: 'codex-cli', label: 'Codex CLI', hint: 'Native hooks integration', detected: true },
+          { id: 'cursor', label: 'Cursor', hint: 'Hooks and MCP integration', detected: true },
+          { id: 'opencode', label: 'OpenCode', hint: 'Plugin integration', detected: false },
+          { id: 'openclaw', label: 'OpenClaw', hint: 'Plugin integration', detected: false },
+          { id: 'hermes', label: 'Hermes Agent', hint: 'Memory provider and MCP search', detected: false },
+        ],
+        skills: [
+          { id: 'how-it-works', label: 'How it works', description: 'Understand how claude-mem remembers your work.', required: true },
+          { id: 'make-plan', label: 'Make a plan', description: 'Turn a task into an implementation plan.' },
+          { id: 'do', label: 'Execute a plan', description: 'Carry out an implementation plan with agents.' },
+          { id: 'mem-search', label: 'Memory search', description: 'Recall decisions from previous sessions.' },
+        ],
+        defaults: { agents: ['claude-code', 'codex-cli', 'cursor'], skills: ['how-it-works', 'make-plan', 'do', 'mem-search'], installClaudeCode: false, disableAutoMemory: false, telemetryEnabled: true, claudeModel: 'haiku' },
+        reinstall: !newInstall,
+      },
+    },
     scan: { agents: [], percent: 0, phase: 'reading', done: false, error: null, improveProduct: true, uploadedAgents: null },
-    reveal: { goals: null, work: null, rules: null },
+    reveal: { goals: null, work: null, rules: null, focusAreas: null, requests: [] },
     extraction: waitingForAgent ? { state: 'waiting-for-agent', step: null } : null,
     recentPrompts: RECENT_PROMPTS,
     checkout: null,
@@ -95,8 +120,8 @@ export function createSampleSetupSource(newInstall: boolean, holdScanAtPercent: 
       if (!done) return
       clearInterval(timer)
       if (waitingForAgent) return
-      setTimeout(() => publish({ reveal: { ...data.reveal, goals: GOALS } }), REVEAL_GAP_MS)
-      setTimeout(() => publish({ reveal: { ...data.reveal, work: WORK } }), REVEAL_GAP_MS * 2)
+      setTimeout(() => publish({ reveal: { ...data.reveal, goals: GOALS, focusAreas: [...SAMPLE_FOCUS_AREAS] } }), REVEAL_GAP_MS)
+      setTimeout(() => publish({ reveal: { ...data.reveal, work: WORK, requests: [...SAMPLE_REQUESTS] } }), REVEAL_GAP_MS * 2)
       setTimeout(() => publish({ reveal: { ...data.reveal, rules: RULES } }), REVEAL_GAP_MS * 3)
     }, TICK_MS)
   }
@@ -105,14 +130,22 @@ export function createSampleSetupSource(newInstall: boolean, holdScanAtPercent: 
     subscribe(onData) {
       listeners.add(onData)
       onData(data)
-      if (!playing) play()
+      if (!playing && data.install?.status === 'ready') play()
       return () => listeners.delete(onData)
+    },
+    async resume() {},
+    async configureInstall(selection) {
+      publish({ install: { ...data.install!, selection, status: 'installing', error: null } })
+      setTimeout(() => {
+        publish({ install: { ...data.install!, status: 'ready' } })
+        if (!playing) play()
+      }, 1200)
     },
     async retryScan() { if (!playing) play() },
     async confirmUpload(upload, agents) { publish({ scan: { ...data.scan, phase: 'done', done: true, percent: 100, uploadedAgents: upload ? agents ?? data.scan.agents.map((agent) => agent.id) : [] } }) },
     async setImproveProduct(improveProduct) { publish({ scan: { ...data.scan, improveProduct } }) },
     // Review fixtures hand nothing to an installer.
-    async choose() {},
+    async choose(choice) { publish({ choice }) },
     // Plays the checkout the terminal would open: waiting, then paid.
     async checkout() {
       publish({ checkout: { state: 'waiting', error: null } })
